@@ -1,0 +1,15 @@
+{
+  "name": "screen-mentor",
+  "version": "0.5.2",
+  "description": "Windows 智能伴学。Codex 看窗口、圈出下一步，由你亲手操作。",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "屏幕伴学",
+    "shortDescription": "看窗口，标一步，你来操作",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read"],
+    "defaultPrompt": ["开启实时屏幕伴学。我在练习窗口操作，请自动更新桌面引导。"]
+  }
+}

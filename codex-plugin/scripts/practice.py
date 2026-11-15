@@ -1,0 +1,273 @@
+"""Observe practice changes while the originating Codex chat is using the tool."""
+from collections import deque
+from pathlib import PureWindowsPath
+from threading import Event, Thread
+import time
+
+from PIL import Image, ImageChops, ImageStat
+from PyQt6.QtCore import QObject, QRect, Qt, pyqtSignal
+from PyQt6.QtGui import QFontMetrics
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout,
+    QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+)
+
+import native
+
+
+CHAT_LEASE_SECONDS = 120
+foreground = native.bind(native.user, "GetForegroundWindow", native.w.HWND)
+owner_of = native.bind(native.user, "GetWindow", native.w.HWND, native.w.HWND, native.w.UINT)
+
+
+class WindowScope:
+    """Follow approved apps across replacement windows and process restarts."""
+
+    shared_hosts = {"explorer.exe", "applicationframehost.exe", "chrome.exe", "msedge.exe",
+                    "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe"}
+
+    def __init__(self, selected):
+        self.roots = {}
+        for hwnd in selected:
+            pid = native.window_state(hwnd)[4]
+            self.roots[hwnd] = pid, native.executable_for(pid)
+        self.apps = {exe for _, exe in self.roots.values()
+                     if exe and PureWindowsPath(exe).name not in self.shared_hosts}
+
+    def accepts(self, hwnd):
+        owner = hwnd
+        while owner:
+            pid = native.window_pid(owner)
+            if owner in self.roots and pid == self.roots[owner][0]:
+                return True
+            if pid and self.apps and native.executable_for(pid) in self.apps:
+                return True
+            owner = owner_of(owner, 4)  # GW_OWNER
+        return False
+
+    def active(self):
+        hwnd = foreground()
+        return hwnd if self.accepts(hwnd) else None
+
+
+def changed(a, b):
+    if a is None or b is None or a[:2] != b[:2]:
+        return a is not b
+    diff = ImageChops.difference(a[3], b[3])
+    return ImageStat.Stat(diff).mean[0] >= 1.6 or sum(diff.histogram()[45:]) >= 80
+
+
+class PracticePanel(QWidget):
+    closed = pyqtSignal()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        if event.isAccepted():
+            self.closed.emit()
+
+
+class Practice(QObject):
+    sampled = pyqtSignal(int, object)
+    wake = pyqtSignal()
+
+    def __init__(self, scope, app):
+        super().__init__()
+        self.scope = scope
+        self.running = Event()
+        self.running.set()
+        self.capture_generation = 0
+        self.ending = Event()
+        self.last_poll = time.monotonic()
+        self.chat_suspended = False
+        self.pending = self.last_sent = self.current = None
+        self.stable_frame = None
+        self.issues = deque()
+        self.last_image = None
+        self.force = False
+        self.recheck_reason = None
+        self.last_sample = None
+
+        self.panel = PracticePanel(flags=Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.panel.setWindowTitle("屏幕伴学 · 当前对话")
+        self.panel.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.panel.closed.connect(self.close)
+        self.panel.setStyleSheet(
+            "QWidget{background:#101722;color:#eef2fa;font:13px 'Microsoft YaHei UI';}"
+            "QPushButton{background:#25344d;border-radius:5px;padding:5px 10px;}"
+        )
+        layout = QVBoxLayout(self.panel)
+        self.status = QLabel()
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setWordWrap(True)
+        self.status.setFixedWidth(320)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.status.setContentsMargins(0, 3, 0, 3)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.status)
+        self.copy_area = QWidget()
+        copy_layout = QVBoxLayout(self.copy_area)
+        copy_layout.setContentsMargins(0, 0, 0, 0)
+        copy_header = QHBoxLayout()
+        copy_header.addWidget(QLabel("要输入的内容"), 1)
+        self.copy_button = QPushButton("复制")
+        self.copy_button.clicked.connect(self.copy_input)
+        copy_header.addWidget(self.copy_button)
+        copy_layout.addLayout(copy_header)
+        self.input_value = QPlainTextEdit()
+        self.input_value.setReadOnly(True)
+        self.input_value.setFixedHeight(53)
+        self.input_value.setStyleSheet("background:#1b2739;padding:4px;border-radius:5px;")
+        copy_layout.addWidget(self.input_value)
+        layout.addWidget(self.copy_area)
+        self.copy_area.hide()
+        actions = QHBoxLayout()
+        self.pause_button = QPushButton("暂停")
+        self.pause_button.clicked.connect(self.toggle)
+        issue = QPushButton("遇到问题")
+        issue.clicked.connect(self.report_issue)
+        end = QPushButton("结束")
+        end.clicked.connect(self.panel.close)
+        for button in (self.pause_button, issue, end):
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        screen = app.primaryScreen().availableGeometry()
+        self.set_status("切回练习软件，提示会跟着画面更新。")
+        self.panel.move(screen.right() - self.panel.width() - 18, screen.bottom() - self.panel.height() - 38)
+        self.panel.show()
+        self.sampled.connect(self.accept_sample)
+        Thread(target=self.watch, daemon=True).start()
+
+    def watch(self):
+        was_visible = False
+        while not self.ending.wait(.4):
+            generation = self.capture_generation
+            hwnd = None
+            if self.running.is_set() and time.monotonic() - self.last_poll < CHAT_LEASE_SECONDS:
+                hwnd = self.scope.active()
+            if hwnd is None:
+                if was_visible:
+                    self.sampled.emit(generation, None)
+                    was_visible = False
+                continue
+            try:
+                bounds = native.window_state(hwnd)
+                raw = native.read_window(hwnd, *bounds[2:4])
+                if self.scope.active() != hwnd or not self.running.is_set() or generation != self.capture_generation:
+                    continue
+                preview = raw.copy()
+                preview.thumbnail((1440, 1000), Image.Resampling.LANCZOS)
+                key = preview.convert("L").resize((144, 90), Image.Resampling.BILINEAR)
+                self.sampled.emit(generation, (hwnd, bounds, preview, key, raw))
+                was_visible = True
+            except native.WindowError:
+                if was_visible:
+                    self.sampled.emit(generation, None)
+                    was_visible = False
+
+    def accept_sample(self, generation, frame):
+        if generation == self.capture_generation:
+            self.update(frame)
+
+    def update(self, frame):
+        if frame is None or not self.running.is_set() or self.ending.is_set():
+            self.current = self.stable_frame = self.pending = None
+            self.force = True
+        else:
+            self.last_sample = time.monotonic()
+            self.last_image = frame[2]
+            self.current = frame
+            if changed(self.stable_frame, frame):
+                self.stable_frame, self.pending = frame, time.monotonic()
+        self.wake.emit()
+
+    def take(self):
+        if not self.running.is_set() or self.ending.is_set() or self.current is None or self.pending is None or time.monotonic() - self.pending < .55:
+            return None
+        if not self.force and not changed(self.current, self.last_sent):
+            return None
+        self.last_sent = self.current
+        self.force = False
+        return self.current
+
+    def toggle(self):
+        self.capture_generation += 1
+        if self.running.is_set():
+            self.running.clear()
+            self.pause_button.setText("继续")
+            self.set_status("已暂停伴学。点「继续」恢复。")
+            self.update(None)
+            return
+        else:
+            self.running.set()
+            self.force = True
+            self.pause_button.setText("暂停")
+            self.set_status("切回练习软件继续")
+        self.wake.emit()
+
+    def set_status(self, text, *, bottom=None):
+        if bottom is None:
+            bottom = self.panel.y() + self.panel.height()
+        self.status.setText(text)
+        self.status.ensurePolished()
+        metrics = QFontMetrics(self.status.font())
+        measured = metrics.boundingRect(
+            QRect(0, 0, self.status.width(), 32767), int(Qt.TextFlag.TextWordWrap), text,
+        ).height()
+        self.status.setFixedHeight(measured + 8)
+        self.panel.layout().invalidate()
+        self.panel.layout().activate()
+        self.panel.adjustSize()
+        if self.panel.isVisible():
+            top = self.panel.screen().availableGeometry().top()
+            self.panel.move(self.panel.x(), max(top, bottom - self.panel.height()))
+
+    def show_instruction(self, text, text_to_type=""):
+        bottom = self.panel.y() + self.panel.height()
+        if self.input_value.toPlainText() != text_to_type:
+            self.input_value.setPlainText(text_to_type)
+            self.copy_button.setText("复制")
+        self.copy_area.setVisible(bool(text_to_type))
+        self.set_status(text, bottom=bottom)
+
+    def copy_input(self):
+        QApplication.clipboard().setText(self.input_value.toPlainText())
+        self.copy_button.setText("已复制")
+
+    def report_issue(self):
+        image = self.last_image
+        dialog = QDialog(self.panel)
+        dialog.setWindowTitle("反馈到当前对话")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+        problem = QPlainTextEdit()
+        problem.setPlaceholderText("描述遇到的问题，也可以只发截图。")
+        problem.setFixedHeight(110)
+        layout.addWidget(problem)
+        attach = QCheckBox("附上最近一次练习窗口截图")
+        attach.setEnabled(image is not None)
+        if image is None:
+            attach.setToolTip("切回练习窗口，让伴学先看一眼画面。")
+        layout.addWidget(attach)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        send = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        send.setText("发到当前对话")
+        send.setEnabled(False)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        update_send = lambda: send.setEnabled(attach.isChecked() or bool(problem.toPlainText().strip()))
+        problem.textChanged.connect(update_send)
+        attach.toggled.connect(update_send)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.issues.append((problem.toPlainText().strip()[:800], image if attach.isChecked() else None))
+            self.force = True
+            self.set_status("反馈已提交。切回练习软件查看下一步。" if self.running.is_set()
+                            else "反馈已暂存。点「继续」后发到原聊天。")
+            self.wake.emit()
+
+    def close(self):
+        self.ending.set()
+        self.current = None
+        self.wake.emit()

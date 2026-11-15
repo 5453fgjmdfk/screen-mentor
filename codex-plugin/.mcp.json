@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "screen_mentor": {
+      "command": "python.exe",
+      "args": ["-B", "scripts/server.py"],
+      "cwd": "."
+    }
+  }
+}

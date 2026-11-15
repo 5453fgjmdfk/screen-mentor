@@ -1,0 +1,545 @@
+"""Codex MCP server. Its tools read a window and draw click-through guidance."""
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+import io
+import json
+import math
+import sys
+from threading import Thread
+import time
+from uuid import uuid4
+
+from capture import enable_dpi_awareness
+
+enable_dpi_awareness()
+
+from PIL import Image, ImageChops, ImageStat
+from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QApplication
+
+import native
+from overlay import GuideOverlay
+from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
+from target import tighten
+
+
+COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
+POLL_WAIT_SECONDS = 40
+
+
+def tool(name, description, properties, required=(), *, read_only=False):
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object", "properties": properties,
+            "required": list(required), "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": False, "openWorldHint": False},
+    }
+
+
+TOOLS = [
+    tool("start_live", "启动或恢复当前对话的实时伴学。同一练习窗口仍在伴学时，返回原有 practice_id。",
+         {"window_id": {"type": "string", "pattern": "^[0-9]+$"},
+          "additional_window_ids": {"type": "array", "maxItems": 8,
+                                    "items": {"type": "string", "pattern": "^[0-9]+$"},
+                                    "description": "用户已经指定要一起跟踪的其他软件窗口。"}}, ("window_id",)),
+    tool("wait_for_practice_change", f"等待最多 {POLL_WAIT_SECONDS} 秒，返回新画面、问题、等待或明确结束。等待超时不代表结束。",
+         {"practice_id": {"type": "string"}}, ("practice_id",), read_only=True),
+    tool("show_practice_hint", "在练习窗口所在的屏幕上显示穿透提示卡。快捷键传 shortcut；有位置的点击、输入或拖动优先用 show_guide。",
+         {"practice_id": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": 240},
+          "shortcut": {"type": "string", "minLength": 1, "maxLength": 50}, "text_to_type": COPY_TEXT},
+         ("practice_id", "text")),
+    tool("list_windows", "查找可用于伴学的桌面窗口。可按标题或软件名筛选。",
+         {"query": {"type": "string", "maxLength": 120}}, read_only=True),
+    tool("observe_window", "捕获明确选定的单个 Windows 窗口，返回图片和标注用的快照 ID。",
+         {"window_id": {"type": "string", "pattern": "^[0-9]+$"}}, ("window_id",), read_only=True),
+    tool("show_guide", "在软件画面上指出点击或输入位置。拖动时框选起点并传入 drag_to_x、drag_to_y，显示起点到落点的箭头。坐标使用截图像素。",
+         {
+             "snapshot_id": {"type": "string"},
+             "x": {"type": "number", "minimum": 0},
+             "y": {"type": "number", "minimum": 0},
+             "width": {"type": "number", "exclusiveMinimum": 0},
+             "height": {"type": "number", "exclusiveMinimum": 0},
+             "text": {"type": "string", "minLength": 1, "maxLength": 40},
+             "detail": {"type": "string", "maxLength": 180},
+             "input_field": {"type": "boolean", "description": "是文本输入框时传 true。保留卡片和指向箭头，隐藏框线。"},
+             "drag_to_x": {"type": "number", "minimum": 0},
+             "drag_to_y": {"type": "number", "minimum": 0},
+             "text_to_type": COPY_TEXT,
+             "step": {"type": "integer", "minimum": 1, "maximum": 999},
+             "seconds": {"type": "integer", "minimum": 3, "maximum": 45},
+         }, ("snapshot_id", "x", "y", "width", "height", "text")),
+    tool("clear_guide", "清除屏幕标注并使当前快照失效。", {}),
+]
+TOOL_SCHEMAS = {item["name"]: item["inputSchema"] for item in TOOLS}
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    id: str
+    hwnd: int
+    window: tuple[int, int, int, int, int]
+    image_size: tuple[int, int]
+    captured_at: float
+
+
+def text_content(data):
+    text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    return {"type": "text", "text": text}
+
+
+def validated_arguments(name, arguments):
+    schema = TOOL_SCHEMAS.get(name)
+    if schema is None:
+        raise ValueError("未知的工具。")
+    fields = schema["properties"]
+    if not isinstance(arguments, dict) or set(arguments) - fields.keys() or set(schema["required"]) - arguments.keys():
+        raise ValueError("工具的参数不完整，或包含不支持的参数。")
+    for key, value in arguments.items():
+        rule = fields[key]
+        if rule["type"] == "string":
+            if not isinstance(value, str) or not rule.get("minLength", 0) <= len(value) <= rule.get("maxLength", 128):
+                raise ValueError(f"{key} 的文字长度无效。")
+            if key == "window_id" and not valid_window_id(value):
+                raise ValueError("请使用 list_windows 返回的 window_id。")
+        elif rule["type"] == "array":
+            if not isinstance(value, list) or len(value) > rule["maxItems"] or not all(map(valid_window_id, value)):
+                raise ValueError("请提供有效的窗口列表。")
+        elif rule["type"] == "boolean":
+            if type(value) is not bool:
+                raise ValueError(f"{key} 必须为 true 或 false。")
+        else:
+            allowed = (int,) if rule["type"] == "integer" else (int, float)
+            if type(value) not in allowed or abs(value) > 10**7 or not math.isfinite(value):
+                raise ValueError(f"{key} 必须是有效数字。")
+            if not rule.get("minimum", -math.inf) <= value <= rule.get("maximum", math.inf):
+                raise ValueError(f"{key} 超出范围。")
+            if "exclusiveMinimum" in rule and value <= rule["exclusiveMinimum"]:
+                raise ValueError(f"{key} 必须大于零。")
+    return arguments
+
+
+def valid_window_id(value):
+    return (isinstance(value, str) and 0 < len(value) <= 20 and value.isascii()
+            and value.isdecimal() and 0 < int(value) < 2**64)
+
+
+class MentorServer(QObject):
+    received = pyqtSignal(object)
+
+    def __init__(self, app: QApplication):
+        super().__init__()
+        self.app = app
+        self.snapshot = None
+        self.practice = None
+        self.practice_id = None
+        self.practice_frame = None
+        self.displayed_frame = None
+        self.displayed_regions = ()
+        self.guide_window = None
+        self.pending_hint = None
+        self.waiting = False
+        self.last_watchdog = self.last_analysis = 0.0
+        self.last_window = None
+        self.idle_rechecked = False
+        self.overlay = GuideOverlay()
+        self.received.connect(self.respond)
+        self.guard = QTimer(self)
+        self.guard.timeout.connect(self.check_window)
+        self.expiration = QTimer(self)
+        self.expiration.setSingleShot(True)
+        self.expiration.timeout.connect(self.hide_guide)
+        self.watchdog = QTimer(self)
+        self.watchdog.timeout.connect(self.watch_practice)
+
+    def start(self):
+        Thread(target=self.read_requests, daemon=True).start()
+
+    def read_requests(self):
+        for line in sys.stdin.buffer:
+            try:
+                self.received.emit(json.loads(line))
+            except (ValueError, UnicodeError):
+                self.received.emit({})
+        self.received.emit(None)
+
+    def hide_guide(self):
+        self.guard.stop()
+        self.expiration.stop()
+        self.displayed_frame = self.guide_window = None
+        self.displayed_regions = ()
+        self.overlay.clear()
+        self.overlay.hide()
+
+    def check_window(self):
+        try:
+            hwnd, bounds = self.guide_window
+            if native.window_state(hwnd) == bounds and (
+                self.displayed_frame is None or self.practice.scope.active() == hwnd
+            ):
+                return
+        except (TypeError, native.WindowError):
+            pass
+        self.hide_guide()
+
+    def observe_window(self, window_id):
+        self.hide_guide()
+        self.snapshot = None
+        hwnd = int(window_id)
+        window = native.window_state(hwnd)
+        _, _, width, height, _ = window
+        image = native.read_window(hwnd, width, height)
+        if native.window_state(hwnd) != window:
+            raise native.WindowError("截图时窗口发生了移动，请重新观察。")
+        image.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+        self.snapshot = Snapshot(uuid4().hex, hwnd, window, image.size, time.monotonic())
+        self.practice_frame = None
+        return self.image_blocks(image)
+
+    @staticmethod
+    def encode_image(image):
+        with io.BytesIO() as output:
+            image.save(output, format="JPEG", quality=88)
+            encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return {"type": "image", "mimeType": "image/jpeg", "data": encoded}
+
+    def image_blocks(self, image):
+        meta = {"snapshot_id": self.snapshot.id, "width": image.width, "height": image.height}
+        return [text_content(meta), self.encode_image(image)]
+
+    def start_practice(self, window_id, additional_window_ids=()):
+        windows = tuple(dict.fromkeys(map(int, (window_id, *additional_window_ids))))
+        if self.practice and not self.practice.ending.is_set():
+            if not all(self.practice.scope.accepts(hwnd) for hwnd in windows):
+                raise ValueError("已有一场不同窗口的伴学。请先结束旧练习，再开始新练习。")
+            self.renew_practice(explicit=True)
+            return [text_content({"practice_id": self.practice_id, "state": "resumed"})]
+        scope = WindowScope(windows)
+        self.hide_guide()
+        self.snapshot = self.practice_frame = None
+        self.pending_hint = None
+        self.practice = Practice(scope, self.app)
+        self.practice.wake.connect(self.invalidate_practice_guide)
+        self.practice_id = uuid4().hex
+        self.last_watchdog = self.last_analysis = time.monotonic()
+        self.last_window = None
+        self.idle_rechecked = False
+        self.watchdog.start(1000)
+        return [text_content({"practice_id": self.practice_id, "state": "started"})]
+
+    def renew_practice(self, *, explicit=False):
+        practice = self.practice
+        now = time.monotonic()
+        reconnect = practice.chat_suspended or now - practice.last_poll >= CHAT_LEASE_SECONDS
+        if reconnect:
+            self.hide_guide()
+            self.snapshot = self.practice_frame = None
+            self.pending_hint = None
+            practice.update(None)
+        practice.last_poll = now
+        practice.chat_suspended = False
+        if reconnect or explicit:
+            practice.force = True
+            practice.recheck_reason = "chat_resumed"
+            practice.set_status("已接回原聊天。切到练习窗口，我会重新查看。" if practice.running.is_set()
+                                else "已接回原聊天。观察已暂停，点「继续」恢复。")
+
+    def invalidate_practice_guide(self):
+        practice = self.practice
+        if practice.ending.is_set() or not practice.running.is_set():
+            self.hide_guide()
+            self.snapshot = self.practice_frame = self.pending_hint = None
+            return
+        current = practice.current
+        if self.practice_frame and (current is None or self.practice_frame[:2] != current[:2]):
+            self.snapshot = self.practice_frame = None
+        if self.displayed_frame and (
+            current is None or self.displayed_frame[:2] != current[:2]
+            or (time.monotonic() - practice.pending >= .55
+                and any(self.region_changed(self.displayed_frame, current, box) for box in self.displayed_regions))
+        ):
+            self.hide_guide()
+            practice.force = True
+        if self.pending_hint:
+            self.display_pending_hint()
+
+    def watch_practice(self):
+        practice = self.practice
+        if practice is None or practice.ending.is_set():
+            self.watchdog.stop()
+            return
+        now = time.monotonic()
+        if not practice.running.is_set():
+            return
+        if now - practice.last_poll >= CHAT_LEASE_SECONDS:
+            if not practice.chat_suspended:
+                practice.chat_suspended = True
+                practice.set_status("原聊天已停止接收画面。回原聊天发「继续伴学」，即可从当前界面接着做。")
+            return
+        hwnd = practice.scope.active()
+        if hwnd is None:
+            return
+        if self.guide_window and self.guide_window[0] == hwnd and self.overlay.has_guide:
+            if not self.overlay.isVisible() or not native.is_visible(int(self.overlay.winId())):
+                self.overlay.restore_guide()
+        if now - self.last_watchdog < 20:
+            return
+        if practice.last_sample is None or now - practice.last_sample > 8:
+            practice.set_status("练习窗口暂时读不到。窗口恢复后会自动重试。")
+            self.last_watchdog = now
+            return
+        if practice.current is None or practice.current[0] != hwnd or practice.pending is None:
+            return
+        idle = native.idle_seconds()
+        if idle < 8:
+            self.idle_rechecked = False
+        missing = (not self.overlay.isVisible() or not self.overlay.has_guide) and now - self.last_analysis >= 12
+        stalled = idle >= 25 and now - practice.pending >= 12 and not self.idle_rechecked
+        if missing or stalled:
+            self.last_watchdog = now
+            self.idle_rechecked = self.idle_rechecked or stalled
+            practice.recheck_reason = "guide_missing" if missing else "idle"
+            practice.force = True
+            practice.set_status("正在重新查看当前窗口，确认下一步…")
+            practice.wake.emit()
+
+    @staticmethod
+    def region_changed(first, second, box):
+        x, y, width, height = box
+        crop = (int(x), int(y), math.ceil(x + width), math.ceil(y + height))
+        before = first[2].crop(crop).convert("L")
+        after = second[2].crop(crop).convert("L")
+        return ImageStat.Stat(ImageChops.difference(before, after)).mean[0] >= 16
+
+    def wait_for_practice_change(self, practice_id):
+        practice = self.practice
+        if practice is None or practice_id != self.practice_id or self.waiting:
+            raise ValueError("当前工具没有对应的伴学会话。")
+        if practice.ending.is_set():
+            return [text_content({"state": "ended"})]
+        self.waiting = True
+        self.renew_practice()
+        deadline = practice.last_poll + POLL_WAIT_SECONDS
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setInterval(180)
+        timer.timeout.connect(loop.quit)
+        practice.wake.connect(loop.quit)
+        timer.start()
+        try:
+            while not practice.ending.is_set():
+                if practice.running.is_set() and practice.issues:
+                    problem, image = practice.issues.popleft()
+                    blocks = [text_content({"state": "issue", "user_reported": problem,
+                                            "screenshot_attached": image is not None})]
+                    if image is not None:
+                        blocks.append(self.encode_image(image))
+                    return blocks
+                frame = practice.take() if practice.running.is_set() else None
+                if frame:
+                    hwnd, bounds, image, _, _ = frame
+                    if practice.scope.active() == hwnd:
+                        self.practice_frame = frame
+                        self.snapshot = Snapshot(uuid4().hex, hwnd, bounds, image.size, time.monotonic())
+                        self.last_analysis = time.monotonic()
+                        event = {"state": "changed", "window_title": native.window_title(hwnd)}
+                        if self.last_window is not None and self.last_window != hwnd:
+                            event["reason"] = "window_changed"
+                            practice.recheck_reason = None
+                            practice.show_instruction("已切换练习窗口，正在查看新界面…")
+                        elif practice.recheck_reason:
+                            event["reason"], practice.recheck_reason = practice.recheck_reason, None
+                        self.last_window = hwnd
+                        if not self.overlay.isVisible() and event.get("reason") != "window_changed":
+                            practice.set_status("正在看当前界面…")
+                        return [text_content(event), *self.image_blocks(image)]
+                if time.monotonic() >= deadline:
+                    state = "waiting" if practice.running.is_set() else "paused"
+                    reason = ("waiting_for_window" if practice.scope.active() is None
+                              else "no_new_frame" if practice.current is None else "unchanged")
+                    return [text_content({"state": state, "reason": reason})]
+                loop.exec()
+            return [text_content({"state": "ended"})]
+        finally:
+            timer.stop()
+            practice.wake.disconnect(loop.quit)
+            self.waiting = False
+
+    def show_guide(self, snapshot_id, x, y, width, height, text, detail="", step=1, seconds=20,
+                   input_field=False, text_to_type="", drag_to_x=None, drag_to_y=None):
+        shot = self.snapshot
+        if not shot or shot.id != snapshot_id or time.monotonic() - shot.captured_at > 90:
+            raise native.WindowError("这张截图已失效，请重新观察窗口。")
+        if native.window_state(shot.hwnd) != shot.window:
+            self.snapshot = None
+            raise native.WindowError("窗口位置或尺寸已变，请重新观察。")
+        iw, ih = shot.image_size
+        if x + width > iw or y + height > ih or not text.strip():
+            raise ValueError("请使用截图范围内的坐标和一条有效提示。")
+        is_input = input_field or bool(text_to_type)
+        dragging = drag_to_x is not None or drag_to_y is not None
+        if dragging and (is_input or drag_to_x is None or drag_to_y is None
+                         or drag_to_x >= iw or drag_to_y >= ih):
+            raise ValueError("拖动需要提供截图内的落点 x 和 y。")
+        regions = [(x, y, width, height)]
+        if dragging:
+            regions.append((max(0, drag_to_x - 8), max(0, drag_to_y - 8),
+                            min(16, iw - max(0, drag_to_x - 8)), min(16, ih - max(0, drag_to_y - 8))))
+        if self.practice_frame:
+            if self.practice.scope.active() != shot.hwnd:
+                raise ValueError("请切回练习窗口后继续。")
+            current = self.practice.current
+            if current is None or any(self.region_changed(self.practice_frame, current, box) for box in regions):
+                self.practice.force = True
+                raise ValueError("目标附近已变化，请等待新画面后再标注。")
+            if not is_input and not dragging:
+                adjusted = tighten(self.practice_frame[4], shot.image_size,
+                                   {"x": x, "y": y, "width": width, "height": height})
+                x, y, width, height = (adjusted[key] for key in ("x", "y", "width", "height"))
+        left, top, ww, wh, _ = shot.window
+        sx, sy = ww / iw, wh / ih
+        gx, gy, gw, gh = left + x * sx, top + y * sy, width * sx, height * sy
+        cx, cy = round(gx + gw / 2), round(gy + gh / 2)
+        if not native.point_belongs_to(shot.hwnd, cx, cy):
+            raise native.WindowError("目标被遮住了，请把练习窗口里的这个位置露出来。")
+        screen, (ml, mt, mr, mb) = self.screen_at(cx, cy)
+        drag_to = None
+        if dragging:
+            dx, dy = round(left + drag_to_x * sx), round(top + drag_to_y * sy)
+            if not (ml <= dx < mr and mt <= dy < mb and native.point_belongs_to(shot.hwnd, dx, dy)):
+                raise ValueError("拖动落点被遮挡或不在同一屏幕，请重新确认起点和落点。")
+            drag_to = dx - ml, dy - mt
+        gx, gy, right, bottom = max(gx, ml), max(gy, mt), min(gx + gw, mr), min(gy + gh, mb)
+        self.hide_guide()
+        self.pending_hint = None
+        self.place_overlay(screen, mr - ml, mb - mt)
+        live = self.practice_frame is not None
+        if text_to_type and text_to_type not in text + detail:
+            if len(text_to_type) <= 60 and text_to_type.isprintable():
+                detail = f"输入 {text_to_type}" + (f"\n{detail}" if detail else "")
+            elif live:
+                detail = "从右下角复制后粘贴。" + (f"\n{detail}" if detail else "")
+        self.overlay.show_guide((gx - ml, gy - mt, right - gx, bottom - gy), text, detail, step,
+                                0 if live else seconds, mark_target=not is_input, drag_to_phys=drag_to)
+        self.guide_window = shot.hwnd, shot.window
+        if live:
+            self.displayed_frame, self.displayed_regions = self.practice_frame, regions
+            self.practice.show_instruction(text, text_to_type)
+        else:
+            self.expiration.start(seconds * 1000)
+        self.guard.start(250)
+        return [text_content({"shown": True, "surface": "screen", "persistent": live,
+                              "seconds": None if live else seconds})]
+
+    def screen_at(self, x, y):
+        device, bounds = native.display_for_point(x, y)
+        screens = self.app.screens()
+        screen = next((s for s in screens if s.name().casefold() == device.casefold()), None)
+        if screen is None and len(screens) == 1:
+            screen = screens[0]
+        if screen is None:
+            raise native.WindowError("无法匹配目标显示器，请把练习窗口移到主屏后重试。")
+        return screen, bounds
+
+    def place_overlay(self, screen, width, height):
+        self.overlay.winId()
+        self.overlay.windowHandle().setScreen(screen)
+        self.overlay.setGeometry(screen.geometry())
+        self.overlay.set_capture_size(width, height)
+
+    def display_pending_hint(self):
+        current = self.practice.current
+        if current is None or self.practice.scope.active() != current[0]:
+            return False
+        hwnd, bounds = current[:2]
+        left, top, width, height, _ = bounds
+        try:
+            screen, (ml, mt, mr, mb) = self.screen_at(left + width // 2, top + height // 2)
+        except native.WindowError:
+            return False
+        title, detail = self.pending_hint
+        self.pending_hint = None
+        self.hide_guide()
+        self.place_overlay(screen, mr - ml, mb - mt)
+        self.overlay.show_guide(None, title, detail, seconds=0,
+                                hint_at_phys=(left + width / 2 - ml, top + min(98, height / 4) - mt))
+        self.guide_window = hwnd, bounds
+        self.displayed_frame = current
+        self.guard.start(250)
+        return True
+
+    def call_tool(self, params):
+        try:
+            name = params.get("name")
+            args = validated_arguments(name, params.get("arguments", {}))
+            if (name in {"observe_window", "show_guide", "show_practice_hint"} and self.practice
+                    and not self.practice.ending.is_set() and not self.practice.running.is_set()):
+                return {"content": [text_content({"state": "paused", "shown": False})]}
+            if name == "start_live":
+                blocks = self.start_practice(**args)
+            elif name == "wait_for_practice_change":
+                blocks = self.wait_for_practice_change(**args)
+            elif name == "show_practice_hint":
+                if not self.practice or self.practice.ending.is_set() or args["practice_id"] != self.practice_id:
+                    raise ValueError("当前工具没有对应的伴学会话。")
+                self.practice.show_instruction(args["text"], args.get("text_to_type", ""))
+                text, shortcut = args["text"], args.get("shortcut")
+                self.pending_hint = (shortcut, text) if shortcut else (text, "")
+                shown = self.display_pending_hint() if self.practice.running.is_set() else False
+                blocks = [text_content({"shown": shown, "surface": "screen" if shown else "pending_foreground"})]
+            elif name == "list_windows":
+                blocks = [text_content({"windows": native.list_windows(args.get("query", "").strip())})]
+            elif name == "observe_window":
+                blocks = self.observe_window(**args)
+            elif name == "show_guide":
+                blocks = self.show_guide(**args)
+            else:
+                self.hide_guide()
+                self.snapshot = None
+                self.pending_hint = None
+                blocks = [text_content({"cleared": True})]
+            return {"content": blocks}
+        except (native.WindowError, ValueError) as exc:
+            return {"isError": True, "content": [text_content(str(exc))]}
+
+    def respond(self, request):
+        if request is None:
+            self.app.quit()
+            return
+        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request:
+            return
+        method, params = request.get("method"), request.get("params", {})
+        response = {"jsonrpc": "2.0", "id": request["id"]}
+        try:
+            if method == "initialize":
+                supported = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
+                version = params.get("protocolVersion")
+                response["result"] = {
+                    "protocolVersion": version if version in supported else supported[-1],
+                    "serverInfo": {"name": "screen-mentor", "version": "0.5.2"},
+                    "capabilities": {"tools": {}},
+                }
+            elif method == "tools/list":
+                response["result"] = {"tools": TOOLS}
+            elif method == "tools/call" and isinstance(params, dict):
+                response["result"] = self.call_tool(params)
+            elif method == "ping":
+                response["result"] = {}
+            else:
+                response["error"] = {"code": -32601, "message": "Method not supported"}
+        except Exception:
+            response["error"] = {"code": -32603, "message": "Screen Mentor request failed"}
+        sys.stdout.buffer.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv[:1])
+    app.setQuitOnLastWindowClosed(False)
+    server = MentorServer(app)
+    server.start()
+    sys.exit(app.exec())
