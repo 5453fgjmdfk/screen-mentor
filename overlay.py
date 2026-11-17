@@ -19,12 +19,12 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QWidget
 
-ACCENT = QColor(64, 132, 255)
-WARM = QColor(255, 174, 32)
-CARD_BG = QColor(15, 19, 27, 232)
-CARD_LINE = QColor(255, 255, 255, 40)
-TXT = QColor(242, 246, 253)
-SUB = QColor(166, 179, 199)
+ACCENT = QColor(162, 131, 231)
+WARM = QColor(233, 171, 215)
+CARD_BG = QColor(37, 29, 59, 239)
+CARD_LINE = QColor(183, 154, 236, 125)
+TXT = QColor(249, 243, 255)
+SUB = QColor(205, 190, 229)
 
 FONT_FAMILY = "Microsoft YaHei UI"
 

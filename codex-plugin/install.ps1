@@ -1,6 +1,7 @@
 param(
     [string]$CodexExe,
-    [string]$PythonExe
+    [string]$PythonExe,
+    [string]$CompanionArt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,20 @@ $marketManifest = Join-Path $marketRoot '.agents/plugins/marketplace.json'
 $runtime = Join-Path $installRoot 'runtime'
 $runtimePython = Join-Path $runtime 'Scripts/python.exe'
 $installUtf8 = [Text.UTF8Encoding]::new($false)
+$artFiles = @('idle.gif', 'reading.gif', 'thinking.gif', 'ready.gif')
+if (-not $CompanionArt) {
+    $bundledArt = Join-Path $PSScriptRoot 'assets/companion'
+    if (Test-Path -LiteralPath $bundledArt -PathType Container) {
+        $CompanionArt = $bundledArt
+    }
+}
+if ($CompanionArt) {
+    foreach ($file in $artFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $CompanionArt $file) -PathType Leaf)) {
+            throw "Companion artwork is missing $file."
+        }
+    }
+}
 
 if (-not $CodexExe) {
     $found = Get-Command codex -ErrorAction SilentlyContinue
@@ -40,8 +55,18 @@ foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts')) {
     New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot $relative) | Out-Null
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketManifest) | Out-Null
-foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py')) {
+foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py', 'scripts/companion.py', 'scripts/window_reader.py')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relative) -Destination (Join-Path $pluginRoot $relative) -Force
+}
+if ($CompanionArt) {
+    $artTarget = Join-Path $pluginRoot 'assets/companion'
+    New-Item -ItemType Directory -Force -Path $artTarget | Out-Null
+    foreach ($file in @($artFiles + 'SOURCE.md')) {
+        $inputFile = Join-Path $CompanionArt $file
+        if (Test-Path -LiteralPath $inputFile -PathType Leaf) {
+            Copy-Item -LiteralPath $inputFile -Destination $artTarget -Force
+        }
+    }
 }
 foreach ($module in @('capture.py', 'overlay.py')) {
     Copy-Item -LiteralPath (Join-Path $repo $module) -Destination (Join-Path $pluginRoot "scripts/$module") -Force

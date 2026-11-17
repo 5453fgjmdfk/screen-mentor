@@ -23,10 +23,14 @@ import native
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
 from target import tighten
+from window_reader import WindowReader
 
 
 COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
 POLL_WAIT_SECONDS = 40
+PROGRESS_PHASES = {"observed": ("已看到", "reading"),
+                   "checking": ("正在核对", "thinking"),
+                   "concluded": ("判断小结", "thinking")}
 
 
 def tool(name, description, properties, required=(), *, read_only=False):
@@ -53,6 +57,11 @@ TOOLS = [
          {"practice_id": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": 240},
           "shortcut": {"type": "string", "minLength": 1, "maxLength": 50}, "text_to_type": COPY_TEXT},
          ("practice_id", "text")),
+    tool("show_practice_progress", "每完成一段有新信息的观察、核对或判断，立即在角色气泡更新一句面向用户的小结。",
+         {"practice_id": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": 110},
+          "phase": {"type": "string", "enum": list(PROGRESS_PHASES),
+                    "description": "已看到的事实 observed、正在核对的问题 checking，或可公开的判断小结 concluded。"},
+          "snapshot_id": {"type": "string"}}, ("practice_id", "text")),
     tool("list_windows", "查找可用于伴学的桌面窗口。可按标题或软件名筛选。",
          {"query": {"type": "string", "maxLength": 120}}, read_only=True),
     tool("observe_window", "捕获明确选定的单个 Windows 窗口，返回图片和标注用的快照 ID。",
@@ -104,6 +113,8 @@ def validated_arguments(name, arguments):
         if rule["type"] == "string":
             if not isinstance(value, str) or not rule.get("minLength", 0) <= len(value) <= rule.get("maxLength", 128):
                 raise ValueError(f"{key} 的文字长度无效。")
+            if "enum" in rule and value not in rule["enum"]:
+                raise ValueError(f"{key} 不是有效选项。")
             if key == "window_id" and not valid_window_id(value):
                 raise ValueError("请使用 list_windows 返回的 window_id。")
         elif rule["type"] == "array":
@@ -142,6 +153,9 @@ class MentorServer(QObject):
         self.displayed_regions = ()
         self.guide_window = None
         self.pending_hint = None
+        self.action = None
+        self.mouse_down = False
+        self.pressed_target = False
         self.waiting = False
         self.last_watchdog = self.last_analysis = 0.0
         self.last_window = None
@@ -155,6 +169,9 @@ class MentorServer(QObject):
         self.expiration.timeout.connect(self.hide_guide)
         self.watchdog = QTimer(self)
         self.watchdog.timeout.connect(self.watch_practice)
+        self.action_poll = QTimer(self)
+        self.action_poll.setInterval(16)
+        self.action_poll.timeout.connect(self.check_action)
 
     def start(self):
         Thread(target=self.read_requests, daemon=True).start()
@@ -170,10 +187,43 @@ class MentorServer(QObject):
     def hide_guide(self):
         self.guard.stop()
         self.expiration.stop()
+        self.action_poll.stop()
+        self.action = None
         self.displayed_frame = self.guide_window = None
         self.displayed_regions = ()
         self.overlay.clear()
         self.overlay.hide()
+
+    def check_action(self):
+        mouse = native.primary_mouse()
+        if not self.action or not mouse:
+            return
+        down, x, y = mouse
+        if down == self.mouse_down:
+            return
+        self.mouse_down = down
+        (left, top, width, height), destination = self.action
+        in_source = left - 4 <= x <= left + width + 4 and top - 4 <= y <= top + height + 4
+        if down:
+            hwnd = self.guide_window[0]
+            self.pressed_target = in_source and native.point_belongs_to(hwnd, x, y)
+            return
+        matched = (math.hypot(x - destination[0], y - destination[1]) <= 16
+                   if destination is not None else in_source)
+        accepted = self.pressed_target and matched
+        self.pressed_target = False
+        if not accepted or not self.practice.running.is_set():
+            return
+        self.hide_guide()
+        self.snapshot = self.practice_frame = None
+        self.practice.force = True
+        self.practice.recheck_reason = "action_performed"
+        self.practice.pending = time.monotonic()
+        self.practice.sample_after = self.practice.pending
+        self.last_watchdog = self.practice.pending
+        self.practice.set_progress("已检测到拖动，正在查看结果" if destination else "已检测到点击，正在查看结果",
+                                   pose="reading")
+        self.practice.wake.emit()
 
     def check_window(self):
         try:
@@ -192,7 +242,8 @@ class MentorServer(QObject):
         hwnd = int(window_id)
         window = native.window_state(hwnd)
         _, _, width, height, _ = window
-        image = native.read_window(hwnd, width, height)
+        with WindowReader() as reader:
+            image = reader.read(hwnd, width, height)
         if native.window_state(hwnd) != window:
             raise native.WindowError("截图时窗口发生了移动，请重新观察。")
         image.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
@@ -278,6 +329,7 @@ class MentorServer(QObject):
         if now - practice.last_poll >= CHAT_LEASE_SECONDS:
             if not practice.chat_suspended:
                 practice.chat_suspended = True
+                practice.set_progress()
                 practice.set_status("原聊天已停止接收画面。回原聊天发「继续伴学」，即可从当前界面接着做。")
             return
         hwnd = practice.scope.active()
@@ -289,7 +341,9 @@ class MentorServer(QObject):
         if now - self.last_watchdog < 20:
             return
         if practice.last_sample is None or now - practice.last_sample > 8:
-            practice.set_status("练习窗口暂时读不到。窗口恢复后会自动重试。")
+            practice.set_progress()
+            if not practice.capture_error:
+                practice.set_status("正在等练习窗口返回可用画面。")
             self.last_watchdog = now
             return
         if practice.current is None or practice.current[0] != hwnd or practice.pending is None:
@@ -333,11 +387,11 @@ class MentorServer(QObject):
         try:
             while not practice.ending.is_set():
                 if practice.running.is_set() and practice.issues:
-                    problem, image = practice.issues.popleft()
+                    problem, images = practice.issues.popleft()
                     blocks = [text_content({"state": "issue", "user_reported": problem,
-                                            "screenshot_attached": image is not None})]
-                    if image is not None:
-                        blocks.append(self.encode_image(image))
+                                            "screenshot_attached": bool(images), "attachment_count": len(images)})]
+                    blocks.extend(self.encode_image(image) for image in images)
+                    practice.set_progress("正在查看你提交的反馈", pose="reading")
                     return blocks
                 frame = practice.take() if practice.running.is_set() else None
                 if frame:
@@ -354,14 +408,17 @@ class MentorServer(QObject):
                         elif practice.recheck_reason:
                             event["reason"], practice.recheck_reason = practice.recheck_reason, None
                         self.last_window = hwnd
-                        if not self.overlay.isVisible() and event.get("reason") != "window_changed":
-                            practice.set_status("正在看当前界面…")
+                        practice.set_progress("画面已收到，正在判断下一步")
                         return [text_content(event), *self.image_blocks(image)]
                 if time.monotonic() >= deadline:
                     state = "waiting" if practice.running.is_set() else "paused"
-                    reason = ("waiting_for_window" if practice.scope.active() is None
-                              else "no_new_frame" if practice.current is None else "unchanged")
-                    return [text_content({"state": state, "reason": reason})]
+                    reason = ("waiting_for_window" if practice.scope.active() is None else
+                              "capture_retry" if practice.capture_error else
+                              "no_new_frame" if practice.current is None else "unchanged")
+                    event = {"state": state, "reason": reason}
+                    if reason == "capture_retry":
+                        event["detail"] = practice.capture_error
+                    return [text_content(event)]
                 loop.exec()
             return [text_content({"state": "ended"})]
         finally:
@@ -429,6 +486,12 @@ class MentorServer(QObject):
         if live:
             self.displayed_frame, self.displayed_regions = self.practice_frame, regions
             self.practice.show_instruction(text, text_to_type)
+            if not is_input:
+                self.action = ((gx, gy, right - gx, bottom - gy), (dx, dy) if dragging else None)
+                mouse = native.primary_mouse()
+                self.mouse_down = bool(mouse and mouse[0])
+                self.pressed_target = False
+                self.action_poll.start()
         else:
             self.expiration.start(seconds * 1000)
         self.guard.start(250)
@@ -476,13 +539,21 @@ class MentorServer(QObject):
         try:
             name = params.get("name")
             args = validated_arguments(name, params.get("arguments", {}))
-            if (name in {"observe_window", "show_guide", "show_practice_hint"} and self.practice
+            if (name in {"observe_window", "show_guide", "show_practice_hint", "show_practice_progress"} and self.practice
                     and not self.practice.ending.is_set() and not self.practice.running.is_set()):
                 return {"content": [text_content({"state": "paused", "shown": False})]}
             if name == "start_live":
                 blocks = self.start_practice(**args)
             elif name == "wait_for_practice_change":
                 blocks = self.wait_for_practice_change(**args)
+            elif name == "show_practice_progress":
+                if not self.practice or self.practice.ending.is_set() or args["practice_id"] != self.practice_id:
+                    raise ValueError("当前工具没有对应的伴学会话。")
+                if args.get("snapshot_id") and (not self.snapshot or self.snapshot.id != args["snapshot_id"]):
+                    raise ValueError("练习画面已切换，请先等待新画面。")
+                label, pose = PROGRESS_PHASES[args.get("phase", "checking")]
+                self.practice.set_progress(args["text"].strip(), pose=pose, label=label)
+                blocks = [text_content({"shown": True, "surface": "companion_bubble"})]
             elif name == "show_practice_hint":
                 if not self.practice or self.practice.ending.is_set() or args["practice_id"] != self.practice_id:
                     raise ValueError("当前工具没有对应的伴学会话。")
@@ -520,7 +591,7 @@ class MentorServer(QObject):
                 version = params.get("protocolVersion")
                 response["result"] = {
                     "protocolVersion": version if version in supported else supported[-1],
-                    "serverInfo": {"name": "screen-mentor", "version": "0.5.2"},
+                    "serverInfo": {"name": "screen-mentor", "version": "0.7.5"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":

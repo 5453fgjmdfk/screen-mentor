@@ -71,6 +71,17 @@ process_image = bind(kernel, "QueryFullProcessImageNameW", w.BOOL, w.HANDLE, w.D
 close_handle = bind(kernel, "CloseHandle", w.BOOL, w.HANDLE)
 tick_count = bind(kernel, "GetTickCount", w.DWORD)
 last_input = bind(user, "GetLastInputInfo", w.BOOL, c.POINTER(LastInput))
+key_state = bind(user, "GetAsyncKeyState", c.c_short, c.c_int)
+cursor_position = bind(user, "GetCursorPos", w.BOOL, c.POINTER(w.POINT))
+system_metrics = bind(user, "GetSystemMetrics", c.c_int, c.c_int)
+
+
+def primary_mouse():
+    point = w.POINT()
+    if not cursor_position(c.byref(point)):
+        return None
+    button = 2 if system_metrics(23) else 1  # SM_SWAPBUTTON; VK_RBUTTON / VK_LBUTTON
+    return bool(key_state(button) & 0x8000), point.x, point.y
 
 
 def window_pid(hwnd):

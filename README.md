@@ -7,6 +7,7 @@
 - 用鼠标动画演示点击和拖动。拖动落点用圆圈标示。
 - 指向输入框，在桌面面板提供可复制的内容，也能在屏幕上显示快捷键。
 - 跟随普通桌面软件的新窗口。在面板上暂停、继续、结束，或者把问题和截图发回原聊天。
+- 浮窗支持拖动，气泡可以分段显示观察和判断小结，截图超时时会自动重试。
 
 ## 安装
 
@@ -19,6 +20,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-plugin\install.ps1
 ```
 
 安装程序会创建独立的 Python 环境并注册本地插件。完成后退出并重开 Codex。插件目录里的本地来源叫 **Screen Mentor Local**。
+
+公开版自带简洁的「学伴」浮标。你可以用自己的 GIF 替换外观。把待机、读图、判断、指引就绪动画分别命名为 `idle.gif`、`reading.gif`、`thinking.gif`、`ready.gif`，放在同一个文件夹中，再执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-plugin\install.ps1 -CompanionArt "C:\MyCompanionArt"
+```
 
 ## 开始练习
 
@@ -37,3 +44,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\codex-plugin\install.ps1
 - `capture.py` 提供 Windows DPI 初始化及截图辅助功能。
 
 项目使用 MIT 许可证。
+
+开发记录见 [版本日志](codex-plugin/CHANGELOG.md)。

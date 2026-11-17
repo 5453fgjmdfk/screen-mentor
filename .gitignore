@@ -10,3 +10,4 @@ config.json
 *.jpeg
 *.webp
 *.pdsprj
+codex-plugin/assets/companion/
