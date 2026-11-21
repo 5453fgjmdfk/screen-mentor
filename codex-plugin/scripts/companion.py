@@ -1,20 +1,28 @@
 """Frameless companion with a speech bubble and hover controls."""
 from math import pi, sin
-from pathlib import Path
 
 from PyQt6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QMovie, QPainter,
+    QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter,
     QPainterPath, QPainterPathStroker, QPen, QPixmap, QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
 
+from appearance import AppearanceDialog, BUILT_INS, STATES, SkinLibrary
 
-ART = Path(__file__).resolve().parent.parent / "assets" / "companion"
 SNAP_DISTANCE = 22
 RESTORE_GAP = 30
-SIDE_POSE = QRectF(185, 77, 552, 744)
-BOTTOM_POSE = QRectF(995, 207, 668, 543)
+
+
+def tinted(hex_color, alpha):
+    color = QColor(hex_color)
+    color.setAlpha(alpha)
+    return color
+
+
+def css_fill(hex_color, alpha):
+    color = QColor(hex_color)
+    return f"rgba({color.red()},{color.green()},{color.blue()},{alpha})"
 
 
 def fit_position(position, size, area):
@@ -25,7 +33,7 @@ def fit_position(position, size, area):
 
 
 class CompanionAction(QPushButton):
-    labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止"}
+    labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止", "appearance": "外观"}
 
     def __init__(self, action):
         super().__init__()
@@ -63,6 +71,18 @@ class CompanionAction(QPushButton):
             stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
             mark = stroke.createStroke(curve)
             mark.addEllipse(QRectF(2.05, 9.5, 2.6, 2.6))
+        elif self.action == "appearance":
+            mark.moveTo(4.3, 0)
+            mark.quadTo(6, 2.5, 7.7, 0)
+            mark.lineTo(11.8, 2.2)
+            mark.lineTo(10.7, 5.6)
+            mark.lineTo(9.2, 5)
+            mark.lineTo(9.2, 12)
+            mark.lineTo(2.8, 12)
+            mark.lineTo(2.8, 5)
+            mark.lineTo(1.3, 5.6)
+            mark.lineTo(.2, 2.2)
+            mark.closeSubpath()
         else:
             mark.addRoundedRect(QRectF(0, 0, 12, 12), 1.6, 1.6)
         scale = 12 / mark.boundingRect().height()
@@ -105,6 +125,7 @@ class EdgeThought(QWidget):
         self.setFont(font)
         self.text = ""
         self.body_size = QSize()
+        self.skin_colors = BUILT_INS[0].palette
 
     def set_text(self, text):
         text = " ".join(text.split())
@@ -155,8 +176,9 @@ class EdgeThought(QWidget):
         body = QRectF(1, 1, self.body_size.width() - 2, self.body_size.height() - 2)
         if self.edge == Qt.Edge.LeftEdge:
             body.translate(self.trail, 0)
-        painter.setPen(QPen(QColor(174, 150, 224, 194), 1))
-        painter.setBrush(QColor(38, 29, 60, 231))
+        palette = self.skin_colors
+        painter.setPen(QPen(tinted(palette.border, 220), 1))
+        painter.setBrush(tinted(palette.background, 231))
         painter.drawRoundedRect(body, 12, 12)
         if self.edge == Qt.Edge.BottomEdge:
             x = min(max(12, self.dot_axis.x()), self.width() - 12)
@@ -167,10 +189,10 @@ class EdgeThought(QWidget):
             left = self.edge == Qt.Edge.LeftEdge
             dots = ((QPointF(3 if left else self.width() - 3, y), 1.8),
                     (QPointF(10 if left else self.width() - 10, y - 3), 3))
-        painter.setBrush(QColor(65, 49, 96, 230))
+        painter.setBrush(tinted(palette.surface, 230))
         for center, radius in dots:
             painter.drawEllipse(center, radius, radius)
-        painter.setPen(QColor("#f2edff"))
+        painter.setPen(QColor(palette.text))
         painter.drawText(body.adjusted(self.padding - 1, 7, 1 - self.padding, -7),
                          self.text_flags, self.visible_text)
 
@@ -188,12 +210,21 @@ class EdgePeek(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.edge = None
         self.press_at = None
-        self.poses = QPixmap(str(ART / "peek-poses.png"))
+        self.side_pose = QPixmap()
+        self.bottom_pose = QPixmap()
         self.thought = EdgeThought(self)
         self.clock = QElapsedTimer()
         self.animation = QTimer(self)
         self.animation.setInterval(33)
         self.animation.timeout.connect(self.animate)
+
+    def set_skin(self, skin):
+        if self.thought.skin_colors != skin.palette:
+            self.thought.skin_colors = skin.palette
+            self.thought.update()
+        self.side_pose = skin.peek(False)
+        self.bottom_pose = skin.peek(True)
+        self.update()
 
     def dock(self, edge, anchor, area):
         self.edge = edge
@@ -292,11 +323,13 @@ class EdgePeek(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        if self.poses.isNull():
+        bottom = self.edge == Qt.Edge.BottomEdge
+        pose = self.bottom_pose if bottom else self.side_pose
+        if pose.isNull():
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(38, 29, 60, 230))
+            painter.setBrush(tinted(self.thought.skin_colors.background, 230))
             painter.drawRoundedRect(QRectF(self.rect()).adjusted(3, 3, -3, -3), 12, 12)
-            painter.setPen(QColor("#f2edff"))
+            painter.setPen(QColor(self.thought.skin_colors.text))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "学")
             return
 
@@ -305,11 +338,14 @@ class EdgePeek(QWidget):
         idle = max(0, elapsed - .54)
         breathe = .021 * sin(idle * 2.7)
         glance = sin(pi * min(1, max(0, (idle % 5.6 - 3.0) / 1.35))) ** 2
-        if self.edge == Qt.Edge.BottomEdge:
+        size = pose.size().scaled(QSize(82, 67) if bottom else QSize(61, 83),
+                                  Qt.AspectRatioMode.KeepAspectRatio)
+        if bottom:
             painter.translate(0, self.height() * (1 + hidden))
             painter.scale(1, 1 + breathe + .055 * glance)
             painter.translate(0, -self.height())
-            painter.drawPixmap(QRectF(1, 1, 82, 67), self.poses, BOTTOM_POSE)
+            target = QRectF((self.width() - size.width()) / 2, self.height() - size.height(),
+                            size.width(), size.height())
         else:
             if self.edge == Qt.Edge.RightEdge:
                 painter.translate(self.width(), 0)
@@ -319,7 +355,8 @@ class EdgePeek(QWidget):
             painter.translate(3, 55)
             painter.rotate(4 * glance)
             painter.translate(-3, -55)
-            painter.drawPixmap(QRectF(0, 1, 61, 83), self.poses, SIDE_POSE)
+            target = QRectF(0, (self.height() - size.height()) / 2, size.width(), size.height())
+        painter.drawPixmap(target, pose, QRectF(pose.rect()))
 
 
 class CompanionPanel(QWidget):
@@ -360,10 +397,7 @@ class CompanionPanel(QWidget):
         self.hover_timer.timeout.connect(self.hide_controls_if_outside)
         self.controls.installEventFilter(self)
 
-        self.anims = {state: QMovie(str(ART / f"{state}.gif"), parent=self)
-                      for state in ("idle", "reading", "thinking", "ready")}
-        for movie in self.anims.values():
-            movie.setScaledSize(QSize(138, 138))
+        self.anims = {}
         self.state = None
         self.ready_timer = QTimer(self)
         self.ready_timer.setSingleShot(True)
@@ -371,6 +405,55 @@ class CompanionPanel(QWidget):
         self.ready_timer.timeout.connect(lambda: self.set_pose("idle"))
         self.sprite.setToolTip("拖到屏幕两侧或底部，进入探头状态")
         self.add_drag_handle(self.sprite)
+        self.library = SkinLibrary()
+        self.skin = None
+        self.appearance_dialog = None
+        self.refresh_skin()
+        self.skin_timer = QTimer(self)
+        self.skin_timer.setInterval(1500)
+        self.skin_timer.timeout.connect(self.refresh_skin)
+        self.skin_timer.start()
+
+    def refresh_skin(self):
+        skin = self.library.current()
+        if skin == self.skin:
+            return
+        previous_skin = self.skin
+        self.skin = skin
+        palette = skin.palette
+        self.setStyleSheet(
+            f"QWidget{{color:{palette.text};font:13px 'Microsoft YaHei UI';}}"
+            f"QFrame#companionBubble{{background:{css_fill(palette.background, 239)};"
+            f"border:1px solid {palette.border};border-radius:14px;}}"
+            f"QLabel#companionProgress{{color:{palette.highlight};}}"
+            f"QLabel#companionTail{{color:{palette.surface};font-size:13px;}}"
+            f"QPlainTextEdit#companionInput{{background:{palette.surface};padding:4px;border-radius:7px;}}"
+            f"QPushButton{{color:{palette.text};background:{css_fill(palette.surface, 219)};"
+            f"border:1px solid {palette.border};border-radius:10px;padding:5px 10px;}}"
+            f"QPushButton:hover{{background:{palette.border};}}"
+        )
+        if previous_skin is None or previous_skin.path != skin.path:
+            pose = self.state or "idle"
+            self.sprite.clear()
+            for movie in self.anims.values():
+                movie.stop()
+                movie.deleteLater()
+            self.anims = {state: skin.movie(state, self, self.sprite.size()) for state in STATES}
+            self.state = None
+            self.set_pose(pose)
+        self.peek.set_skin(skin)
+
+    def open_appearance(self):
+        if self.appearance_dialog is None:
+            dialog = AppearanceDialog(self if self.isVisible() else None, self.library, self.library.current())
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.accepted.connect(self.refresh_skin)
+            dialog.finished.connect(self.forget_appearance)
+            self.appearance_dialog = dialog
+        self.appearance_dialog.show_centered()
+
+    def forget_appearance(self):
+        self.appearance_dialog = None
 
     def set_pose(self, state):
         if self.state == state:
@@ -484,6 +567,9 @@ class CompanionPanel(QWidget):
         super().closeEvent(event)
         if event.isAccepted():
             self.peek.close()
+            self.skin_timer.stop()
+            if self.appearance_dialog is not None:
+                self.appearance_dialog.close()
             self.ready_timer.stop()
             for movie in self.anims.values():
                 movie.stop()

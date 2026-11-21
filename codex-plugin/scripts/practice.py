@@ -102,13 +102,6 @@ class Practice(QObject):
 
         self.panel = CompanionPanel()
         self.panel.closed.connect(self.close)
-        self.panel.setStyleSheet(
-            "QWidget{color:#f2edff;font:13px 'Microsoft YaHei UI';}"
-            "QFrame#companionBubble{background:rgba(37,29,59,239);border:1px solid #79639f;border-radius:14px;}"
-            "QPushButton{color:#f2edff;background:rgba(52,41,78,219);border:1px solid #8068a9;"
-            "border-radius:10px;padding:5px 10px;}"
-            "QPushButton:hover{background:#68518a;}"
-        )
         layout = QVBoxLayout(self.panel)
         layout.setContentsMargins(3, 3, 3, 3)
         layout.setSpacing(1)
@@ -131,7 +124,7 @@ class Practice(QObject):
         self.progress.setTextFormat(Qt.TextFormat.PlainText)
         self.progress.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.progress.setWordWrap(True)
-        self.progress.setStyleSheet("color:#cbb6fa;")
+        self.progress.setObjectName("companionProgress")
         self.progress.hide()
         bubble_layout.addWidget(self.progress)
         self.progress_timer = QTimer(self)
@@ -152,13 +145,13 @@ class Practice(QObject):
         self.input_value = QPlainTextEdit()
         self.input_value.setReadOnly(True)
         self.input_value.setFixedHeight(53)
-        self.input_value.setStyleSheet("background:#342851;padding:4px;border-radius:7px;")
+        self.input_value.setObjectName("companionInput")
         copy_layout.addWidget(self.input_value)
         bubble_layout.addWidget(self.copy_area)
         self.copy_area.hide()
         tail = QLabel("▼")
         tail.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tail.setStyleSheet("color:rgba(48,37,76,243);font-size:13px;")
+        tail.setObjectName("companionTail")
         tail.setFixedHeight(12)
         layout.addWidget(tail)
         layout.addWidget(self.panel.sprite, alignment=Qt.AlignmentFlag.AlignHCenter)
@@ -167,9 +160,11 @@ class Practice(QObject):
         self.pause_button.clicked.connect(self.toggle)
         issue = CompanionAction("help")
         issue.clicked.connect(self.report_issue)
+        appearance = CompanionAction("appearance")
+        appearance.clicked.connect(self.panel.open_appearance)
         end = CompanionAction("stop")
         end.clicked.connect(self.panel.close)
-        for button in (self.pause_button, issue, end):
+        for button in (self.pause_button, issue, appearance, end):
             actions.addWidget(button)
         layout.addWidget(self.panel.controls, alignment=Qt.AlignmentFlag.AlignHCenter)
         screen = app.primaryScreen().availableGeometry()

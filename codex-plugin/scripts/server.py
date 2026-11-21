@@ -20,6 +20,7 @@ from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 import native
+from appearance import AppearanceDialog, SkinLibrary
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
 from target import tighten
@@ -46,6 +47,7 @@ def tool(name, description, properties, required=(), *, read_only=False):
 
 
 TOOLS = [
+    tool("open_appearance", "用户明确想换肤、编辑外观或打开外观管理器时，打开本机伴学外观窗口。", {}),
     tool("start_live", "启动或恢复当前对话的实时伴学。同一练习窗口仍在伴学时，返回原有 practice_id。",
          {"window_id": {"type": "string", "pattern": "^[0-9]+$"},
           "additional_window_ids": {"type": "array", "maxItems": 8,
@@ -147,6 +149,7 @@ class MentorServer(QObject):
         self.app = app
         self.snapshot = None
         self.practice = None
+        self.appearance_dialog = None
         self.practice_id = None
         self.practice_frame = None
         self.displayed_frame = None
@@ -542,7 +545,16 @@ class MentorServer(QObject):
             if (name in {"observe_window", "show_guide", "show_practice_hint", "show_practice_progress"} and self.practice
                     and not self.practice.ending.is_set() and not self.practice.running.is_set()):
                 return {"content": [text_content({"state": "paused", "shown": False})]}
-            if name == "start_live":
+            if name == "open_appearance":
+                if self.practice and not self.practice.ending.is_set():
+                    self.practice.panel.open_appearance()
+                else:
+                    if self.appearance_dialog is None or not self.appearance_dialog.isVisible():
+                        library = SkinLibrary()
+                        self.appearance_dialog = AppearanceDialog(None, library, library.current())
+                    self.appearance_dialog.show_centered()
+                blocks = [text_content({"opened": True, "surface": "appearance_manager"})]
+            elif name == "start_live":
                 blocks = self.start_practice(**args)
             elif name == "wait_for_practice_change":
                 blocks = self.wait_for_practice_change(**args)
@@ -591,7 +603,7 @@ class MentorServer(QObject):
                 version = params.get("protocolVersion")
                 response["result"] = {
                     "protocolVersion": version if version in supported else supported[-1],
-                    "serverInfo": {"name": "screen-mentor", "version": "0.8.1"},
+                    "serverInfo": {"name": "screen-mentor", "version": "0.9.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":

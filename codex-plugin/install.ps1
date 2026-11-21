@@ -40,7 +40,7 @@ foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'ass
     New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot $relative) | Out-Null
 }
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketManifest) | Out-Null
-foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py', 'scripts/companion.py', 'scripts/window_reader.py', 'assets/companion/idle.gif', 'assets/companion/reading.gif', 'assets/companion/thinking.gif', 'assets/companion/ready.gif', 'assets/companion/peek-poses.png', 'assets/companion/SOURCE.md')) {
+foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py', 'scripts/companion.py', 'scripts/appearance.py', 'scripts/window_reader.py', 'assets/companion/idle.gif', 'assets/companion/reading.gif', 'assets/companion/thinking.gif', 'assets/companion/ready.gif', 'assets/companion/peek-poses.png', 'assets/companion/SOURCE.md')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relative) -Destination (Join-Path $pluginRoot $relative) -Force
 }
 foreach ($module in @('capture.py', 'overlay.py')) {
@@ -83,3 +83,15 @@ if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
         Remove-Item -LiteralPath $shortcutPath
     }
 }
+
+$skinLauncher = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' (Join-Path $pluginRoot 'scripts/appearance.py')
+if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the appearance manager.' }
+$skinPython = Join-Path (Split-Path -Parent $runtimeResolved) 'pythonw.exe'
+$appearanceLabel = -join (0x5916, 0x89C2, 0x7BA1, 0x7406 | ForEach-Object { [char]$_ })
+$skinShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut(
+    (Join-Path $desktop ($manifest.interface.displayName + ' - ' + $appearanceLabel + '.lnk'))
+)
+$skinShortcut.TargetPath = $skinPython
+$skinShortcut.Arguments = '-B "' + $skinLauncher + '"'
+$skinShortcut.WorkingDirectory = Split-Path -Parent $skinLauncher
+$skinShortcut.Save()
