@@ -2,7 +2,7 @@
 import math
 
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
 POLL_WAIT_SECONDS = 40
 SESSION_KEY = {"type": "string", "description": "本条对话从 start_live 收到的 practice_id。"}

@@ -9,7 +9,7 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 from PyQt6.QtCore import QElapsedTimer, QRect, QRectF, QSettings, QSignalBlocker, QSize, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QIcon, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
@@ -19,6 +19,7 @@ from skin_assets import ASSET_FILES, FILE_LIMIT, MIB, ROLES, STATES, CropDialog,
 
 
 ART = Path(__file__).resolve().parent.parent / "assets" / "companion"
+APP_ICON = ART.parent / "app-icon.ico"
 PEEK_BOUNDS = {False: QRect(185, 77, 552, 744), True: QRect(995, 207, 668, 543)}
 BLINK_BOUNDS = {
     False: (QRect(276, 369, 119, 106), QRect(426, 428, 128, 101)),
@@ -731,6 +732,7 @@ if __name__ == "__main__":
 
     enable_dpi_awareness()
     app = QApplication(sys.argv[:1])
+    app.setWindowIcon(QIcon(str(APP_ICON)))
     library = SkinLibrary()
     dialog = AppearanceDialog(None, library, library.current())
     dialog.show_centered()

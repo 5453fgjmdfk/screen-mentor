@@ -4,6 +4,8 @@
 
 ## 安装
 
+发布包解压后，双击根目录的 `install-desktop.cmd` 只装桌面学伴，或双击 `install-codex.cmd` 同时注册 Codex 插件。首次安装需 Python 3.11+，安装过程会下载 Python 依赖。桌面应用可以独立使用。
+
 需要 Windows 上的 Codex 桌面版和 Python 3.11+。先打开 Codex，在本目录的 PowerShell 运行：
 
 ```powershell

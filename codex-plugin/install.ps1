@@ -1,16 +1,19 @@
 param(
     [string]$CodexExe,
     [string]$PythonExe,
-    [switch]$DesktopOnly
+    [switch]$DesktopOnly,
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'ScreenMentor'),
+    [string]$ShortcutDirectory = [Environment]::GetFolderPath('DesktopDirectory')
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$installRoot = Join-Path $env:LOCALAPPDATA 'ScreenMentor'
-$marketRoot = Join-Path $installRoot 'marketplace'
+$manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot '.codex-plugin/plugin.json') | ConvertFrom-Json
+$desktopRoot = Join-Path $InstallRoot ('versions/' + $manifest.version)
+$marketRoot = Join-Path $InstallRoot 'marketplace'
 $pluginRoot = Join-Path $marketRoot 'screen-mentor'
 $marketManifest = Join-Path $marketRoot '.agents/plugins/marketplace.json'
-$runtime = Join-Path $installRoot 'runtime'
+$runtime = Join-Path $InstallRoot 'runtime'
 $runtimePython = Join-Path $runtime 'Scripts/python.exe'
 $installUtf8 = [Text.UTF8Encoding]::new($false)
 
@@ -24,91 +27,104 @@ if (-not $DesktopOnly -and -not $CodexExe) {
     }
 }
 if (-not $DesktopOnly -and -not $CodexExe) {
-    throw 'Open Codex desktop first, or supply -CodexExe.'
+    throw 'Open Codex desktop first, or choose Install Desktop Companion.'
 }
 
 if (-not (Test-Path -LiteralPath $runtimePython)) {
+    $pythonArguments = @()
     if (-not $PythonExe) {
-        $PythonExe = (Get-Command python.exe).Source
+        $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+        $python = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($launcher) {
+            $PythonExe = $launcher.Source
+            $pythonArguments = @('-3')
+        } elseif ($python) {
+            $PythonExe = $python.Source
+        } else {
+            throw 'Python 3.11 or newer is required. Install it from python.org and run the installer again.'
+        }
     }
-    & $PythonExe -m venv $runtime
+    & $PythonExe @pythonArguments -c 'import sys; sys.exit(sys.version_info < (3, 11))'
+    if ($LASTEXITCODE -ne 0) { throw 'Python 3.11 or newer is required.' }
+    & $PythonExe @pythonArguments -m venv $runtime
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the Screen Mentor Python environment.' }
 }
 & $runtimePython -m pip install --disable-pip-version-check -r (Join-Path $PSScriptRoot 'requirements.txt')
 if ($LASTEXITCODE -ne 0) { throw 'Could not install Screen Mentor dependencies.' }
 
-foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'assets/companion')) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $pluginRoot $relative) | Out-Null
-}
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketManifest) | Out-Null
-foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py', 'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py', 'assets/companion/idle.gif', 'assets/companion/reading.gif', 'assets/companion/thinking.gif', 'assets/companion/ready.gif', 'assets/companion/peek-poses.png', 'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relative) -Destination (Join-Path $pluginRoot $relative) -Force
-}
-foreach ($module in @('desktop.py', 'bridge.py', 'protocol.py', 'resident_agent.py')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "scripts/$module") -Destination (Join-Path $pluginRoot "scripts/$module") -Force
-}
-foreach ($module in @('capture.py', 'overlay.py')) {
-    Copy-Item -LiteralPath (Join-Path $repo $module) -Destination (Join-Path $pluginRoot "scripts/$module") -Force
+function Resolve-InstalledPath([string]$Path) {
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = $installUtf8
+        $resolved = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' $Path
+        if ($LASTEXITCODE -ne 0) { throw "Could not resolve install path: $Path" }
+        return $resolved
+    } finally {
+        [Console]::OutputEncoding = $previousEncoding
+    }
 }
 
-$mcpPath = Join-Path $PSScriptRoot '.mcp.json'
-$mcp = Get-Content -Raw -Encoding UTF8 -LiteralPath $mcpPath | ConvertFrom-Json
-$runtimeResolved = & $runtimePython -c 'import os, sys; print(os.path.realpath(sys.executable))'
-if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the Screen Mentor interpreter path.' }
+$runtimeResolved = Resolve-InstalledPath $runtimePython
+$runtimeWindowed = Join-Path (Split-Path -Parent $runtimeResolved) 'pythonw.exe'
+$mcp = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot '.mcp.json') | ConvertFrom-Json
 $mcp.mcpServers.screen_mentor.command = $runtimeResolved
-[IO.File]::WriteAllText((Join-Path $pluginRoot '.mcp.json'), ($mcp | ConvertTo-Json -Depth 12), $installUtf8)
-[IO.File]::WriteAllText($marketManifest, @'
-{
-  "name": "screen-mentor-local",
-  "interface": {"displayName": "Screen Mentor Local"},
-  "plugins": [
-    {
-      "name": "screen-mentor",
-      "source": {"source": "local", "path": "./screen-mentor"},
-      "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
-      "category": "Productivity"
+$mcpJson = $mcp | ConvertTo-Json -Depth 12
+
+$destinations = @($desktopRoot)
+if (-not $DesktopOnly) { $destinations += $pluginRoot }
+$files = @(
+    '.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md',
+    'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py',
+    'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py',
+    'scripts/desktop.py', 'scripts/bridge.py', 'scripts/protocol.py', 'scripts/resident_agent.py',
+    'assets/app-icon.ico', 'assets/app-icon.png', 'assets/companion/idle.gif', 'assets/companion/reading.gif',
+    'assets/companion/ready.gif', 'assets/companion/thinking.gif', 'assets/companion/peek-poses.png',
+    'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md'
+)
+foreach ($destination in $destinations) {
+    foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'assets/companion')) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $destination $relative) | Out-Null
     }
-  ]
+    foreach ($relative in $files) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relative) -Destination (Join-Path $destination $relative) -Force
+    }
+    foreach ($module in @('capture.py', 'overlay.py')) {
+        Copy-Item -LiteralPath (Join-Path $repo $module) -Destination (Join-Path $destination "scripts/$module") -Force
+    }
+    [IO.File]::WriteAllText((Join-Path $destination '.mcp.json'), $mcpJson, $installUtf8)
 }
-'@, $installUtf8)
 
 if (-not $DesktopOnly) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketManifest) | Out-Null
+    $marketplace = @{
+        name = 'screen-mentor-local'
+        interface = @{displayName = 'Screen Mentor Local'}
+        plugins = @(@{
+            name = 'screen-mentor'
+            source = @{source = 'local'; path = './screen-mentor'}
+            policy = @{installation = 'AVAILABLE'; authentication = 'ON_INSTALL'}
+            category = 'Productivity'
+        })
+    }
+    [IO.File]::WriteAllText($marketManifest, ($marketplace | ConvertTo-Json -Depth 8), $installUtf8)
     & $CodexExe plugin marketplace add $marketRoot
     if ($LASTEXITCODE -ne 0) { throw 'Could not register the local marketplace.' }
     & $CodexExe plugin add 'screen-mentor@screen-mentor-local'
     if ($LASTEXITCODE -ne 0) { throw 'Could not install the Screen Mentor plugin.' }
 }
 
-$desktop = [Environment]::GetFolderPath('DesktopDirectory')
-$manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $pluginRoot '.codex-plugin/plugin.json') | ConvertFrom-Json
-$shortcutPath = Join-Path $desktop ($manifest.interface.displayName + '.lnk')
-if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
-    $oldLink = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
-    $oldLauncher = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' (Join-Path $pluginRoot 'scripts/launch.py')
-    if ($oldLink.Arguments.StartsWith('-B "' + $oldLauncher + '" ')) {
-        Remove-Item -LiteralPath $shortcutPath
-    }
-}
-
-$skinLauncher = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' (Join-Path $pluginRoot 'scripts/appearance.py')
-if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the appearance manager.' }
-$skinPython = Join-Path (Split-Path -Parent $runtimeResolved) 'pythonw.exe'
+$desktopResolved = Resolve-InstalledPath $desktopRoot
+New-Item -ItemType Directory -Force -Path $ShortcutDirectory | Out-Null
+$shell = New-Object -ComObject WScript.Shell
 $appearanceLabel = -join (0x5916, 0x89C2, 0x7BA1, 0x7406 | ForEach-Object { [char]$_ })
-$skinShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut(
-    (Join-Path $desktop ($manifest.interface.displayName + ' - ' + $appearanceLabel + '.lnk'))
-)
-$skinShortcut.TargetPath = $skinPython
-$skinShortcut.Arguments = '-B "' + $skinLauncher + '"'
-$skinShortcut.WorkingDirectory = Split-Path -Parent $skinLauncher
-$skinShortcut.Save()
-
-$deskLauncher = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' (Join-Path $pluginRoot 'scripts/desktop.py')
-if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the desktop companion.' }
-$deskLabel = -join (0x684C, 0x9762, 0x5B66, 0x4F34 | ForEach-Object { [char]$_ })
-$deskShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut(
-    (Join-Path $desktop ($manifest.interface.displayName + ' - ' + $deskLabel + '.lnk'))
-)
-$deskShortcut.TargetPath = $skinPython
-$deskShortcut.Arguments = '-B "' + $deskLauncher + '"'
-$deskShortcut.WorkingDirectory = Split-Path -Parent $deskLauncher
-$deskShortcut.Save()
+$desktopLabel = -join (0x684C, 0x9762, 0x5B66, 0x4F34 | ForEach-Object { [char]$_ })
+foreach ($shortcut in @(@{Label = $appearanceLabel; File = 'appearance.py'}, @{Label = $desktopLabel; File = 'desktop.py'})) {
+    $path = Join-Path $ShortcutDirectory ($manifest.interface.displayName + ' - ' + $shortcut.Label + '.lnk')
+    $link = $shell.CreateShortcut($path)
+    $link.TargetPath = $runtimeWindowed
+    $link.Arguments = '-B "' + (Join-Path $desktopResolved ('scripts/' + $shortcut.File)) + '"'
+    $link.WorkingDirectory = Join-Path $desktopResolved 'scripts'
+    $link.IconLocation = (Join-Path $desktopResolved 'assets/app-icon.ico') + ',0'
+    $link.Save()
+}
+Write-Output "Screen Mentor $($manifest.version) installed."

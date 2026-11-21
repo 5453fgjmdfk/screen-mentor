@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout,
 )
 
-from appearance import ART
+from appearance import APP_ICON
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
 from server import MentorServer
@@ -268,7 +268,7 @@ class Desktop(QObject):
         self.listener = QLocalServer(self)
         self.listener.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.listener.newConnection.connect(self.accept)
-        self.tray = QSystemTrayIcon(QIcon(str(ART / "idle.gif")), self)
+        self.tray = QSystemTrayIcon(QIcon(str(APP_ICON)), self)
         self.tray.setToolTip("屏幕伴学")
         self.menu = QMenu()
         self.menu.addAction("日常对话", self.show_chat)
@@ -334,6 +334,7 @@ class Desktop(QObject):
 
 def main():
     app = QApplication(sys.argv[:1])
+    app.setWindowIcon(QIcon(str(APP_ICON)))
     app.setQuitOnLastWindowClosed(False)
     PROFILE.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(PROFILE / "desktop.lock"))
