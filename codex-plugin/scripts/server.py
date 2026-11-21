@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import io
 import json
 import math
-import sys
-from threading import Thread
 import time
 from uuid import uuid4
 
@@ -16,77 +14,17 @@ from capture import enable_dpi_awareness
 enable_dpi_awareness()
 
 from PIL import Image, ImageChops, ImageStat
-from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QEventLoop, QObject, QTimer
 
 import native
-from appearance import AppearanceDialog, SkinLibrary
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
+from protocol import POLL_WAIT_SECONDS, PROGRESS_PHASES, validated_arguments
 from target import tighten
 from window_reader import WindowReader
 
 
-COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
-POLL_WAIT_SECONDS = 40
-PROGRESS_PHASES = {"observed": ("已看到", "reading"),
-                   "checking": ("正在核对", "thinking"),
-                   "concluded": ("判断小结", "thinking")}
-
-
-def tool(name, description, properties, required=(), *, read_only=False):
-    return {
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object", "properties": properties,
-            "required": list(required), "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": False, "openWorldHint": False},
-    }
-
-
-TOOLS = [
-    tool("open_appearance", "用户明确想换肤、编辑外观或打开外观管理器时，打开本机伴学外观窗口。", {}),
-    tool("start_live", "启动或恢复当前对话的实时伴学。同一练习窗口仍在伴学时，返回原有 practice_id。",
-         {"window_id": {"type": "string", "pattern": "^[0-9]+$"},
-          "additional_window_ids": {"type": "array", "maxItems": 8,
-                                    "items": {"type": "string", "pattern": "^[0-9]+$"},
-                                    "description": "用户已经指定要一起跟踪的其他软件窗口。"}}, ("window_id",)),
-    tool("wait_for_practice_change", f"等待最多 {POLL_WAIT_SECONDS} 秒，返回新画面、问题、等待或明确结束。等待超时不代表结束。",
-         {"practice_id": {"type": "string"}}, ("practice_id",), read_only=True),
-    tool("show_practice_hint", "在练习窗口所在的屏幕上显示穿透提示卡。快捷键传 shortcut；有位置的点击、输入或拖动优先用 show_guide。",
-         {"practice_id": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": 240},
-          "shortcut": {"type": "string", "minLength": 1, "maxLength": 50}, "text_to_type": COPY_TEXT},
-         ("practice_id", "text")),
-    tool("show_practice_progress", "每完成一段有新信息的观察、核对或判断，立即在角色气泡更新一句面向用户的小结。",
-         {"practice_id": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": 110},
-          "phase": {"type": "string", "enum": list(PROGRESS_PHASES),
-                    "description": "已看到的事实 observed、正在核对的问题 checking，或可公开的判断小结 concluded。"},
-          "snapshot_id": {"type": "string"}}, ("practice_id", "text")),
-    tool("list_windows", "查找可用于伴学的桌面窗口。可按标题或软件名筛选。",
-         {"query": {"type": "string", "maxLength": 120}}, read_only=True),
-    tool("observe_window", "捕获明确选定的单个 Windows 窗口，返回图片和标注用的快照 ID。",
-         {"window_id": {"type": "string", "pattern": "^[0-9]+$"}}, ("window_id",), read_only=True),
-    tool("show_guide", "在软件画面上指出点击或输入位置。拖动时框选起点并传入 drag_to_x、drag_to_y，显示起点到落点的箭头。坐标使用截图像素。",
-         {
-             "snapshot_id": {"type": "string"},
-             "x": {"type": "number", "minimum": 0},
-             "y": {"type": "number", "minimum": 0},
-             "width": {"type": "number", "exclusiveMinimum": 0},
-             "height": {"type": "number", "exclusiveMinimum": 0},
-             "text": {"type": "string", "minLength": 1, "maxLength": 40},
-             "detail": {"type": "string", "maxLength": 180},
-             "input_field": {"type": "boolean", "description": "是文本输入框时传 true。保留卡片和指向箭头，隐藏框线。"},
-             "drag_to_x": {"type": "number", "minimum": 0},
-             "drag_to_y": {"type": "number", "minimum": 0},
-             "text_to_type": COPY_TEXT,
-             "step": {"type": "integer", "minimum": 1, "maximum": 999},
-             "seconds": {"type": "integer", "minimum": 3, "maximum": 45},
-         }, ("snapshot_id", "x", "y", "width", "height", "text")),
-    tool("clear_guide", "清除屏幕标注并使当前快照失效。", {}),
-]
-TOOL_SCHEMAS = {item["name"]: item["inputSchema"] for item in TOOLS}
+RECONNECT_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -103,54 +41,16 @@ def text_content(data):
     return {"type": "text", "text": text}
 
 
-def validated_arguments(name, arguments):
-    schema = TOOL_SCHEMAS.get(name)
-    if schema is None:
-        raise ValueError("未知的工具。")
-    fields = schema["properties"]
-    if not isinstance(arguments, dict) or set(arguments) - fields.keys() or set(schema["required"]) - arguments.keys():
-        raise ValueError("工具的参数不完整，或包含不支持的参数。")
-    for key, value in arguments.items():
-        rule = fields[key]
-        if rule["type"] == "string":
-            if not isinstance(value, str) or not rule.get("minLength", 0) <= len(value) <= rule.get("maxLength", 128):
-                raise ValueError(f"{key} 的文字长度无效。")
-            if "enum" in rule and value not in rule["enum"]:
-                raise ValueError(f"{key} 不是有效选项。")
-            if key == "window_id" and not valid_window_id(value):
-                raise ValueError("请使用 list_windows 返回的 window_id。")
-        elif rule["type"] == "array":
-            if not isinstance(value, list) or len(value) > rule["maxItems"] or not all(map(valid_window_id, value)):
-                raise ValueError("请提供有效的窗口列表。")
-        elif rule["type"] == "boolean":
-            if type(value) is not bool:
-                raise ValueError(f"{key} 必须为 true 或 false。")
-        else:
-            allowed = (int,) if rule["type"] == "integer" else (int, float)
-            if type(value) not in allowed or abs(value) > 10**7 or not math.isfinite(value):
-                raise ValueError(f"{key} 必须是有效数字。")
-            if not rule.get("minimum", -math.inf) <= value <= rule.get("maximum", math.inf):
-                raise ValueError(f"{key} 超出范围。")
-            if "exclusiveMinimum" in rule and value <= rule["exclusiveMinimum"]:
-                raise ValueError(f"{key} 必须大于零。")
-    return arguments
-
-
-def valid_window_id(value):
-    return (isinstance(value, str) and 0 < len(value) <= 20 and value.isascii()
-            and value.isdecimal() and 0 < int(value) < 2**64)
-
-
 class MentorServer(QObject):
-    received = pyqtSignal(object)
-
-    def __init__(self, app: QApplication):
+    def __init__(self, app, archive):
         super().__init__()
-        self.app = app
+        self.archive = archive
         self.snapshot = None
-        self.practice = None
-        self.appearance_dialog = None
+        self.snapshot_owner = None
+        self.practice = Practice(None, app, persistent=True)
+        self.practice.wake.connect(self.invalidate_practice_guide)
         self.practice_id = None
+        self.practice_owner = None
         self.practice_frame = None
         self.displayed_frame = None
         self.displayed_regions = ()
@@ -164,7 +64,6 @@ class MentorServer(QObject):
         self.last_window = None
         self.idle_rechecked = False
         self.overlay = GuideOverlay()
-        self.received.connect(self.respond)
         self.guard = QTimer(self)
         self.guard.timeout.connect(self.check_window)
         self.expiration = QTimer(self)
@@ -175,17 +74,6 @@ class MentorServer(QObject):
         self.action_poll = QTimer(self)
         self.action_poll.setInterval(16)
         self.action_poll.timeout.connect(self.check_action)
-
-    def start(self):
-        Thread(target=self.read_requests, daemon=True).start()
-
-    def read_requests(self):
-        for line in sys.stdin.buffer:
-            try:
-                self.received.emit(json.loads(line))
-            except (ValueError, UnicodeError):
-                self.received.emit({})
-        self.received.emit(None)
 
     def hide_guide(self):
         self.guard.stop()
@@ -265,20 +153,28 @@ class MentorServer(QObject):
         meta = {"snapshot_id": self.snapshot.id, "width": image.width, "height": image.height}
         return [text_content(meta), self.encode_image(image)]
 
-    def start_practice(self, window_id, additional_window_ids=()):
+    def start_practice(self, window_id, additional_window_ids=(), *, owner, practice_id=None):
         windows = tuple(dict.fromkeys(map(int, (window_id, *additional_window_ids))))
-        if self.practice and not self.practice.ending.is_set():
+        if not self.practice.ending.is_set():
+            if practice_id != self.practice_id:
+                raise ValueError("另一条对话正在伴学。请先结束原会话，或用原 practice_id 恢复。")
             if not all(self.practice.scope.accepts(hwnd) for hwnd in windows):
                 raise ValueError("已有一场不同窗口的伴学。请先结束旧练习，再开始新练习。")
+            if self.waiting and owner != self.practice_owner:
+                raise ValueError("原连接还在等待画面，请稍后重试。")
+            self.practice_owner = owner
             self.renew_practice(explicit=True)
             return [text_content({"practice_id": self.practice_id, "state": "resumed"})]
+        if self.waiting:
+            raise ValueError("上一场伴学正在退出，请稍后重试。")
         scope = WindowScope(windows)
         self.hide_guide()
         self.snapshot = self.practice_frame = None
         self.pending_hint = None
-        self.practice = Practice(scope, self.app)
-        self.practice.wake.connect(self.invalidate_practice_guide)
+        self.practice.begin(scope)
         self.practice_id = uuid4().hex
+        self.practice_owner = owner
+        self.snapshot_owner = None
         self.last_watchdog = self.last_analysis = time.monotonic()
         self.last_window = None
         self.idle_rechecked = False
@@ -327,13 +223,20 @@ class MentorServer(QObject):
             self.watchdog.stop()
             return
         now = time.monotonic()
-        if not practice.running.is_set():
+        idle_for = now - practice.last_poll
+        if idle_for >= CHAT_LEASE_SECONDS + RECONNECT_SECONDS:
+            practice.close()
             return
-        if now - practice.last_poll >= CHAT_LEASE_SECONDS:
+        if idle_for >= CHAT_LEASE_SECONDS:
             if not practice.chat_suspended:
                 practice.chat_suspended = True
+                self.hide_guide()
+                self.snapshot = self.practice_frame = self.pending_hint = None
+                practice.update(None)
                 practice.set_progress()
-                practice.set_status("原聊天已停止接收画面。回原聊天发「继续伴学」，即可从当前界面接着做。")
+                practice.set_status("原聊天暂时断开。重连前会暂停读图。")
+            return
+        if not practice.running.is_set():
             return
         hwnd = practice.scope.active()
         if hwnd is None:
@@ -402,6 +305,7 @@ class MentorServer(QObject):
                     if practice.scope.active() == hwnd:
                         self.practice_frame = frame
                         self.snapshot = Snapshot(uuid4().hex, hwnd, bounds, image.size, time.monotonic())
+                        self.snapshot_owner = self.practice_owner
                         self.last_analysis = time.monotonic()
                         event = {"state": "changed", "window_title": native.window_title(hwnd)}
                         if self.last_window is not None and self.last_window != hwnd:
@@ -538,24 +442,36 @@ class MentorServer(QObject):
         self.guard.start(250)
         return True
 
-    def call_tool(self, params):
+    def call_tool(self, params, owner):
         try:
             name = params.get("name")
             args = validated_arguments(name, params.get("arguments", {}))
-            if (name in {"observe_window", "show_guide", "show_practice_hint", "show_practice_progress"} and self.practice
-                    and not self.practice.ending.is_set() and not self.practice.running.is_set()):
-                return {"content": [text_content({"state": "paused", "shown": False})]}
+            live = not self.practice.ending.is_set()
+            session = args.get("practice_id")
+            lesson = {"observe_window", "show_guide", "show_practice_hint", "show_practice_progress", "clear_guide",
+                      "wait_for_practice_change", "end_live"}
+            if name in lesson and (live or session is not None):
+                if session is None or session != self.practice_id or owner != self.practice_owner:
+                    raise ValueError("请使用本条对话收到的 practice_id。")
+                if not live:
+                    if name == "wait_for_practice_change":
+                        return {"content": [text_content({"state": "ended"})]}
+                    raise ValueError("这场伴学已结束。")
+                if not self.practice.running.is_set() and name in lesson - {
+                    "clear_guide", "wait_for_practice_change", "end_live",
+                }:
+                    return {"content": [text_content({"state": "paused", "shown": False})]}
             if name == "open_appearance":
-                if self.practice and not self.practice.ending.is_set():
-                    self.practice.panel.open_appearance()
-                else:
-                    if self.appearance_dialog is None or not self.appearance_dialog.isVisible():
-                        library = SkinLibrary()
-                        self.appearance_dialog = AppearanceDialog(None, library, library.current())
-                    self.appearance_dialog.show_centered()
+                self.practice.panel.open_appearance()
                 blocks = [text_content({"opened": True, "surface": "appearance_manager"})]
             elif name == "start_live":
-                blocks = self.start_practice(**args)
+                blocks = self.start_practice(owner=owner, **args)
+            elif name == "end_live":
+                summary = args.get("summary", "").strip()
+                if summary:
+                    self.archive.write("practice", summary)
+                self.practice.close()
+                blocks = [text_content({"state": "ended", "summary_saved": bool(summary)})]
             elif name == "wait_for_practice_change":
                 blocks = self.wait_for_practice_change(**args)
             elif name == "show_practice_progress":
@@ -577,10 +493,18 @@ class MentorServer(QObject):
             elif name == "list_windows":
                 blocks = [text_content({"windows": native.list_windows(args.get("query", "").strip())})]
             elif name == "observe_window":
-                blocks = self.observe_window(**args)
+                if live and not self.practice.scope.accepts(int(args["window_id"])):
+                    raise ValueError("该窗口不在本场伴学的范围内。")
+                blocks = self.observe_window(args["window_id"])
+                self.snapshot_owner = owner
             elif name == "show_guide":
+                if self.snapshot_owner != owner:
+                    raise ValueError("请使用本条对话取得的快照。")
+                args.pop("practice_id", None)
                 blocks = self.show_guide(**args)
             else:
+                if not live and self.snapshot is not None and self.snapshot_owner != owner:
+                    raise ValueError("请在原对话中清除标注。")
                 self.hide_guide()
                 self.snapshot = None
                 self.pending_hint = None
@@ -589,40 +513,13 @@ class MentorServer(QObject):
         except (native.WindowError, ValueError) as exc:
             return {"isError": True, "content": [text_content(str(exc))]}
 
-    def respond(self, request):
-        if request is None:
-            self.app.quit()
-            return
-        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request:
-            return
-        method, params = request.get("method"), request.get("params", {})
+    def respond(self, request, owner):
+        if (not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request
+                or request.get("method") != "tools/call" or not isinstance(request.get("params", {}), dict)):
+            raise ValueError("Invalid request")
         response = {"jsonrpc": "2.0", "id": request["id"]}
         try:
-            if method == "initialize":
-                supported = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
-                version = params.get("protocolVersion")
-                response["result"] = {
-                    "protocolVersion": version if version in supported else supported[-1],
-                    "serverInfo": {"name": "screen-mentor", "version": "0.10.1"},
-                    "capabilities": {"tools": {}},
-                }
-            elif method == "tools/list":
-                response["result"] = {"tools": TOOLS}
-            elif method == "tools/call" and isinstance(params, dict):
-                response["result"] = self.call_tool(params)
-            elif method == "ping":
-                response["result"] = {}
-            else:
-                response["error"] = {"code": -32601, "message": "Method not supported"}
+            response["result"] = self.call_tool(request.get("params", {}), owner)
         except Exception:
             response["error"] = {"code": -32603, "message": "Screen Mentor request failed"}
-        sys.stdout.buffer.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
-        sys.stdout.buffer.flush()
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv[:1])
-    app.setQuitOnLastWindowClosed(False)
-    server = MentorServer(app)
-    server.start()
-    sys.exit(app.exec())
+        return response

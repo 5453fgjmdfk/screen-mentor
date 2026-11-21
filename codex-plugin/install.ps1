@@ -1,6 +1,7 @@
 param(
     [string]$CodexExe,
-    [string]$PythonExe
+    [string]$PythonExe,
+    [switch]$DesktopOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +14,7 @@ $runtime = Join-Path $installRoot 'runtime'
 $runtimePython = Join-Path $runtime 'Scripts/python.exe'
 $installUtf8 = [Text.UTF8Encoding]::new($false)
 
-if (-not $CodexExe) {
+if (-not $DesktopOnly -and -not $CodexExe) {
     $found = Get-Command codex -ErrorAction SilentlyContinue
     if ($found) {
         $CodexExe = $found.Source
@@ -22,7 +23,7 @@ if (-not $CodexExe) {
             Where-Object Path | Select-Object -First 1 -ExpandProperty Path
     }
 }
-if (-not $CodexExe) {
+if (-not $DesktopOnly -and -not $CodexExe) {
     throw 'Open Codex desktop first, or supply -CodexExe.'
 }
 
@@ -42,6 +43,9 @@ foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'ass
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $marketManifest) | Out-Null
 foreach ($relative in @('.codex-plugin/plugin.json', 'skills/screen-mentor/SKILL.md', 'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py', 'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py', 'assets/companion/idle.gif', 'assets/companion/reading.gif', 'assets/companion/thinking.gif', 'assets/companion/ready.gif', 'assets/companion/peek-poses.png', 'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $relative) -Destination (Join-Path $pluginRoot $relative) -Force
+}
+foreach ($module in @('desktop.py', 'bridge.py', 'protocol.py', 'resident_agent.py')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "scripts/$module") -Destination (Join-Path $pluginRoot "scripts/$module") -Force
 }
 foreach ($module in @('capture.py', 'overlay.py')) {
     Copy-Item -LiteralPath (Join-Path $repo $module) -Destination (Join-Path $pluginRoot "scripts/$module") -Force
@@ -68,10 +72,12 @@ $mcp.mcpServers.screen_mentor.command = $runtimeResolved
 }
 '@, $installUtf8)
 
-& $CodexExe plugin marketplace add $marketRoot
-if ($LASTEXITCODE -ne 0) { throw 'Could not register the local marketplace.' }
-& $CodexExe plugin add 'screen-mentor@screen-mentor-local'
-if ($LASTEXITCODE -ne 0) { throw 'Could not install the Screen Mentor plugin.' }
+if (-not $DesktopOnly) {
+    & $CodexExe plugin marketplace add $marketRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Could not register the local marketplace.' }
+    & $CodexExe plugin add 'screen-mentor@screen-mentor-local'
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Screen Mentor plugin.' }
+}
 
 $desktop = [Environment]::GetFolderPath('DesktopDirectory')
 $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $pluginRoot '.codex-plugin/plugin.json') | ConvertFrom-Json
@@ -95,3 +101,14 @@ $skinShortcut.TargetPath = $skinPython
 $skinShortcut.Arguments = '-B "' + $skinLauncher + '"'
 $skinShortcut.WorkingDirectory = Split-Path -Parent $skinLauncher
 $skinShortcut.Save()
+
+$deskLauncher = & $runtimePython -X utf8 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' (Join-Path $pluginRoot 'scripts/desktop.py')
+if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the desktop companion.' }
+$deskLabel = -join (0x684C, 0x9762, 0x5B66, 0x4F34 | ForEach-Object { [char]$_ })
+$deskShortcut = (New-Object -ComObject WScript.Shell).CreateShortcut(
+    (Join-Path $desktop ($manifest.interface.displayName + ' - ' + $deskLabel + '.lnk'))
+)
+$deskShortcut.TargetPath = $skinPython
+$deskShortcut.Arguments = '-B "' + $deskLauncher + '"'
+$deskShortcut.WorkingDirectory = Split-Path -Parent $deskLauncher
+$deskShortcut.Save()

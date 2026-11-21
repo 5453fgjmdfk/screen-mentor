@@ -77,14 +77,34 @@ class Practice(QObject):
     sampled = pyqtSignal(int, object)
     capture_failed = pyqtSignal(int, str)
     wake = pyqtSignal()
+    idle_chat = pyqtSignal()
+    session_ended = pyqtSignal()
 
-    def __init__(self, scope, app):
+    def __init__(self, scope, app, *, persistent=False):
         super().__init__()
-        self.scope = scope
+        self.persistent = persistent
+        self.scope = None
         self.running = Event()
-        self.running.set()
         self.capture_generation = 0
+        self.session_serial = 0
         self.ending = Event()
+        self.ending.set()
+        self.shutdown = Event()
+        self.reset_capture()
+        self.progress_since = None
+        self.progress_text = ""
+        self.progress_label = ""
+
+        self.setup_panel(app)
+        if persistent:
+            self.set_idle()
+        else:
+            self.begin(scope)
+        self.sampled.connect(self.accept_sample)
+        self.capture_failed.connect(self.note_capture_failure)
+        Thread(target=self.watch, daemon=True).start()
+
+    def reset_capture(self):
         self.last_poll = time.monotonic()
         self.chat_suspended = False
         self.pending = self.last_sent = self.current = None
@@ -96,12 +116,10 @@ class Practice(QObject):
         self.last_sample = None
         self.capture_error = None
         self.sample_after = 0.0
-        self.progress_since = None
-        self.progress_text = ""
-        self.progress_label = ""
 
+    def setup_panel(self, app):
         self.panel = CompanionPanel()
-        self.panel.closed.connect(self.close)
+        self.panel.closed.connect(self.on_panel_closed)
         layout = QVBoxLayout(self.panel)
         layout.setContentsMargins(3, 3, 3, 3)
         layout.setSpacing(1)
@@ -163,27 +181,55 @@ class Practice(QObject):
         appearance = CompanionAction("appearance")
         appearance.clicked.connect(self.panel.open_appearance)
         end = CompanionAction("stop")
-        end.clicked.connect(self.panel.close)
+        end.clicked.connect(self.close if self.persistent else self.panel.close)
+        self.chat_button = CompanionAction("chat")
+        self.chat_button.clicked.connect(self.idle_chat)
+        actions.addWidget(self.chat_button)
+        self.practice_controls = (self.pause_button, issue, end)
         for button in (self.pause_button, issue, appearance, end):
             actions.addWidget(button)
         layout.addWidget(self.panel.controls, alignment=Qt.AlignmentFlag.AlignHCenter)
         screen = app.primaryScreen().availableGeometry()
-        self.set_status("切回练习软件，提示会跟着画面更新。")
+        self.set_status("桌面学伴")
         self.panel.move(screen.right() - self.panel.width() - 18, screen.bottom() - self.panel.height() - 38)
         self.panel.show()
         self.panel.set_pose("idle")
-        self.sampled.connect(self.accept_sample)
-        self.capture_failed.connect(self.note_capture_failure)
-        Thread(target=self.watch, daemon=True).start()
+
+    def begin(self, scope):
+        self.capture_generation += 1
+        self.session_serial += 1
+        self.reset_capture()
+        self.scope = scope
+        self.ending.clear()
+        self.running.set()
+        self.chat_button.hide()
+        self.pause_button.set_action("pause")
+        for control in self.practice_controls:
+            control.show()
+        self.set_status("切回练习软件，提示会跟着画面更新。")
+
+    def set_idle(self):
+        for control in self.practice_controls:
+            control.hide()
+        self.chat_button.show()
+        self.set_progress()
+        self.copy_area.hide()
+        self.input_value.clear()
+        self.set_status("桌面学伴 · 悬停后点聊天图标")
 
     def watch(self):
         previous = None
         with WindowReader() as reader:
-            while not self.ending.wait(.4):
+            while not self.shutdown.wait(.4):
                 generation = self.capture_generation
+                scope = self.scope
+                if scope is None or self.ending.is_set():
+                    reader.close()
+                    previous = None
+                    continue
                 hwnd = None
                 if self.running.is_set() and time.monotonic() - self.last_poll < CHAT_LEASE_SECONDS:
-                    hwnd = self.scope.active()
+                    hwnd = scope.active()
                 if hwnd is None:
                     if previous is not None:
                         self.sampled.emit(generation, None)
@@ -193,7 +239,7 @@ class Practice(QObject):
                 try:
                     bounds = native.window_state(hwnd)
                     raw = reader.read(hwnd, *bounds[2:4])
-                    if self.scope.active() != hwnd or not self.running.is_set() or generation != self.capture_generation:
+                    if generation != self.capture_generation or not self.running.is_set() or scope.active() != hwnd:
                         continue
                     preview = raw.copy()
                     preview.thumbnail((1440, 1000), Image.Resampling.LANCZOS)
@@ -201,7 +247,7 @@ class Practice(QObject):
                     self.sampled.emit(generation, (hwnd, bounds, preview, key, raw))
                 except native.WindowError as exc:
                     self.capture_failed.emit(generation, str(exc))
-                    if self.ending.wait(.6):
+                    if self.shutdown.wait(.6):
                         break
 
     def accept_sample(self, generation, frame):
@@ -343,6 +389,7 @@ class Practice(QObject):
         self.copy_button.setText("已复制")
 
     def report_issue(self):
+        serial = self.session_serial
         image = self.last_image
         dialog = QDialog(self.panel, Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         dialog.setStyleSheet("QDialog{background:#251d3b;} QPlainTextEdit,QListWidget{background:#342851;}")
@@ -417,7 +464,8 @@ class Practice(QObject):
         center = self.panel.screen().availableGeometry().center()
         dialog.move(center.x() - dialog.width() // 2, center.y() - dialog.height() // 2)
         problem.setFocus()
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if (dialog.exec() == QDialog.DialogCode.Accepted and serial == self.session_serial
+                and not self.ending.is_set()):
             if attach.isChecked() and image is not None:
                 pasted_images.append(image)
             self.issues.append((problem.toPlainText().strip()[:800], pasted_images))
@@ -427,7 +475,20 @@ class Practice(QObject):
             self.wake.emit()
 
     def close(self):
+        if self.ending.is_set():
+            return
         self.progress_timer.stop()
+        self.capture_generation += 1
+        self.session_serial += 1
         self.ending.set()
-        self.current = None
+        self.running.clear()
+        self.scope = None
+        self.reset_capture()
+        if self.persistent and not self.shutdown.is_set():
+            self.set_idle()
         self.wake.emit()
+        self.session_ended.emit()
+
+    def on_panel_closed(self):
+        self.shutdown.set()
+        self.close()

@@ -49,8 +49,11 @@ class WindowReader:
         # Windows venvs whose python.exe is a process-launching redirector.
         environment = os.environ.copy()
         environment["PYTHONPATH"] = sysconfig.get_path("purelib")
+        interpreter = Path(sys._base_executable)
+        if interpreter.name.casefold() == "pythonw.exe":
+            interpreter = interpreter.with_name("python.exe")
         self.process = subprocess.Popen(
-            [sys._base_executable, "-B", str(Path(__file__).resolve())],
+            [str(interpreter), "-B", str(Path(__file__).resolve())],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW, env=environment,
         )

@@ -32,7 +32,8 @@ def fit_position(position, size, area):
 
 
 class CompanionAction(QPushButton):
-    labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止", "appearance": "外观"}
+    labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止", "appearance": "外观",
+              "chat": "日常对话"}
 
     def __init__(self, action):
         super().__init__()
@@ -70,6 +71,14 @@ class CompanionAction(QPushButton):
             stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
             mark = stroke.createStroke(curve)
             mark.addEllipse(QRectF(2.05, 9.5, 2.6, 2.6))
+        elif self.action == "chat":
+            mark.addRoundedRect(QRectF(0, 0, 12, 9), 2.3, 2.3)
+            tail = QPainterPath()
+            tail.moveTo(3, 8)
+            tail.lineTo(3, 12)
+            tail.lineTo(7, 8)
+            tail.closeSubpath()
+            mark = mark.united(tail)
         elif self.action == "appearance":
             mark.moveTo(4.3, 0)
             mark.quadTo(6, 2.5, 7.7, 0)
