@@ -1,14 +1,13 @@
 """Frameless companion with a speech bubble and hover controls."""
-from math import pi, sin
-
 from PyQt6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter,
-    QPainterPath, QPainterPathStroker, QPen, QPixmap, QTransform,
+    QPainterPath, QPainterPathStroker, QPen, QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
 
-from appearance import AppearanceDialog, BUILT_INS, STATES, SkinLibrary
+from appearance import AppearanceDialog, BUILT_INS, PeekFrames, SkinLibrary, paint_peek
+from skin_assets import STATES
 
 SNAP_DISTANCE = 22
 RESTORE_GAP = 30
@@ -210,8 +209,8 @@ class EdgePeek(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.edge = None
         self.press_at = None
-        self.side_pose = QPixmap()
-        self.bottom_pose = QPixmap()
+        self.frames = {}
+        self.art_path = None
         self.thought = EdgeThought(self)
         self.clock = QElapsedTimer()
         self.animation = QTimer(self)
@@ -222,8 +221,13 @@ class EdgePeek(QWidget):
         if self.thought.skin_colors != skin.palette:
             self.thought.skin_colors = skin.palette
             self.thought.update()
-        self.side_pose = skin.peek(False)
-        self.bottom_pose = skin.peek(True)
+        if self.art_path != skin.path:
+            for frames in self.frames.values():
+                frames.dispose()
+            self.frames = {bottom: PeekFrames(skin, bottom, self) for bottom in (False, True)}
+            self.art_path = skin.path
+            if self.isVisible():
+                self.frames[self.edge == Qt.Edge.BottomEdge].start()
         self.update()
 
     def dock(self, edge, anchor, area):
@@ -235,6 +239,7 @@ class EdgePeek(QWidget):
             self.setFixedSize(64, 84)
         self.move(self.edge_position(anchor - QPoint(self.width() // 2, self.height() // 2)))
         self.clock.start()
+        self.frames[edge == Qt.Edge.BottomEdge].start()
         self.show()
         self.animation.start()
         self.animate()
@@ -316,6 +321,7 @@ class EdgePeek(QWidget):
 
     def hideEvent(self, event):
         self.animation.stop()
+        self.frames[self.edge == Qt.Edge.BottomEdge].stop()
         self.thought.hide()
         self.reset_press()
         super().hideEvent(event)
@@ -324,7 +330,7 @@ class EdgePeek(QWidget):
         painter = QPainter(self)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         bottom = self.edge == Qt.Edge.BottomEdge
-        pose = self.bottom_pose if bottom else self.side_pose
+        pose = self.frames[bottom].current()
         if pose.isNull():
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(tinted(self.thought.skin_colors.background, 230))
@@ -333,30 +339,8 @@ class EdgePeek(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "学")
             return
 
-        elapsed = self.clock.elapsed() / 1000
-        hidden = (1 - min(1, elapsed / .54)) ** 3
-        idle = max(0, elapsed - .54)
-        breathe = .021 * sin(idle * 2.7)
-        glance = sin(pi * min(1, max(0, (idle % 5.6 - 3.0) / 1.35))) ** 2
-        size = pose.size().scaled(QSize(82, 67) if bottom else QSize(61, 83),
-                                  Qt.AspectRatioMode.KeepAspectRatio)
-        if bottom:
-            painter.translate(0, self.height() * (1 + hidden))
-            painter.scale(1, 1 + breathe + .055 * glance)
-            painter.translate(0, -self.height())
-            target = QRectF((self.width() - size.width()) / 2, self.height() - size.height(),
-                            size.width(), size.height())
-        else:
-            if self.edge == Qt.Edge.RightEdge:
-                painter.translate(self.width(), 0)
-                painter.scale(-1, 1)
-            painter.translate(-self.width() * hidden, 0)
-            painter.scale(1 + breathe, 1)
-            painter.translate(3, 55)
-            painter.rotate(4 * glance)
-            painter.translate(-3, -55)
-            target = QRectF(0, (self.height() - size.height()) / 2, size.width(), size.height())
-        painter.drawPixmap(target, pose, QRectF(pose.rect()))
+        paint_peek(painter, self.width(), self.height(), pose, bottom, self.clock.elapsed() / 1000,
+                   mirror=self.edge == Qt.Edge.RightEdge)
 
 
 class CompanionPanel(QWidget):
