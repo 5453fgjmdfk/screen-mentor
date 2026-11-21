@@ -10,4 +10,6 @@ config.json
 *.jpeg
 *.webp
 *.pdsprj
-codex-plugin/assets/companion/
+!codex-plugin/assets/app-icon.png
+!codex-plugin/assets/companion/peek-poses.png
+!codex-plugin/assets/companion/peek-blink.png
