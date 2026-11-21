@@ -1,10 +1,11 @@
 """Frameless companion with a speech bubble and hover controls."""
+from math import pi, sin
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QCursor, QGuiApplication, QLinearGradient, QMovie, QPainter, QPainterPath, QPainterPathStroker, QPen,
-    QTransform,
+    QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QMovie, QPainter,
+    QPainterPath, QPainterPathStroker, QPen, QPixmap, QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
 
@@ -12,6 +13,8 @@ from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWid
 ART = Path(__file__).resolve().parent.parent / "assets" / "companion"
 SNAP_DISTANCE = 22
 RESTORE_GAP = 30
+SIDE_POSE = QRectF(185, 77, 552, 744)
+BOTTOM_POSE = QRectF(995, 207, 668, 543)
 
 
 def fit_position(position, size, area):
@@ -85,10 +88,97 @@ class CompanionAction(QPushButton):
         painter.drawPath(mark)
 
 
+class EdgeThought(QWidget):
+    trail = 17
+    padding = 10
+    text_flags = int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere)
+
+    def __init__(self, peek):
+        super().__init__(peek, flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus
+                         | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        font = QFont("Microsoft YaHei UI")
+        font.setPixelSize(13)
+        self.setFont(font)
+        self.text = ""
+        self.body_size = QSize()
+
+    def set_text(self, text):
+        text = " ".join(text.split())
+        if text == self.text:
+            return
+        self.text = text
+        self.setAccessibleName(text)
+        metrics = QFontMetrics(self.font())
+        width = min(198, max(54, metrics.horizontalAdvance(text)))
+        measure = QRect(0, 0, width, 32767)
+        limit = metrics.height() + 2 * metrics.lineSpacing()
+
+        def height(value):
+            return metrics.boundingRect(measure, self.text_flags, value).height()
+
+        self.visible_text = text
+        if height(text) > limit:
+            start, end = 0, len(text)
+            while start < end:
+                middle = (start + end + 1) // 2
+                if height(text[:middle].rstrip() + "…") <= limit:
+                    start = middle
+                else:
+                    end = middle - 1
+            self.visible_text = text[:start].rstrip() + "…"
+        self.body_size = QSize(width + 2 * self.padding, height(self.visible_text) + 16)
+        self.update()
+
+    def follow(self, pet, edge, area):
+        self.edge = edge
+        width, height = self.body_size.width(), self.body_size.height()
+        if edge == Qt.Edge.BottomEdge:
+            size = QSize(width, height + self.trail)
+            anchor = QPoint(pet.center().x(), pet.top() + 3)
+            origin = anchor - QPoint(width // 2, size.height())
+        else:
+            size = QSize(width + self.trail, height)
+            anchor = QPoint(pet.right() - 4 if edge == Qt.Edge.LeftEdge else pet.left() + 4, pet.top() + 25)
+            origin = anchor - QPoint(0 if edge == Qt.Edge.LeftEdge else size.width(), height * 3 // 4)
+        position = fit_position(origin, size, area)
+        self.dot_axis = anchor - position
+        self.setGeometry(QRect(position, size))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        body = QRectF(1, 1, self.body_size.width() - 2, self.body_size.height() - 2)
+        if self.edge == Qt.Edge.LeftEdge:
+            body.translate(self.trail, 0)
+        painter.setPen(QPen(QColor(174, 150, 224, 194), 1))
+        painter.setBrush(QColor(38, 29, 60, 231))
+        painter.drawRoundedRect(body, 12, 12)
+        if self.edge == Qt.Edge.BottomEdge:
+            x = min(max(12, self.dot_axis.x()), self.width() - 12)
+            dots = ((QPointF(x + 3, self.height() - 3), 1.8),
+                    (QPointF(x, self.height() - 10), 3))
+        else:
+            y = min(max(10, self.dot_axis.y()), self.height() - 10)
+            left = self.edge == Qt.Edge.LeftEdge
+            dots = ((QPointF(3 if left else self.width() - 3, y), 1.8),
+                    (QPointF(10 if left else self.width() - 10, y - 3), 3))
+        painter.setBrush(QColor(65, 49, 96, 230))
+        for center, radius in dots:
+            painter.drawEllipse(center, radius, radius)
+        painter.setPen(QColor("#f2edff"))
+        painter.drawText(body.adjusted(self.padding - 1, 7, 1 - self.padding, -7),
+                         self.text_flags, self.visible_text)
+
+
 class EdgePeek(QWidget):
     restore_requested = pyqtSignal(object)
 
-    def __init__(self, sprite):
+    def __init__(self):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -96,20 +186,27 @@ class EdgePeek(QWidget):
         self.setAccessibleName("展开屏幕伴学")
         self.setToolTip("点击或向屏幕内拖动，展开伴学")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.sprite = sprite
         self.edge = None
         self.press_at = None
+        self.poses = QPixmap(str(ART / "peek-poses.png"))
+        self.thought = EdgeThought(self)
+        self.clock = QElapsedTimer()
+        self.animation = QTimer(self)
+        self.animation.setInterval(33)
+        self.animation.timeout.connect(self.animate)
 
     def dock(self, edge, anchor, area):
         self.edge = edge
         self.area = QRect(area)
-        if edge in (Qt.Edge.LeftEdge, Qt.Edge.RightEdge):
-            self.setFixedSize(38, 62)
+        if edge == Qt.Edge.BottomEdge:
+            self.setFixedSize(84, 68)
         else:
-            self.setFixedSize(62, 38)
+            self.setFixedSize(64, 84)
         self.move(self.edge_position(anchor - QPoint(self.width() // 2, self.height() // 2)))
+        self.clock.start()
         self.show()
-        self.update()
+        self.animation.start()
+        self.animate()
 
     def edge_position(self, position):
         position = fit_position(position, self.size(), self.area)
@@ -117,8 +214,6 @@ class EdgePeek(QWidget):
             position.setX(self.area.left())
         elif self.edge == Qt.Edge.RightEdge:
             position.setX(self.area.right() - self.width() + 1)
-        elif self.edge == Qt.Edge.TopEdge:
-            position.setY(self.area.top())
         else:
             position.setY(self.area.bottom() - self.height() + 1)
         return position
@@ -150,7 +245,6 @@ class EdgePeek(QWidget):
         inward = {
             Qt.Edge.LeftEdge: delta.x(),
             Qt.Edge.RightEdge: -delta.x(),
-            Qt.Edge.TopEdge: delta.y(),
             Qt.Edge.BottomEdge: -delta.y(),
         }[self.edge]
         if inward >= max(14, QApplication.startDragDistance()):
@@ -165,50 +259,67 @@ class EdgePeek(QWidget):
     def event(self, event):
         if event.type() == QEvent.Type.UngrabMouse:
             self.reset_press()
-        elif event.type() in (QEvent.Type.Enter, QEvent.Type.Leave):
-            self.update()
         return super().event(event)
+
+    def set_thought(self, text):
+        self.thought.set_text(text)
+        if self.isVisible():
+            self.follow_thought()
+
+    def animate(self):
+        self.update()
+        if not self.thought.isVisible() and self.thought.text and self.clock.elapsed() >= 200:
+            self.follow_thought()
+
+    def follow_thought(self):
+        if self.thought.text and self.clock.elapsed() >= 200:
+            self.thought.follow(self.geometry(), self.edge, self.area)
+            self.thought.show()
+        else:
+            self.thought.hide()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if self.thought.isVisible():
+            self.follow_thought()
+
+    def hideEvent(self, event):
+        self.animation.stop()
+        self.thought.hide()
+        self.reset_press()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        bounds = QRectF(self.rect()).adjusted(.75, .75, -.75, -.75)
-        if self.edge == Qt.Edge.LeftEdge:
-            bounds.adjust(-13, 0, 0, 0)
-            portrait = QRectF(-31, 0, 82, 82)
-            grip = QRectF(32, 23, 2, 16)
-        elif self.edge == Qt.Edge.RightEdge:
-            bounds.adjust(0, 0, 13, 0)
-            portrait = QRectF(-14, 0, 82, 82)
-            grip = QRectF(4, 23, 2, 16)
-        elif self.edge == Qt.Edge.TopEdge:
-            bounds.adjust(0, -13, 0, 0)
-            portrait = QRectF(-10, -25, 82, 82)
-            grip = QRectF(23, 32, 16, 2)
-        else:
-            bounds.adjust(0, 0, 0, 13)
-            portrait = QRectF(-10, -8, 82, 82)
-            grip = QRectF(23, 4, 16, 2)
-
-        active = self.underMouse() or self.press_at is not None
-        tab = QPainterPath()
-        tab.addRoundedRect(bounds, 12, 12)
-        painter.fillPath(tab, QColor(53, 40, 80, 232) if active else QColor(39, 30, 60, 214))
-        painter.save()
-        painter.setClipPath(tab)
-        movie = self.sprite.movie()
-        frame = movie.currentPixmap() if movie is not None else self.sprite.pixmap()
-        if frame is not None and not frame.isNull():
-            painter.drawPixmap(portrait, frame, QRectF(frame.rect()))
-        else:
+        if self.poses.isNull():
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(38, 29, 60, 230))
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(3, 3, -3, -3), 12, 12)
             painter.setPen(QColor("#f2edff"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "学")
-        painter.restore()
-        painter.setPen(QPen(QColor(211, 190, 253, 224 if active else 156), 1))
-        painter.drawPath(tab)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(227, 212, 255, 240 if active else 180))
-        painter.drawRoundedRect(grip, 1, 1)
+            return
+
+        elapsed = self.clock.elapsed() / 1000
+        hidden = (1 - min(1, elapsed / .54)) ** 3
+        idle = max(0, elapsed - .54)
+        breathe = .021 * sin(idle * 2.7)
+        glance = sin(pi * min(1, max(0, (idle % 5.6 - 3.0) / 1.35))) ** 2
+        if self.edge == Qt.Edge.BottomEdge:
+            painter.translate(0, self.height() * (1 + hidden))
+            painter.scale(1, 1 + breathe + .055 * glance)
+            painter.translate(0, -self.height())
+            painter.drawPixmap(QRectF(1, 1, 82, 67), self.poses, BOTTOM_POSE)
+        else:
+            if self.edge == Qt.Edge.RightEdge:
+                painter.translate(self.width(), 0)
+                painter.scale(-1, 1)
+            painter.translate(-self.width() * hidden, 0)
+            painter.scale(1 + breathe, 1)
+            painter.translate(3, 55)
+            painter.rotate(4 * glance)
+            painter.translate(-3, -55)
+            painter.drawPixmap(QRectF(0, 1, 61, 83), self.poses, SIDE_POSE)
 
 
 class CompanionPanel(QWidget):
@@ -230,7 +341,7 @@ class CompanionPanel(QWidget):
         self.drag_handle = None
         self.drag_offset = None
         self.drag_start = None
-        self.peek = EdgePeek(self.sprite)
+        self.peek = EdgePeek()
         self.peek.restore_requested.connect(self.restore_from_edge)
         self.destroyed.connect(self.peek.deleteLater)
         self.controls = QWidget()
@@ -253,13 +364,12 @@ class CompanionPanel(QWidget):
                       for state in ("idle", "reading", "thinking", "ready")}
         for movie in self.anims.values():
             movie.setScaledSize(QSize(138, 138))
-            movie.frameChanged.connect(self.refresh_peek)
         self.state = None
         self.ready_timer = QTimer(self)
         self.ready_timer.setSingleShot(True)
         self.ready_timer.setInterval(2650)
         self.ready_timer.timeout.connect(lambda: self.set_pose("idle"))
-        self.sprite.setToolTip("拖到屏幕边缘可收起伴学")
+        self.sprite.setToolTip("拖到屏幕两侧或底部，进入探头状态")
         self.add_drag_handle(self.sprite)
 
     def set_pose(self, state):
@@ -337,7 +447,6 @@ class CompanionPanel(QWidget):
         distances = {
             Qt.Edge.LeftEdge: abs(bounds.left() - area.left()),
             Qt.Edge.RightEdge: abs(area.right() - bounds.right()),
-            Qt.Edge.TopEdge: abs(bounds.top() - area.top()),
             Qt.Edge.BottomEdge: abs(area.bottom() - bounds.bottom()),
         }
         edge = min(distances, key=distances.get)
@@ -359,17 +468,11 @@ class CompanionPanel(QWidget):
                 position.setX(area.left() + RESTORE_GAP)
             elif self.peek.edge == Qt.Edge.RightEdge:
                 position.setX(area.right() - self.width() + 1 - RESTORE_GAP)
-            elif self.peek.edge == Qt.Edge.TopEdge:
-                position.setY(area.top() + RESTORE_GAP)
             else:
                 position.setY(area.bottom() - self.height() + 1 - RESTORE_GAP)
         self.move(fit_position(position, self.size(), area))
         self.peek.hide()
         self.show()
-
-    def refresh_peek(self):
-        if self.peek.isVisible():
-            self.peek.update()
 
     def hide_controls_if_outside(self):
         at = QCursor.pos()

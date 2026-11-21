@@ -291,6 +291,7 @@ class Practice(QObject):
         self.panel.layout().invalidate()
         self.panel.layout().activate()
         self.panel.adjustSize()
+        self.sync_edge_thought()
         if self.panel.isVisible():
             top = self.panel.screen().availableGeometry().top()
             self.panel.move(self.panel.x(), max(top, bottom - self.panel.height()))
@@ -311,6 +312,10 @@ class Practice(QObject):
         self.progress.setVisible(bool(text))
         self.fit_panel(bottom)
 
+    def sync_edge_thought(self):
+        text = self.progress.text() if self.progress_text else self.status.text()
+        self.panel.peek.set_thought(text)
+
     def render_progress(self):
         if self.progress_label:
             text = f"{self.progress_label} · {self.progress_text}"
@@ -325,6 +330,8 @@ class Practice(QObject):
         self.fit_text(self.progress, text, 4)
         if self.progress.isVisible() and before != self.progress.height():
             self.fit_panel(bottom)
+        else:
+            self.sync_edge_thought()
 
     def show_instruction(self, text, text_to_type=""):
         self.set_progress()
