@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-from PyQt6.QtCore import QElapsedTimer, QRectF, QSettings, QSignalBlocker, QSize, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QImageReader, QMovie, QPainter, QPixmap
+from PyQt6.QtCore import QElapsedTimer, QRect, QRectF, QSettings, QSignalBlocker, QSize, Qt, QTimer
+from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
@@ -19,6 +19,11 @@ from skin_assets import ASSET_FILES, FILE_LIMIT, MIB, ROLES, STATES, CropDialog,
 
 
 ART = Path(__file__).resolve().parent.parent / "assets" / "companion"
+PEEK_BOUNDS = {False: QRect(185, 77, 552, 744), True: QRect(995, 207, 668, 543)}
+BLINK_BOUNDS = {
+    False: (QRect(276, 369, 119, 106), QRect(426, 428, 128, 101)),
+    True: (QRect(1167, 552, 143, 112), QRect(1342, 551, 139, 108)),
+}
 
 
 @dataclass(frozen=True)
@@ -92,13 +97,55 @@ class Skin:
     def peek(self, bottom):
         if self.path == ART:
             pixmap = QPixmap(str(ART / "peek-poses.png"))
-            return pixmap.copy(995, 207, 668, 543) if bottom else pixmap.copy(185, 77, 552, 744)
+            return pixmap.copy(PEEK_BOUNDS[bottom])
         return QPixmap(str(self.path / ("bottom.png" if bottom else "side.png")))
+
+
+def blink_cels(still, bottom):
+    sheet = QPixmap(str(ART / "peek-blink.png"))
+    if still.isNull() or not sheet.rect().contains(PEEK_BOUNDS[bottom]):
+        return (still,)
+    patches = []
+    for bounds in BLINK_BOUNDS[bottom]:
+        patch = sheet.copy(bounds)
+        painter = QPainter(patch)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        for x, y in ((patch.width(), 0), (0, patch.height())):
+            fade = QLinearGradient(0, 0, x, y)
+            fade.setColorAt(0, Qt.GlobalColor.transparent)
+            fade.setColorAt(.09, Qt.GlobalColor.black)
+            fade.setColorAt(.91, Qt.GlobalColor.black)
+            fade.setColorAt(1, Qt.GlobalColor.transparent)
+            painter.fillRect(patch.rect(), fade)
+        painter.end()
+        patches.append((bounds.topLeft() - PEEK_BOUNDS[bottom].topLeft(), patch))
+    cels = [still]
+    for opacity in (.64, 1):
+        cel = still.copy()
+        painter = QPainter(cel)
+        painter.setOpacity(opacity)
+        for point, patch in patches:
+            painter.drawPixmap(point, patch)
+        painter.end()
+        cels.append(cel)
+    return tuple(cels)
+
+
+def blink_step(elapsed, bottom):
+    # Let the two poses blink at different times and vary the pause between blinks.
+    phase = (elapsed - (1.75 if bottom else 1.10)) % 12.4
+    for beat in (0, 3.6, 8.0):
+        age = phase - beat
+        if 0 <= age < .18:
+            return 2 if .035 <= age < .14 else 1
+    return 0
 
 
 class PeekFrames:
     def __init__(self, skin, bottom, owner):
         self.still = skin.peek(bottom)
+        self.bottom = bottom
+        self.cels = blink_cels(self.still, bottom) if skin.path == ART else (self.still,)
         path = skin.path / ("bottom.gif" if bottom else "side.gif")
         self.movie = open_movie(path, owner, QSize(164, 168)) if path.is_file() else None
 
@@ -116,11 +163,13 @@ class PeekFrames:
             self.movie.stop()
             self.movie.deleteLater()
 
-    def current(self):
+    def current(self, elapsed=0):
         if self.movie is not None:
             frame = self.movie.currentPixmap()
             if not frame.isNull():
                 return frame
+        if len(self.cels) > 1:
+            return self.cels[blink_step(elapsed, self.bottom)]
         return self.still
 
 
@@ -321,8 +370,8 @@ class PreviewPortrait(QWidget):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        elapsed = self.clock.elapsed() / 1000 % 5.6
-        paint_peek(painter, self.width(), self.height(), self.frames.current(), self.bottom, elapsed)
+        elapsed = self.clock.elapsed() / 1000
+        paint_peek(painter, self.width(), self.height(), self.frames.current(elapsed), self.bottom, elapsed % 5.6)
 
 
 FORMAT_HINT = ("单帧边长 1–1024 px，单个素材 ≤ 8 MB，最多 180 帧，所有帧合计 ≤ 2800 万像素。"

@@ -603,7 +603,7 @@ class MentorServer(QObject):
                 version = params.get("protocolVersion")
                 response["result"] = {
                     "protocolVersion": version if version in supported else supported[-1],
-                    "serverInfo": {"name": "screen-mentor", "version": "0.10.0"},
+                    "serverInfo": {"name": "screen-mentor", "version": "0.10.1"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":

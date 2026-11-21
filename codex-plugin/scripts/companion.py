@@ -330,7 +330,8 @@ class EdgePeek(QWidget):
         painter = QPainter(self)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         bottom = self.edge == Qt.Edge.BottomEdge
-        pose = self.frames[bottom].current()
+        elapsed = self.clock.elapsed() / 1000
+        pose = self.frames[bottom].current(elapsed)
         if pose.isNull():
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(tinted(self.thought.skin_colors.background, 230))
@@ -339,7 +340,7 @@ class EdgePeek(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "学")
             return
 
-        paint_peek(painter, self.width(), self.height(), pose, bottom, self.clock.elapsed() / 1000,
+        paint_peek(painter, self.width(), self.height(), pose, bottom, elapsed,
                    mirror=self.edge == Qt.Edge.RightEdge)
 
 
