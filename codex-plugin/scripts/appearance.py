@@ -1,6 +1,7 @@
 """Local skins, package validation, and the companion appearance dialog."""
 from dataclasses import dataclass, replace
 import json
+from io import BytesIO
 from math import pi, sin
 from pathlib import Path
 import re
@@ -8,6 +9,7 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
+from PIL import Image
 from PyQt6.QtCore import QElapsedTimer, QRect, QRectF, QSettings, QSignalBlocker, QSize, Qt, QTimer
 from PyQt6.QtGui import QColor, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
 from PyQt6.QtWidgets import (
@@ -16,7 +18,9 @@ from PyQt6.QtWidgets import (
 )
 
 from resident_agent import PROFILE
-from skin_assets import ASSET_FILES, FILE_LIMIT, MIB, ROLES, STATES, CropDialog, asset_bytes, check_image, require_roles
+from skin_assets import (
+    ASSET_FILES, FILE_LIMIT, MIB, ROLES, STATES, CropDialog, asset_bytes, check_image, crop_sheet, open_sheet, require_roles,
+)
 
 
 ART = Path(__file__).resolve().parent.parent / "assets" / "companion"
@@ -326,6 +330,20 @@ class SkinLibrary:
                                         ensure_ascii=False).encode("utf-8")}
         raw.update(sources)
         return self.install(raw)
+
+    def import_portrait(self, source, name):
+        image = open_sheet(asset_bytes(source))
+        bounds = image.getchannel("A").getbbox()
+        if not bounds:
+            raise ValueError("图片里没有可见人物。")
+        image = image.crop(bounds)
+        image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+        idle_name, idle = crop_sheet(image, QRect(0, 0, *image.size), 1, 1, 1, "idle")
+        side = BytesIO()
+        image.save(side, "PNG")
+        bottom = BytesIO()
+        image.crop((0, 0, image.width, max(1, image.height * 2 // 3))).save(bottom, "PNG")
+        return self.create(name, {idle_name: idle, "side.png": side.getvalue(), "bottom.png": bottom.getvalue()})
 
     def install(self, raw):
         name, palette = read_manifest(raw["skin.json"])

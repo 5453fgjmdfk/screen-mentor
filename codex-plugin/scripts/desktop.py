@@ -1,9 +1,11 @@
 """Resident Windows application for chat and external-agent practice."""
 from functools import partial
 import json
+from pathlib import Path
 import sqlite3
 import sys
 from threading import Event, Thread
+from uuid import uuid4
 
 from capture import enable_dpi_awareness
 
@@ -18,14 +20,14 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from appearance import APP_ICON
+from appearance import APP_ICON, SkinLibrary
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from companion import fit_position
 from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
 from scheduled import TaskScheduler
 from server import MentorServer
-from team import PRIMARY, TeamCoordinator, TeamStore
+from team import PRIMARY, Member, TeamCoordinator, TeamStore
 
 
 STYLE = """
@@ -272,8 +274,7 @@ class ChatPane(QWidget):
             def context_for(*queries):
                 messages = self.archive.request_messages(prompt, queries)
                 messages[0]["content"] += (
-                    f"你的名字是{member.name}，你的分工是：{member.role}。"
-                    "若需要重新检索，请先返回 recall，其余字段留空。"
+                    f"\n{member.identity()}\n若需要重新检索，请先返回 recall，其余字段留空。"
                 )
                 return messages
 
@@ -375,7 +376,7 @@ class Desktop(QObject):
         super().__init__()
         self.app = app
         self.archive = Archive(PROFILE / "agent.sqlite3")
-        self.engine = MentorServer(app, self.archive)
+        self.engine = MentorServer(app, self.archive, create_member=self.create_member, list_skins=self.member_skins)
         self.chat = None
         self.member_chats = {}
         self.manager = None
@@ -468,6 +469,44 @@ class Desktop(QObject):
 
     def member_archive(self, key):
         return self.archive if key == PRIMARY else Archive(PROFILE / "members" / key / "agent.sqlite3")
+
+    def member_skins(self):
+        return [{"key": skin.key, "name": skin.name} for skin in SkinLibrary().all(saved_palettes=False)]
+
+    def create_member(self, options):
+        portrait = options.get("portrait_path")
+        skin_key = options.get("skin_key")
+        if portrait and skin_key:
+            raise ValueError("请在现有皮肤与 PNG 图片中选择一种。")
+        if skin_key and not any(skin["key"] == skin_key for skin in self.member_skins()):
+            raise ValueError("找不到这个皮肤。请用 list_member_skins 查看本机已有的皮肤。")
+        member = Member(uuid4().hex, options["name"].strip(), options["role"].strip(),
+                        model=options.get("model", "").strip(), skin=skin_key or "default",
+                        visible=options.get("visible", False), personality=options.get("personality", "").strip(),
+                        persona=options.get("persona", "").strip())
+        saved = self.save_member(member, portrait=portrait)
+        return {"created": True, "member_id": saved.key, "name": saved.name, "role": saved.role,
+                "skin_key": saved.skin, "visible": saved.visible, "displayed": saved.visible and not self.team.blocked}
+
+    def save_member(self, member, *, portrait=None):
+        install = None
+        if portrait:
+            source = Path(portrait)
+            if not source.is_absolute() or source.drive.startswith("\\") or source.suffix.casefold() != ".png":
+                raise ValueError("请选择本机的透明 PNG，或提供它的绝对路径。")
+            install = partial(SkinLibrary().import_portrait, source, member.name)
+        try:
+            saved = self.team.store.save_member(member, install_skin=install)
+        except sqlite3.Error as error:
+            raise ValueError("无法保存学伴，请检查本机存储。") from error
+        self.sync_pets()
+        chat = self.member_chats.get(saved.key)
+        if chat is not None:
+            chat.set_member(saved)
+        if self.manager is not None:
+            self.manager.reload_members(saved.key)
+            self.manager.refresh()
+        return saved
 
     def show_member_chat(self, key):
         self.show_manager()

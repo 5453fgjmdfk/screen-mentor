@@ -2,7 +2,7 @@
 import math
 
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
 POLL_WAIT_SECONDS = 40
 SESSION_KEY = {"type": "string", "description": "本条对话从 start_live 收到的 practice_id。"}
@@ -26,6 +26,18 @@ def tool(name, description, properties, required=(), *, read_only=False):
 TOOLS = [
     tool("open_management", "打开本机屏幕伴学管理面板。用于管理成员、群聊、并行协作、模型、桌面闲聊和定时任务。", {}),
     tool("open_appearance", "用户明确想换肤或编辑桌宠时，打开本机管理面板的「外观」页。", {}),
+    tool("list_member_skins", "列出本机可为新学伴选择的桌宠皮肤。", {}, read_only=True),
+    tool("create_member", "用户明确要求添加成员时，在本机创建一位有独立职责、性格、角色设定和形象的学伴。",
+         {"name": {"type": "string", "minLength": 1, "maxLength": 20},
+          "role": {"type": "string", "minLength": 1, "maxLength": 360},
+          "personality": {"type": "string", "maxLength": 400, "description": "性格与说话方式"},
+          "persona": {"type": "string", "maxLength": 800, "description": "原创角色背景、称呼或口头禅"},
+          "model": {"type": "string", "maxLength": 120, "description": "用户明确指定时覆盖模型名"},
+          "skin_key": {"type": "string", "minLength": 1, "maxLength": 64, "description": "list_member_skins 的 key"},
+          "portrait_path": {"type": "string", "minLength": 1, "maxLength": 4096,
+                            "description": "用户选定的本机透明 PNG 的绝对路径。与 skin_key 二选一。"},
+          "visible": {"type": "boolean", "description": "是否显示在桌面，默认 false"}},
+         ("name", "role")),
     tool("start_live", "启动当前对话的伴学。恢复现有伴学时传原 practice_id。",
          {"window_id": {"type": "string", "pattern": "^[0-9]+$"}, "practice_id": SESSION_KEY,
           "additional_window_ids": {"type": "array", "maxItems": 8,

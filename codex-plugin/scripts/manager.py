@@ -4,10 +4,10 @@ from datetime import datetime
 import sqlite3
 from uuid import uuid4
 
-from PyQt6.QtCore import QDateTime, QPoint, QSignalBlocker, QTimer, Qt
-from PyQt6.QtGui import QCursor, QGuiApplication
+from PyQt6.QtCore import QDateTime, QPoint, QSignalBlocker, QSize, QTimer, Qt
+from PyQt6.QtGui import QCursor, QGuiApplication, QIcon, QImageReader, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDateTimeEdit, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -67,6 +67,14 @@ def show_centered(dialog):
     dialog.show()
     dialog.raise_()
     dialog.activateWindow()
+
+
+def portrait_icon(skin):
+    reader = QImageReader(str(skin.path / "idle.gif"))
+    size = reader.size()
+    if size.isValid():
+        reader.setScaledSize(size.scaled(QSize(44, 44), Qt.AspectRatioMode.KeepAspectRatio))
+    return QIcon(QPixmap.fromImage(reader.read()))
 
 
 class TeamPet(CompanionPanel):
@@ -161,16 +169,35 @@ class MemberDialog(QDialog):
         super().__init__(parent)
         self.persist = persist
         self.member = member or Member(uuid4().hex, "", "")
-        self.setWindowTitle("编辑成员" if member else "添加成员")
-        self.setMinimumWidth(484)
+        self.setWindowTitle("编辑成员档案" if member else "创建学伴")
+        self.setMinimumWidth(535)
         self.setStyleSheet(PANEL_STYLE)
         form = QFormLayout(self)
         form.setContentsMargins(18, 16, 18, 16)
         self.name = QLineEdit(self.member.name)
         self.name.setMaxLength(20)
         self.role = QPlainTextEdit(self.member.role)
-        self.role.setFixedHeight(80)
-        self.role.setPlaceholderText("例如：复核实验步骤，提醒我验证结果。")
+        self.role.setFixedHeight(55)
+        self.role.setPlaceholderText("例如：复核实验步骤，说明如何验证结果。")
+        self.personality = QPlainTextEdit(self.member.personality)
+        self.personality.setFixedHeight(55)
+        self.personality.setPlaceholderText("例如：严谨但温和，一次只提一个问题。")
+        self.persona = QPlainTextEdit(self.member.persona)
+        self.persona.setFixedHeight(70)
+        self.persona.setPlaceholderText("例如：住在实验室的纸鹤精灵，称呼我为搭档。")
+        self.skin = QComboBox()
+        self.skin.setAccessibleName("学伴的桌宠形象")
+        self.portrait = None
+        library = SkinLibrary()
+        skins = (library.current(),) if self.member.key == PRIMARY else library.all(saved_palettes=False)
+        for skin in skins:
+            self.skin.addItem(portrait_icon(skin), skin.name, skin.key)
+        self.skin.setCurrentIndex(max(0, self.skin.findData(self.member.skin)))
+        import_button = button("导入透明 PNG…", self.choose_portrait)
+        import_button.setToolTip("用一张透明 PNG 创建静态桌宠，动画可从「外观」页另行导入。")
+        art = QHBoxLayout()
+        art.addWidget(self.skin, 1)
+        art.addWidget(import_button)
         self.model = QLineEdit(self.member.model)
         self.model.setMaxLength(120)
         self.model.setPlaceholderText("留空则使用默认模型")
@@ -179,12 +206,15 @@ class MemberDialog(QDialog):
         self.active = QCheckBox("可参加群聊和协作")
         self.active.setChecked(self.member.active)
         form.addRow("成员名称", self.name)
-        form.addRow("分工", self.role)
+        form.addRow("工作职责", self.role)
+        form.addRow("性格与表达", self.personality)
+        form.addRow("角色设定", self.persona)
+        form.addRow("桌宠形象", art)
         form.addRow("模型覆盖", self.model)
         form.addRow(self.visible_pet)
         form.addRow(self.active)
         if self.member.key == PRIMARY:
-            for control in (self.visible_pet, self.active):
+            for control in (self.visible_pet, self.active, self.skin, import_button):
                 control.setEnabled(False)
         self.notice = label("", "notice")
         form.addRow(self.notice)
@@ -194,12 +224,26 @@ class MemberDialog(QDialog):
         actions.addWidget(button("保存", self.save, primary=True))
         form.addRow(actions)
 
+    def choose_portrait(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "选择透明桌宠形象", "", "PNG 图片 (*.png)")
+        if not filename:
+            return
+        self.portrait = filename
+        index = self.skin.findData("")
+        if index < 0:
+            self.skin.addItem("导入的 PNG（待保存）", "")
+            index = self.skin.count() - 1
+        self.skin.setCurrentIndex(index)
+
     def save(self):
+        skin = self.skin.currentData()
+        primary = self.member.key == PRIMARY
         member = replace(self.member, name=self.name.text().strip(), role=self.role.toPlainText().strip(),
-                         model=self.model.text().strip(),
-                         visible=self.visible_pet.isChecked(), active=self.active.isChecked())
+                         model=self.model.text().strip(), visible=self.visible_pet.isChecked(), active=self.active.isChecked(),
+                         personality=self.personality.toPlainText().strip(), persona=self.persona.toPlainText().strip(),
+                         skin=self.member.skin if primary or not skin else skin)
         try:
-            self.persist(member)
+            self.persist(member, portrait=self.portrait if not skin and not primary else None)
         except (ValueError, sqlite3.Error) as error:
             self.notice.setText(str(error))
             return
@@ -520,6 +564,7 @@ class ManagerWindow(QDialog):
         page, layout = self.page("成员")
         self.members = QListWidget()
         self.members.setAccessibleName("桌面学伴成员")
+        self.members.setIconSize(QSize(36, 36))
         layout.addWidget(self.members, 1)
         self.member_hint = label("", "quiet")
         layout.addWidget(self.member_hint)
@@ -528,7 +573,7 @@ class ManagerWindow(QDialog):
         actions.addWidget(button("私聊", lambda: self.member_action(self.desktop.show_member_chat)))
         actions.addWidget(button("查看记忆", lambda: self.member_action(self.desktop.show_member_memory)))
         actions.addWidget(button("编辑外观", lambda: self.member_action(self.open_appearance)))
-        actions.addWidget(button("编辑", lambda: self.edit_member()))
+        actions.addWidget(button("编辑档案", lambda: self.edit_member()))
         actions.addStretch()
         actions.addWidget(button("添加成员", lambda: self.edit_member(add=True), primary=True))
         return page
@@ -548,7 +593,11 @@ class ManagerWindow(QDialog):
         return page
 
     def open_appearance(self, key=PRIMARY):
-        self.appearance_member.setCurrentIndex(max(0, self.appearance_member.findData(key)))
+        index = max(0, self.appearance_member.findData(key))
+        if self.appearance_member.currentIndex() == index:
+            self.load_appearance()
+        else:
+            self.appearance_member.setCurrentIndex(index)
         self.nav.setCurrentRow(self.appearance_index)
 
     def load_appearance(self):
@@ -828,20 +877,25 @@ class ManagerWindow(QDialog):
         else:
             self.prompt.clear()
 
-    def reload_members(self):
+    def reload_members(self, preferred=None):
         previous = self.current_member()
+        preferred = preferred or (previous.key if previous else None)
         checked = set(self.selected())
         first_load = not self.participants.count()
         self.members.clear()
         self.participants.clear()
         members = self.team.store.members()
+        keys = {member.skin for member in members if member.key != PRIMARY}
+        icons = {skin.key: portrait_icon(skin) for skin in self.skin_library.all(saved_palettes=False) if skin.key in keys}
+        icons[PRIMARY] = portrait_icon(self.skin_library.current())
         for member in members:
             state = "显示在桌面" if member.visible and member.active else "未显示"
             role = "主学伴" if member.key == PRIMARY else "子成员"
             item = QListWidgetItem(f"{member.name}　·　{role}　·　{state}\n{excerpt(member.role, 156)}")
+            item.setIcon(icons.get(PRIMARY if member.key == PRIMARY else member.skin, QIcon()))
             item.setData(Qt.ItemDataRole.UserRole, member)
             self.members.addItem(item)
-            if previous and previous.key == member.key:
+            if preferred == member.key:
                 self.members.setCurrentItem(item)
             if member.active:
                 entry = QListWidgetItem(member.name)
@@ -870,11 +924,8 @@ class ManagerWindow(QDialog):
 
     def edit_member(self, *, add=False):
         current = self.current_member()
-        dialog = MemberDialog(self, None if add else current, self.team.store.save_member)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.desktop.sync_pets()
-            self.reload_members()
-            self.refresh()
+        dialog = MemberDialog(self, None if add else current, self.desktop.save_member)
+        dialog.exec()
         dialog.deleteLater()
 
     def show_notice(self, message):

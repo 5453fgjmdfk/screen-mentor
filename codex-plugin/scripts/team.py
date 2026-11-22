@@ -1,6 +1,6 @@
 """Local companion roster, shared conversation and bounded group turns."""
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from queue import Queue
 import re
@@ -15,6 +15,9 @@ from resident_agent import MAX_INPUT, ask_model, excerpt
 
 PRIMARY = "primary"
 MAX_MEMBERS = 8
+MAX_ROLE = 360
+MAX_PERSONALITY = 400
+MAX_PERSONA = 800
 MAX_SPEAKERS = 4
 MAX_WORKERS = 3
 MIN_INTERVAL = 15
@@ -41,6 +44,16 @@ class Member:
     skin: str = "default"
     visible: bool = False
     active: bool = True
+    personality: str = ""
+    persona: str = ""
+
+    def identity(self):
+        parts = [f"你的名字是{self.name}。", f"工作职责：{self.role}"]
+        if self.personality:
+            parts.append(f"沟通性格和表达方式：{self.personality}")
+        if self.persona:
+            parts.append(f"角色设定（虚构背景）：{self.persona}")
+        return "\n".join(parts)
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,9 @@ class TeamStore:
                 CREATE TABLE IF NOT EXISTS member_appearance (
                     member_key TEXT PRIMARY KEY, palette TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS member_profile (
+                    member_key TEXT PRIMARY KEY, personality TEXT NOT NULL, persona TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS parallel_round (
                     id TEXT PRIMARY KEY
                 );
@@ -100,15 +116,20 @@ class TeamStore:
     def members(self):
         with closing(self.connect()) as db:
             return [Member(row["key"], row["name"], row["role"], row["model"], row["skin"],
-                           bool(row["visible"]), bool(row["active"])) for row in db.execute(
-                "SELECT * FROM member ORDER BY CASE WHEN key = ? THEN 0 ELSE 1 END, rowid", (PRIMARY,)
-            )]
+                           bool(row["visible"]), bool(row["active"]), row["personality"] or "", row["persona"] or "")
+                    for row in db.execute("""
+                        SELECT member.*, member_profile.personality, member_profile.persona
+                        FROM member LEFT JOIN member_profile ON member.key = member_profile.member_key
+                        ORDER BY CASE WHEN member.key = ? THEN 0 ELSE 1 END, member.rowid
+                    """, (PRIMARY,))]
 
-    def save_member(self, member):
+    def save_member(self, member, *, install_skin=None):
         if not member.name or len(member.name) > 20 or not member.name.isprintable() or "@" in member.name:
             raise ValueError("成员名称需要 1–20 个可见字符。")
-        if not member.role or len(member.role) > 360:
-            raise ValueError("请用 1–360 个字描述成员的职责。")
+        if not member.role or len(member.role) > MAX_ROLE:
+            raise ValueError(f"请用 1–{MAX_ROLE} 个字描述成员的职责。")
+        if len(member.personality) > MAX_PERSONALITY or len(member.persona) > MAX_PERSONA:
+            raise ValueError(f"性格最多 {MAX_PERSONALITY} 字，角色设定最多 {MAX_PERSONA} 字。")
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             if (not db.execute("SELECT 1 FROM member WHERE key = ?", (member.key,)).fetchone()
@@ -123,6 +144,15 @@ class TeamStore:
                       member.visible or member.key == PRIMARY, member.active or member.key == PRIMARY))
             except sqlite3.IntegrityError:
                 raise ValueError("这个名称已被使用。") from None
+            if install_skin is not None:
+                skin = install_skin()
+                member = replace(member, skin=skin.key)
+                db.execute("UPDATE member SET skin=? WHERE key=?", (skin.key, member.key))
+            db.execute("""
+                INSERT INTO member_profile(member_key, personality, persona) VALUES (?, ?, ?)
+                ON CONFLICT(member_key) DO UPDATE SET personality=excluded.personality, persona=excluded.persona
+            """, (member.key, member.personality, member.persona))
+        return member
 
     def add_line(self, round_id, kind, speaker, body, member_key=None, *, casual_key=None):
         with closing(self.connect()) as db, db:
@@ -419,7 +449,7 @@ class TeamCoordinator(QObject):
                     instruction = "回应用户或前一位成员，补充自己的观点。"
                 thread = "\n".join(f"{name}：{excerpt(body, 800)}" for name, body in replies)
                 messages = [
-                    {"role": "system", "content": f"你是群聊成员 {member.name}。职责：{member.role}\n"
+                    {"role": "system", "content": f"你是群聊成员 {member.name}。\n{member.identity()}\n"
                      f"{instruction} 使用中文。只输出包含 answer 字段的 JSON 对象。"},
                     {"role": "user", "content": f"同类历史记录：\n{transcript}\n\n本轮题目：\n{prompt}"
                      f"\n\n本轮前面的回复：\n{thread}"},
@@ -523,7 +553,7 @@ class TeamCoordinator(QObject):
     def request(self, member, config, instruction, context, max_tokens):
         endpoint, model, key = config
         messages = [
-            {"role": "system", "content": f"你是学伴成员 {member.name}。职责：{member.role}\n{instruction} 使用中文。"},
+            {"role": "system", "content": f"你是学伴成员 {member.name}。\n{member.identity()}\n{instruction} 使用中文。"},
             {"role": "user", "content": context},
         ]
         answer, _, _ = ask_model(endpoint, member.model or model, key, messages, max_tokens=max_tokens)

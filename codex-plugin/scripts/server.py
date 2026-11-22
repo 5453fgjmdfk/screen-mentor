@@ -44,9 +44,11 @@ def text_content(data):
 class MentorServer(QObject):
     management_requested = pyqtSignal()
 
-    def __init__(self, app, archive):
+    def __init__(self, app, archive, *, create_member=None, list_skins=None):
         super().__init__()
         self.archive = archive
+        self.create_member = create_member
+        self.list_skins = list_skins
         self.snapshot = None
         self.snapshot_owner = None
         self.practice = Practice(None, app, persistent=True)
@@ -469,6 +471,14 @@ class MentorServer(QObject):
             elif name == "open_management":
                 self.management_requested.emit()
                 blocks = [text_content({"opened": True, "surface": "desktop_manager"})]
+            elif name == "list_member_skins":
+                if self.list_skins is None:
+                    raise ValueError("桌面成员管理尚未打开。")
+                blocks = [text_content({"skins": self.list_skins()})]
+            elif name == "create_member":
+                if self.create_member is None:
+                    raise ValueError("桌面成员管理尚未打开。")
+                blocks = [text_content(self.create_member(args))]
             elif name == "start_live":
                 blocks = self.start_practice(owner=owner, **args)
             elif name == "end_live":
