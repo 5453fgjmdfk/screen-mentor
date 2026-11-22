@@ -337,7 +337,7 @@ class Practice(QObject):
         self.panel.layout().activate()
         self.panel.adjustSize()
         self.sync_edge_thought()
-        if self.panel.isVisible() and self.panel.drag_handle is None:
+        if self.panel.isVisible() and not self.panel.moving:
             top = self.panel.screen().availableGeometry().top()
             self.panel.move(self.panel.x(), max(top, bottom - self.panel.height()))
 

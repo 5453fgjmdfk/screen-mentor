@@ -258,7 +258,7 @@ class ChatPane(QWidget):
         endpoint, model, key = (self.settings.value(field, "", type=str)
                                 for field in ("endpoint", "model", "key_name"))
         member = self.member
-        config = (endpoint, member.model or model, key)
+        config = member.connection((endpoint, model, key))
         self.busy = True
         self.cancel = Event()
         self.preview = ""
@@ -384,6 +384,7 @@ class Desktop(QObject):
         self.chat_bubbles = set()
         self.exiting = False
         self.pets = {}
+        self.preferences = QSettings(str(PROFILE / "desktop.ini"), QSettings.Format.IniFormat)
         self.agent_settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.team = TeamCoordinator(TeamStore(PROFILE / "team.sqlite3"), PROFILE / "team.ini",
                                     self.model_settings, self.quiet_ready, self)
@@ -423,7 +424,16 @@ class Desktop(QObject):
     def show_manager(self):
         manager = self.get_manager()
         manager.refresh()
-        show_centered(manager)
+        if manager.isVisible() or (manager.placed and self.preferences.value("remember_geometry", True, type=bool)):
+            if manager.isMinimized():
+                manager.showNormal()
+            else:
+                manager.show()
+            manager.raise_()
+            manager.activateWindow()
+        else:
+            show_centered(manager)
+            manager.placed = True
 
     def get_manager(self):
         if self.manager is None:
@@ -431,15 +441,28 @@ class Desktop(QObject):
         return self.manager
 
     def hide_to_tray(self):
+        self.manager.store_layout()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.manager.hide()
         else:
             self.manager.showMinimized()
 
+    def close_manager(self):
+        if self.preferences.value("close_action", "tray", type=str) == "quit":
+            QTimer.singleShot(0, self.quit)
+        else:
+            self.hide_to_tray()
+
+    def workspace_directory(self):
+        directory = self.preferences.value("workspace_directory", "", type=str)
+        return directory if directory and Path(directory).is_dir() else ""
+
     def quit(self):
         if self.exiting:
             return
         self.exiting = True
+        if self.manager is not None:
+            self.manager.store_layout()
         self.engine.practice.shutdown.set()
         self.engine.practice.close()
         self.scheduler.stop()
@@ -480,10 +503,13 @@ class Desktop(QObject):
             raise ValueError("请在现有皮肤与 PNG 图片中选择一种。")
         if skin_key and not any(skin["key"] == skin_key for skin in self.member_skins()):
             raise ValueError("找不到这个皮肤。请用 list_member_skins 查看本机已有的皮肤。")
+        endpoint = options.get("endpoint", "").strip()
+        model = options.get("model", "").strip()
         member = Member(uuid4().hex, options["name"].strip(), options["role"].strip(),
-                        model=options.get("model", "").strip(), skin=skin_key or "default",
+                        model="" if endpoint else model, skin=skin_key or "default",
                         visible=options.get("visible", False), personality=options.get("personality", "").strip(),
-                        persona=options.get("persona", "").strip())
+                        persona=options.get("persona", "").strip(), endpoint=endpoint,
+                        own_model=model if endpoint else "", key_name=options.get("key_name", "").strip())
         saved = self.save_member(member, portrait=portrait)
         return {"created": True, "member_id": saved.key, "name": saved.name, "role": saved.role,
                 "skin_key": saved.skin, "visible": saved.visible, "displayed": saved.visible and not self.team.blocked}
@@ -505,6 +531,8 @@ class Desktop(QObject):
             chat.set_member(saved)
         if self.manager is not None:
             self.manager.reload_members(saved.key)
+            if self.manager.model_target.currentData() == saved.key:
+                self.manager.load_model()
             self.manager.refresh()
         return saved
 
@@ -518,7 +546,7 @@ class Desktop(QObject):
             return None
         if key not in self.member_chats:
             chat = ChatPane(self.member_archive(key), member, self.show_team if key == PRIMARY else None,
-                            self.get_manager().open_model)
+                            lambda: self.get_manager().open_model(key))
             self.member_chats[key] = chat
             chat.started.connect(lambda: self.show_chat_response(key, "think", ""))
             chat.response.connect(lambda phase, text: self.show_chat_response(key, phase, text))

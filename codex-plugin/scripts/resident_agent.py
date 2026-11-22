@@ -236,20 +236,28 @@ def read_model_stream(response, publish, cancelled):
     return "".join(chunks)
 
 
-def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=None, cancelled=lambda: False):
-    if not endpoint.strip() or not model.strip():
-        raise ValueError("尚未配置常驻模型。打开「设置模型」填写接口和模型名。")
-    target = urlsplit(endpoint.rstrip("/"))
+def model_url(endpoint):
+    url = endpoint.rstrip("/")
+    try:
+        target = urlsplit(url)
+        port = target.port
+    except ValueError:
+        raise ValueError("模型接口地址无效。") from None
     if (not target.hostname or target.username or target.password or target.query or target.fragment
+            or (port is not None and port == 0) or any(character.isspace() for character in url)
             or (target.scheme != "https" and not
                 (target.scheme == "http" and target.hostname in {"localhost", "127.0.0.1", "::1"}))):
         raise ValueError("模型接口使用 HTTPS，或使用本机的 HTTP 地址。")
+    return url if url.endswith("/chat/completions") else url + "/chat/completions"
+
+
+def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=None, cancelled=lambda: False):
+    if not endpoint.strip() or not model.strip():
+        raise ValueError("尚未配置模型。打开「模型」填写接口和模型名。")
+    url = model_url(endpoint)
     key = os.environ.get(key_name, "") if key_name else ""
     if key_name and not key:
         raise ValueError(f"尚未读取到环境变量 {key_name}，请设置后重新启动桌面学伴。")
-    url = endpoint.rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url += "/chat/completions"
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = "Bearer " + key

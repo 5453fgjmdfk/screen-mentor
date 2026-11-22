@@ -2,7 +2,7 @@
 from dataclasses import replace
 
 from PIL import Image
-from PyQt6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter,
     QImage, QPainterPath, QPainterPathStroker, QPen, QTransform,
@@ -233,6 +233,8 @@ class EdgeThought(QWidget):
 
 class EdgePeek(QWidget):
     restore_requested = pyqtSignal(object)
+    lift_moved = pyqtSignal(QPoint)
+    lift_released = pyqtSignal(QPoint)
 
     def __init__(self):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -245,6 +247,7 @@ class EdgePeek(QWidget):
         self.edge = None
         self.thinking = False
         self.press_at = None
+        self.lift_point = None
         self.frames = {}
         self.art_path = None
         self.thought = EdgeThought(self)
@@ -300,7 +303,15 @@ class EdgePeek(QWidget):
 
     def mouseMoveEvent(self, event):
         if self.press_at is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            delta = event.globalPosition().toPoint() - self.press_at
+            cursor = event.globalPosition().toPoint()
+            delta = cursor - self.press_at
+            if self.lift_point is not None or self.inward(delta) >= max(14, QApplication.startDragDistance()):
+                if self.lift_point is None:
+                    self.thought.hide()
+                    self.update()
+                self.lift_point = cursor
+                self.lift_moved.emit(cursor)
+                return
             if delta.manhattanLength() >= QApplication.startDragDistance():
                 self.move(self.edge_position(self.press_position + delta))
 
@@ -310,27 +321,37 @@ class EdgePeek(QWidget):
             return
         cursor = event.globalPosition().toPoint()
         delta = cursor - self.press_at
+        lifted = self.lift_point is not None
         self.reset_press()
+        if lifted:
+            self.lift_released.emit(cursor)
+            return
         if delta.manhattanLength() < QApplication.startDragDistance():
             self.restore_requested.emit(None)
             return
-        inward = {
-            Qt.Edge.LeftEdge: delta.x(),
-            Qt.Edge.RightEdge: -delta.x(),
-            Qt.Edge.BottomEdge: -delta.y(),
-        }[self.edge]
-        if inward >= max(14, QApplication.startDragDistance()):
+        if self.inward(delta) >= max(14, QApplication.startDragDistance()):
             self.restore_requested.emit(cursor)
         else:
             self.move(self.edge_position(self.press_position + delta))
 
+    def inward(self, delta):
+        return {
+            Qt.Edge.LeftEdge: delta.x(),
+            Qt.Edge.RightEdge: -delta.x(),
+            Qt.Edge.BottomEdge: -delta.y(),
+        }[self.edge]
+
     def reset_press(self):
         self.press_at = None
+        self.lift_point = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def event(self, event):
         if event.type() == QEvent.Type.UngrabMouse:
+            lifted = self.lift_point
             self.reset_press()
+            if lifted is not None and self.isVisible():
+                self.lift_released.emit(lifted)
         return super().event(event)
 
     def set_thought(self, text):
@@ -344,7 +365,7 @@ class EdgePeek(QWidget):
             self.follow_thought()
 
     def follow_thought(self):
-        if self.thought.text and self.clock.elapsed() >= 200:
+        if self.lift_point is None and self.thought.text and self.clock.elapsed() >= 200:
             self.thought.follow(self.geometry(), self.edge, self.area)
             self.thought.show()
         else:
@@ -363,6 +384,8 @@ class EdgePeek(QWidget):
         super().hideEvent(event)
 
     def paintEvent(self, event):
+        if self.lift_point is not None:
+            return
         painter = QPainter(self)
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         bottom = self.edge == Qt.Edge.BottomEdge
@@ -380,6 +403,50 @@ class EdgePeek(QWidget):
                    mirror=self.edge == Qt.Edge.RightEdge, thinking=self.thinking)
 
 
+class PetSprite(QLabel):
+    def __init__(self):
+        super().__init__()
+        self.lift = 0.0
+        self.tilt = 1
+        self.motion = QVariantAnimation(self)
+        self.motion.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.motion.valueChanged.connect(self.animate_lift)
+
+    def animate_lift(self, value):
+        self.lift = value
+        self.update()
+
+    def animate(self, beginning, ending, milliseconds):
+        self.motion.stop()
+        self.motion.setStartValue(beginning)
+        self.motion.setEndValue(ending)
+        self.motion.setDuration(milliseconds)
+        self.motion.start()
+
+    def pickup(self, edge):
+        self.tilt = -1 if edge == Qt.Edge.RightEdge else 1
+        self.animate(1.0, .36, 210)
+
+    def land(self):
+        self.animate(self.lift, 0.0, 160)
+
+    def paintEvent(self, event):
+        movie = self.movie()
+        frame = movie.currentPixmap() if movie is not None else self.pixmap()
+        if not self.lift or frame is None or frame.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        size = frame.deviceIndependentSize()
+        pivot = QPointF(self.width() / 2, self.height() * .2)
+        painter.translate(pivot)
+        painter.rotate(self.tilt * 12 * self.lift)
+        painter.scale(1 - .32 * self.lift, 1 - .18 * self.lift)
+        painter.setOpacity(1 - .19 * self.lift)
+        painter.drawPixmap(QPointF(-size.width() / 2, (self.height() - size.height()) / 2 - pivot.y()), frame)
+
+
 class CompanionPanel(QWidget):
     closed = pyqtSignal()
     clicked = pyqtSignal()
@@ -392,7 +459,7 @@ class CompanionPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-        self.sprite = QLabel()
+        self.sprite = PetSprite()
         self.sprite.setAccessibleName("小龙学伴")
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sprite.setFixedSize(sprite_size, sprite_size)
@@ -400,10 +467,14 @@ class CompanionPanel(QWidget):
         self.drag_handle = None
         self.drag_offset = None
         self.drag_start = None
+        self.edge_dragging = False
+        self.lift_widgets = []
         self.model_frame = None
         self.model_pixels = QRect()
         self.peek = EdgePeek()
         self.peek.restore_requested.connect(self.restore_from_edge)
+        self.peek.lift_moved.connect(self.pull_from_edge)
+        self.peek.lift_released.connect(self.drop_from_edge)
         self.destroyed.connect(self.peek.deleteLater)
         self.controls = QWidget()
         self.controls.setObjectName("companionControls")
@@ -504,7 +575,7 @@ class CompanionPanel(QWidget):
     def eventFilter(self, target, event):
         if target in self.drag_handles and self.drag_window(target, event):
             return True
-        if target in (self.sprite, self.controls):
+        if not self.edge_dragging and target in (self.sprite, self.controls):
             if event.type() == QEvent.Type.Enter:
                 self.hover_timer.stop()
                 self.controls.show()
@@ -580,6 +651,54 @@ class CompanionPanel(QWidget):
         offset = model.topLeft()
         return fit_position(position + offset, model.size(), area) - offset
 
+    @property
+    def moving(self):
+        return self.drag_handle is not None or self.edge_dragging
+
+    def grab_point(self):
+        model = self.model_bounds()
+        return QPoint(model.center().x(), model.top() + round(model.height() * .18))
+
+    def pull_from_edge(self, cursor):
+        if not self.edge_dragging:
+            self.edge_dragging = True
+            self.hover_timer.stop()
+            self.controls.hide()
+            layout = self.layout()
+            self.lift_widgets = [widget for index in range(layout.count())
+                                 if (widget := layout.itemAt(index).widget()) is not None
+                                 and widget is not self.sprite and not widget.isHidden()]
+            for widget in self.lift_widgets:
+                widget.hide()
+            layout.activate()
+            self.adjustSize()
+            self.sprite.pickup(self.peek.edge)
+        screen = QGuiApplication.screenAt(cursor) or self.peek.screen()
+        self.move(self.fit_model(cursor - self.grab_point(), screen.availableGeometry()))
+        if not self.isVisible():
+            self.show()
+
+    def cancel_lift(self):
+        if not self.edge_dragging:
+            return
+        self.edge_dragging = False
+        for widget in self.lift_widgets:
+            widget.show()
+        self.lift_widgets.clear()
+        self.layout().activate()
+        self.adjustSize()
+        self.sprite.land()
+
+    def drop_from_edge(self, cursor):
+        if not self.edge_dragging:
+            return
+        self.peek.hide()
+        self.cancel_lift()
+        screen = QGuiApplication.screenAt(cursor) or self.screen()
+        area = screen.availableGeometry()
+        position = cursor - self.grab_point()
+        self.move(fit_position(position, self.size(), area))
+
     def snap_to_edge(self, area):
         bounds = self.model_bounds().translated(self.pos())
         distances = {
@@ -623,6 +742,7 @@ class CompanionPanel(QWidget):
     def closeEvent(self, event):
         super().closeEvent(event)
         if event.isAccepted():
+            self.cancel_lift()
             self.peek.close()
             self.skin_timer.stop()
             self.ready_timer.stop()

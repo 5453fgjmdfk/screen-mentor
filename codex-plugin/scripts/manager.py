@@ -1,19 +1,22 @@
 """Native management panel and desktop views for companion members."""
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
+import re
 import sqlite3
 from uuid import uuid4
 
-from PyQt6.QtCore import QDateTime, QPoint, QSignalBlocker, QSize, QTimer, Qt
-from PyQt6.QtGui import QCursor, QGuiApplication, QIcon, QImageReader, QPixmap
+from PyQt6.QtCore import QByteArray, QDateTime, QEvent, QPoint, QSignalBlocker, QSize, QTimer, QUrl, Qt
+from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImageReader, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QColorDialog, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QSystemTrayIcon,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position
-from resident_agent import MAX_INPUT, excerpt
+from resident_agent import MAX_INPUT, excerpt, model_url
 from scheduled import FREQUENCIES, MODES, ScheduledTask
 from team import (
     MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, CasualRoom, Member, PRIMARY, ROOM_MODES,
@@ -35,13 +38,47 @@ QListWidget, QPlainTextEdit, QLineEdit, QComboBox, QSpinBox, QDateTimeEdit {
     background:#1d2933;border:1px solid #3f5360;border-radius:8px;padding:7px;selection-background-color:#416272;
 }
 QListWidget#nav {background:transparent;border:0;}
+QListWidget#nav::item {padding:6px 8px;}
 QListWidget::item {padding:8px;border-radius:7px;}
 QListWidget::item:selected {background:#365260;color:#f3f8fa;}
 QPushButton {background:#2b3e4a;border:1px solid #455e6d;border-radius:8px;padding:7px 12px;}
 QPushButton:hover, QPushButton:focus {border-color:#9abacb;}
 QPushButton:disabled {color:#8596a0;border-color:#374b56;}
 QPushButton#primary {background:#a1c1d0;color:#1c2b34;font-weight:600;}
+QTabWidget::pane {border:1px solid #354752;border-radius:8px;}
+QTabBar::tab {color:#e5edf1;background:#202b35;border:1px solid #354752;padding:8px 14px;margin-right:4px;}
+QTabBar::tab:selected {color:#f3f8fa;background:#365260;}
 """
+
+
+PANEL_THEMES = {
+    "slate": ("石板蓝", "#1a232b"),
+    "lilac": ("暮紫", "#2a213a"),
+    "mint": ("深林绿", "#142e29"),
+    "paper": ("暖白", "#f4f0e9"),
+    "custom": ("自定义颜色", "#1a232b"),
+}
+
+
+def panel_style(theme, color):
+    if theme == "slate":
+        return PANEL_STYLE
+    token = color if theme == "custom" else PANEL_THEMES.get(theme, PANEL_THEMES["slate"])[1]
+    try:
+        palette = palette_for(token)
+    except ValueError:
+        return PANEL_STYLE
+    foreground = palette.text
+    shades = {
+        "#1a232b": palette.background, "#e5edf1": foreground, "#a7bbc7": foreground,
+        "#b2ccd9": palette.highlight, "#202b35": palette.surface, "#354752": palette.border,
+        "#222f3a": palette.surface, "#344754": palette.border, "#1d2933": palette.surface,
+        "#3f5360": palette.border, "#416272": palette.border, "#365260": palette.border,
+        "#f3f8fa": palette_for(palette.border).text, "#2b3e4a": palette.surface, "#455e6d": palette.border,
+        "#9abacb": palette.highlight, "#8596a0": palette.border, "#374b56": palette.border,
+        "#a1c1d0": palette.highlight, "#1c2b34": palette_for(palette.highlight).text,
+    }
+    return re.sub(r"#[0-9a-f]{6}\b", lambda match: shades.get(match[0], match[0]), PANEL_STYLE)
 
 
 def label(text, role=""):
@@ -136,7 +173,7 @@ class TeamPet(CompanionPanel):
         self.caption.setText(message)
         self.layout().activate()
         self.adjustSize()
-        if self.isVisible() and self.drag_handle is None:
+        if self.isVisible() and not self.moving:
             area = self.screen().availableGeometry()
             self.move(fit_position(QPoint(self.x(), bottom - self.height()), self.size(), area))
         self.peek.set_thought(message)
@@ -151,6 +188,7 @@ class TeamPet(CompanionPanel):
             return
         self.suspended = suspend
         if suspend:
+            self.cancel_lift()
             self.bubble_timer.stop()
             self.say("")
             if self.peek.isVisible():
@@ -165,13 +203,13 @@ class TeamPet(CompanionPanel):
 
 
 class MemberDialog(QDialog):
-    def __init__(self, parent, member, persist):
+    def __init__(self, parent, member, persist, directory=""):
         super().__init__(parent)
         self.persist = persist
+        self.directory = directory
         self.member = member or Member(uuid4().hex, "", "")
         self.setWindowTitle("编辑成员档案" if member else "创建学伴")
         self.setMinimumWidth(535)
-        self.setStyleSheet(PANEL_STYLE)
         form = QFormLayout(self)
         form.setContentsMargins(18, 16, 18, 16)
         self.name = QLineEdit(self.member.name)
@@ -198,9 +236,12 @@ class MemberDialog(QDialog):
         art = QHBoxLayout()
         art.addWidget(self.skin, 1)
         art.addWidget(import_button)
-        self.model = QLineEdit(self.member.model)
+        self.model = QLineEdit(self.member.own_model if self.member.endpoint else self.member.model)
         self.model.setMaxLength(120)
         self.model.setPlaceholderText("留空则使用默认模型")
+        self.model.setReadOnly(bool(self.member.endpoint))
+        if self.member.endpoint:
+            self.model.setToolTip("此成员使用独立接口，请在「模型」页修改。")
         self.visible_pet = QCheckBox("在桌面显示这个伙伴")
         self.visible_pet.setChecked(self.member.visible)
         self.active = QCheckBox("可参加群聊和协作")
@@ -210,7 +251,7 @@ class MemberDialog(QDialog):
         form.addRow("性格与表达", self.personality)
         form.addRow("角色设定", self.persona)
         form.addRow("桌宠形象", art)
-        form.addRow("模型覆盖", self.model)
+        form.addRow("模型名", self.model)
         form.addRow(self.visible_pet)
         form.addRow(self.active)
         if self.member.key == PRIMARY:
@@ -225,7 +266,7 @@ class MemberDialog(QDialog):
         form.addRow(actions)
 
     def choose_portrait(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "选择透明桌宠形象", "", "PNG 图片 (*.png)")
+        filename, _ = QFileDialog.getOpenFileName(self, "选择透明桌宠形象", self.directory, "PNG 图片 (*.png)")
         if not filename:
             return
         self.portrait = filename
@@ -239,7 +280,8 @@ class MemberDialog(QDialog):
         skin = self.skin.currentData()
         primary = self.member.key == PRIMARY
         member = replace(self.member, name=self.name.text().strip(), role=self.role.toPlainText().strip(),
-                         model=self.model.text().strip(), visible=self.visible_pet.isChecked(), active=self.active.isChecked(),
+                         model=self.member.model if self.member.endpoint else self.model.text().strip(),
+                         visible=self.visible_pet.isChecked(), active=self.active.isChecked(),
                          personality=self.personality.toPlainText().strip(), persona=self.persona.toPlainText().strip(),
                          skin=self.member.skin if primary or not skin else skin)
         try:
@@ -405,9 +447,15 @@ class ManagerWindow(QDialog):
         self.room_drafts = {}
         self.displayed_room = ""
         self.setWindowTitle("屏幕伴学 · 管理面板")
-        self.setStyleSheet(PANEL_STYLE)
+        preferences = desktop.preferences
+        self.setStyleSheet(panel_style(preferences.value("theme", "slate", type=str),
+                                       preferences.value("theme_color", "#1a232b", type=str)))
         self.resize(840, 570)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
         self.setMinimumSize(718, 487)
+        geometry = preferences.value("manager_geometry", QByteArray(), type=QByteArray)
+        self.placed = bool(preferences.value("remember_geometry", True, type=bool)
+                           and geometry and self.restoreGeometry(geometry))
         layout = QHBoxLayout(self)
         layout.setContentsMargins(17, 17, 17, 17)
         layout.setSpacing(15)
@@ -422,7 +470,7 @@ class ManagerWindow(QDialog):
         self.nav.setObjectName("nav")
         self.nav.setAccessibleName("管理面板导航")
         nav_layout.addWidget(self.nav, 1)
-        self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊", "定时任务"])
+        self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊", "定时任务", "设置"])
         nav_layout.addWidget(button("收起到托盘", self.desktop.hide_to_tray))
         nav_layout.addWidget(button("退出桌面学伴", self.desktop.quit))
         self.pages = QStackedWidget()
@@ -435,8 +483,8 @@ class ManagerWindow(QDialog):
         self.model_index = self.pages.addWidget(self.model_page())
         self.pages.addWidget(self.schedule_page())
         self.tasks_index = self.pages.addWidget(self.tasks_page())
+        self.settings_index = self.pages.addWidget(self.settings_page())
         self.nav.currentRowChanged.connect(self.switch_page)
-        self.nav.setCurrentRow(0)
         self.team.changed.connect(self.refresh)
         self.team.line.connect(self.add_line)
         self.team.notice.connect(self.show_notice)
@@ -447,6 +495,9 @@ class ManagerWindow(QDialog):
         self.reload_rooms()
         self.load_tasks()
         self.refresh()
+        startup = preferences.value("startup_page", "桌面", type=str)
+        matches = self.nav.findItems(startup, Qt.MatchFlag.MatchExactly)
+        self.nav.setCurrentRow(self.nav.row(matches[0]) if matches else 0)
 
     def page(self, title):
         page = QWidget()
@@ -463,6 +514,30 @@ class ManagerWindow(QDialog):
             self.select_chat()
         elif index == self.tasks_index:
             self.load_tasks()
+
+    def store_layout(self):
+        preferences = self.desktop.preferences
+        if self.placed and preferences.value("remember_geometry", True, type=bool):
+            preferences.setValue("manager_geometry", self.saveGeometry())
+            preferences.sync()
+
+    def closeEvent(self, event):
+        if self.desktop.exiting:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+            self.desktop.close_manager()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange and self.isMinimized()
+                and self.desktop.preferences.value("close_action", "tray", type=str) == "tray"
+                and QSystemTrayIcon.isSystemTrayAvailable()):
+            QTimer.singleShot(0, self.minimize_to_tray)
+
+    def minimize_to_tray(self):
+        if self.isMinimized() and self.isVisible() and not self.desktop.exiting:
+            self.desktop.hide_to_tray()
 
     def home_page(self):
         page, layout = self.page("桌面学伴")
@@ -557,7 +632,8 @@ class ManagerWindow(QDialog):
             if pane is not None:
                 self.private_chats.setCurrentWidget(pane)
 
-    def open_model(self):
+    def open_model(self, key=""):
+        self.model_target.setCurrentIndex(max(0, self.model_target.findData(key)))
         self.nav.setCurrentRow(self.model_index)
 
     def members_page(self):
@@ -587,7 +663,8 @@ class ManagerWindow(QDialog):
         row.addWidget(self.appearance_member, 1)
         layout.addLayout(row)
         self.skin_library = SkinLibrary()
-        self.skin_editor = AppearanceEditor(self.skin_library, self.skin_library.current(), self.apply_appearance)
+        self.skin_editor = AppearanceEditor(self.skin_library, self.skin_library.current(), self.apply_appearance,
+                                            self.desktop.workspace_directory)
         layout.addWidget(self.skin_editor, 1)
         self.appearance_member.currentIndexChanged.connect(self.load_appearance)
         return page
@@ -633,29 +710,196 @@ class ManagerWindow(QDialog):
 
     def model_page(self):
         page, layout = self.page("模型")
-        form = QFormLayout()
-        layout.addLayout(form)
+        self.model_form = QFormLayout()
+        layout.addLayout(self.model_form)
+        self.model_target = QComboBox()
+        self.model_target.setAccessibleName("选择要配置模型的学伴")
+        self.model_form.addRow("配置对象", self.model_target)
+        self.own_connection = QCheckBox("使用独立接口")
+        self.model_form.addRow(self.own_connection)
         self.model_fields = {}
         for name, caption, hint in (("endpoint", "接口地址", "例如 http://127.0.0.1:11434/v1"),
-                                    ("model", "默认模型", "成员可以单独覆盖模型名"),
+                                    ("model", "模型名", "填写服务提供的模型名"),
+                                    ("own_model", "模型名", "填写这个学伴所用的模型名"),
                                     ("key_name", "密钥环境变量名", "例如 SCREEN_MENTOR_MODEL_KEY，可留空")):
-            field = QLineEdit(self.desktop.agent_settings.value(name, "", type=str))
+            field = QLineEdit()
             field.setPlaceholderText(hint)
-            form.addRow(caption, field)
+            field.setMaxLength(1024 if name == "endpoint" else 128 if name == "key_name" else 120)
+            self.model_form.addRow(caption, field)
             self.model_fields[name] = field
-        status = label("", "notice")
-        layout.addWidget(status)
-
-        def save():
-            for name, field in self.model_fields.items():
-                self.desktop.agent_settings.setValue(name, field.text().strip())
-            self.desktop.agent_settings.sync()
-            status.setText("模型设置已保存。")
-            self.refresh()
-
-        layout.addWidget(button("保存模型设置", save, primary=True), alignment=Qt.AlignmentFlag.AlignRight)
+        self.model_help = label("", "quiet")
+        layout.addWidget(self.model_help)
+        self.model_notice = label("", "notice")
+        layout.addWidget(self.model_notice)
+        self.model_target.currentIndexChanged.connect(self.load_model)
+        self.own_connection.toggled.connect(self.update_model_form)
+        layout.addWidget(button("保存模型设置", self.save_model, primary=True), alignment=Qt.AlignmentFlag.AlignRight)
         layout.addStretch()
         return page
+
+    def selected_model_member(self):
+        key = self.model_target.currentData()
+        return next((member for member in self.team.store.members() if member.key == key), None) if key else None
+
+    def load_model(self):
+        member = self.selected_model_member()
+        with QSignalBlocker(self.own_connection):
+            self.own_connection.setChecked(bool(member and member.endpoint))
+        if member:
+            values = {"endpoint": member.endpoint, "model": member.model,
+                      "own_model": member.own_model, "key_name": member.key_name}
+        else:
+            endpoint, model, key_name = self.desktop.model_settings()
+            values = {"endpoint": endpoint, "model": model, "key_name": key_name}
+        for key, field in self.model_fields.items():
+            field.setText(values.get(key, ""))
+        self.model_notice.clear()
+        self.update_model_form()
+
+    def update_model_form(self):
+        personal = bool(self.model_target.currentData())
+        independent = personal and self.own_connection.isChecked()
+        self.model_form.setRowVisible(self.own_connection, personal)
+        for name in ("endpoint", "key_name"):
+            self.model_form.setRowVisible(self.model_fields[name], not personal or independent)
+        self.model_form.setRowVisible(self.model_fields["model"], not independent)
+        self.model_form.setRowVisible(self.model_fields["own_model"], independent)
+        if independent:
+            hint = "此学伴使用这里填写的接口、模型和密钥。环境变量名留空时不发送密钥。"
+        elif personal:
+            hint = "此学伴沿用默认接口。模型名留空时也沿用默认模型。"
+        else:
+            hint = "这组设置用于沿用默认接口的学伴。可在上方选择成员，为它单独配置其他接口或模型。"
+        self.model_help.setText(hint)
+
+    def save_model(self):
+        fields = {key: field.text().strip() for key, field in self.model_fields.items()}
+        member = self.selected_model_member()
+        try:
+            if member:
+                if self.own_connection.isChecked():
+                    if not fields["endpoint"]:
+                        raise ValueError("请填写此学伴的独立接口地址。")
+                    member = replace(member, endpoint=fields["endpoint"], own_model=fields["own_model"],
+                                     key_name=fields["key_name"])
+                else:
+                    member = replace(member, model=fields["model"], endpoint="", own_model="", key_name="")
+                self.desktop.save_member(member)
+            else:
+                if fields["endpoint"]:
+                    model_url(fields["endpoint"])
+                for name in ("endpoint", "model", "key_name"):
+                    self.desktop.agent_settings.setValue(name, fields[name])
+                self.desktop.agent_settings.sync()
+        except ValueError as error:
+            self.model_notice.setText(str(error))
+            return
+        self.model_notice.setText("模型设置已保存。")
+
+    def settings_page(self):
+        page, layout = self.page("设置")
+        preferences = self.desktop.preferences
+        self.settings_tabs = QTabWidget()
+        layout.addWidget(self.settings_tabs, 1)
+        appearance = self.settings_section("外观")
+        general = self.settings_section("通用")
+        workspace = self.settings_section("工作空间")
+        self.theme = QComboBox()
+        for key, (name, _) in PANEL_THEMES.items():
+            self.theme.addItem(name, key)
+        self.theme.setCurrentIndex(max(0, self.theme.findData(preferences.value("theme", "slate", type=str))))
+        appearance.addRow("颜色主题", self.theme)
+        self.theme_color = QLineEdit(preferences.value("theme_color", "#1a232b", type=str))
+        self.theme_color.setMaxLength(7)
+        self.theme_color.setPlaceholderText("#RRGGBB")
+        self.pick_color = button("选颜色…", self.pick_theme_color)
+        color_row = QHBoxLayout()
+        color_row.addWidget(self.theme_color, 1)
+        color_row.addWidget(self.pick_color)
+        appearance.addRow("自定义颜色", color_row)
+        self.theme.currentIndexChanged.connect(self.update_theme_fields)
+        self.update_theme_fields()
+
+        self.close_action = QComboBox()
+        self.close_action.addItem("收起到系统托盘", "tray")
+        self.close_action.addItem("退出桌面学伴", "quit")
+        self.close_action.setCurrentIndex(max(0, self.close_action.findData(
+            preferences.value("close_action", "tray", type=str))))
+        general.addRow("关闭面板时", self.close_action)
+        general.addRow(label("收起后桌宠与定时任务继续运行。退出时会结束当前伴学和后台工作。", "quiet"))
+
+        self.workspace_folder = QLineEdit(preferences.value("workspace_directory", "", type=str))
+        self.workspace_folder.setPlaceholderText("选择导入皮肤和素材时优先打开的目录")
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.workspace_folder, 1)
+        folder_row.addWidget(button("浏览…", self.choose_workspace))
+        folder_row.addWidget(button("打开目录", self.open_workspace))
+        workspace.addRow("工作目录", folder_row)
+        self.startup_page_field = QComboBox()
+        self.startup_page_field.addItems([self.nav.item(i).text() for i in range(self.nav.count())])
+        self.startup_page_field.setCurrentText(preferences.value("startup_page", "桌面", type=str))
+        workspace.addRow("启动时打开", self.startup_page_field)
+        self.remember_geometry = QCheckBox("记住管理面板的位置和大小")
+        self.remember_geometry.setChecked(preferences.value("remember_geometry", True, type=bool))
+        workspace.addRow(self.remember_geometry)
+        self.settings_notice = label("", "notice")
+        layout.addWidget(self.settings_notice)
+        layout.addWidget(button("保存设置", self.save_preferences, primary=True), alignment=Qt.AlignmentFlag.AlignRight)
+        return page
+
+    def settings_section(self, name):
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(16, 15, 16, 15)
+        form.setVerticalSpacing(11)
+        self.settings_tabs.addTab(panel, name)
+        return form
+
+    def update_theme_fields(self):
+        custom = self.theme.currentData() == "custom"
+        self.theme_color.setEnabled(custom)
+        self.pick_color.setEnabled(custom)
+
+    def pick_theme_color(self):
+        initial = QColor(self.theme_color.text())
+        color = QColorDialog.getColor(initial if initial.isValid() else QColor("#1a232b"), self, "管理面板颜色")
+        if color.isValid():
+            self.theme_color.setText(color.name())
+
+    def choose_workspace(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择工作目录", self.workspace_folder.text())
+        if folder:
+            self.workspace_folder.setText(folder)
+
+    def open_workspace(self):
+        folder = self.workspace_folder.text().strip()
+        if folder and Path(folder).is_absolute() and Path(folder).is_dir():
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(folder)):
+                return
+        self.settings_notice.setText("请先选择一个可以打开的本地文件夹。")
+
+    def save_preferences(self):
+        folder = self.workspace_folder.text().strip()
+        if folder and (not Path(folder).is_absolute() or not Path(folder).is_dir()):
+            self.settings_notice.setText("请选择存在的工作目录，或将此项留空。")
+            return
+        theme = self.theme.currentData()
+        color = self.theme_color.text().strip()
+        if theme == "custom" and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            self.settings_notice.setText("自定义颜色格式为 #RRGGBB，例如 #2B3A50。")
+            return
+        preferences = self.desktop.preferences
+        preferences.setValue("theme", theme)
+        preferences.setValue("theme_color", color)
+        preferences.setValue("close_action", self.close_action.currentData())
+        preferences.setValue("workspace_directory", folder)
+        preferences.setValue("startup_page", self.startup_page_field.currentText())
+        preferences.setValue("remember_geometry", self.remember_geometry.isChecked())
+        if not self.remember_geometry.isChecked():
+            preferences.remove("manager_geometry")
+        preferences.sync()
+        self.setStyleSheet(panel_style(theme, color))
+        self.settings_notice.setText("设置已保存。")
 
     def schedule_page(self):
         page, layout = self.page("桌面闲聊")
@@ -905,13 +1149,17 @@ class ManagerWindow(QDialog):
                 self.participants.addItem(entry)
         if self.members.currentRow() < 0:
             self.members.setCurrentRow(0)
-        for combo in (self.appearance_member, self.chat_member):
+        for combo in (self.appearance_member, self.chat_member, self.model_target):
             current_target = combo.currentData()
             with QSignalBlocker(combo):
                 combo.clear()
+                if combo is self.model_target:
+                    combo.addItem("默认模型设置", "")
                 for member in members:
                     combo.addItem(member.name, member.key)
                 combo.setCurrentIndex(max(0, combo.findData(current_target)))
+            if combo is self.model_target and current_target is None:
+                self.load_model()
 
     def current_member(self):
         item = self.members.currentItem()
@@ -924,7 +1172,8 @@ class ManagerWindow(QDialog):
 
     def edit_member(self, *, add=False):
         current = self.current_member()
-        dialog = MemberDialog(self, None if add else current, self.desktop.save_member)
+        dialog = MemberDialog(self, None if add else current, self.desktop.save_member,
+                              self.desktop.workspace_directory())
         dialog.exec()
         dialog.deleteLater()
 

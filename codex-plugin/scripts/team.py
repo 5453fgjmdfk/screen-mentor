@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
 
-from resident_agent import MAX_INPUT, ask_model, excerpt
+from resident_agent import MAX_INPUT, ask_model, excerpt, model_url
 
 
 PRIMARY = "primary"
@@ -46,6 +46,15 @@ class Member:
     active: bool = True
     personality: str = ""
     persona: str = ""
+    endpoint: str = ""
+    own_model: str = ""
+    key_name: str = ""
+
+    def connection(self, defaults):
+        if self.endpoint:
+            return self.endpoint, self.own_model, self.key_name
+        endpoint, model, key_name = defaults
+        return endpoint, self.model or model, key_name
 
     def identity(self):
         parts = [f"你的名字是{self.name}。", f"工作职责：{self.role}"]
@@ -91,6 +100,9 @@ class TeamStore:
                 CREATE TABLE IF NOT EXISTS member_profile (
                     member_key TEXT PRIMARY KEY, personality TEXT NOT NULL, persona TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS member_connection (
+                    member_key TEXT PRIMARY KEY, endpoint TEXT NOT NULL, model TEXT NOT NULL, key_name TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS parallel_round (
                     id TEXT PRIMARY KEY
                 );
@@ -116,10 +128,13 @@ class TeamStore:
     def members(self):
         with closing(self.connect()) as db:
             return [Member(row["key"], row["name"], row["role"], row["model"], row["skin"],
-                           bool(row["visible"]), bool(row["active"]), row["personality"] or "", row["persona"] or "")
+                           bool(row["visible"]), bool(row["active"]), row["personality"] or "", row["persona"] or "",
+                           row["endpoint"] or "", row["own_model"] or "", row["key_name"] or "")
                     for row in db.execute("""
-                        SELECT member.*, member_profile.personality, member_profile.persona
+                        SELECT member.*, member_profile.personality, member_profile.persona,
+                               member_connection.endpoint, member_connection.model AS own_model, member_connection.key_name
                         FROM member LEFT JOIN member_profile ON member.key = member_profile.member_key
+                        LEFT JOIN member_connection ON member.key = member_connection.member_key
                         ORDER BY CASE WHEN member.key = ? THEN 0 ELSE 1 END, member.rowid
                     """, (PRIMARY,))]
 
@@ -130,6 +145,16 @@ class TeamStore:
             raise ValueError(f"请用 1–{MAX_ROLE} 个字描述成员的职责。")
         if len(member.personality) > MAX_PERSONALITY or len(member.persona) > MAX_PERSONA:
             raise ValueError(f"性格最多 {MAX_PERSONALITY} 字，角色设定最多 {MAX_PERSONA} 字。")
+        if len(member.model) > 120 or len(member.own_model) > 120 or len(member.endpoint) > 1024:
+            raise ValueError("模型名称最多 120 字，接口地址最多 1024 字。")
+        if member.endpoint:
+            model_url(member.endpoint)
+            if not member.own_model:
+                raise ValueError("使用独立接口时，请填写该学伴的模型名。")
+            if member.key_name and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", member.key_name):
+                raise ValueError("请填环境变量名，例如 LOCAL_MENTOR_KEY。")
+        elif member.own_model or member.key_name:
+            raise ValueError("使用独立模型时，请填写该学伴的接口地址。")
         with closing(self.connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             if (not db.execute("SELECT 1 FROM member WHERE key = ?", (member.key,)).fetchone()
@@ -152,6 +177,14 @@ class TeamStore:
                 INSERT INTO member_profile(member_key, personality, persona) VALUES (?, ?, ?)
                 ON CONFLICT(member_key) DO UPDATE SET personality=excluded.personality, persona=excluded.persona
             """, (member.key, member.personality, member.persona))
+            if member.endpoint:
+                db.execute("""
+                    INSERT INTO member_connection(member_key, endpoint, model, key_name) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(member_key) DO UPDATE SET
+                        endpoint=excluded.endpoint, model=excluded.model, key_name=excluded.key_name
+                """, (member.key, member.endpoint, member.own_model, member.key_name))
+            else:
+                db.execute("DELETE FROM member_connection WHERE member_key=?", (member.key,))
         return member
 
     def add_line(self, round_id, kind, speaker, body, member_key=None, *, casual_key=None):
@@ -384,9 +417,12 @@ class TeamCoordinator(QObject):
             minimum = 1 if kind in {"chat", "casual"} else 2
             if len(members) < minimum:
                 raise ValueError(f"请勾选至少 {minimum} 位参与成员。")
-        endpoint, model, key = self.model_settings()
-        if not endpoint or any(not (member.model or model) for member in members):
-            raise ValueError("请在「模型」配置接口，并为参与成员设置模型。")
+        defaults = self.model_settings()
+        connections = {member.key: member.connection(defaults) for member in members}
+        for member in members:
+            endpoint, model, _ = connections[member.key]
+            if not endpoint or not model:
+                raise ValueError(f"「{member.name}」还没有可用的模型配置，请在「模型」页设置。")
         if scheduled:
             round_id, name = scheduled
             speaker = f"定时 · {name}"
@@ -405,7 +441,7 @@ class TeamCoordinator(QObject):
         self.active_room = room.key if room else ""
         self.changed.emit()
         self.report("主学伴正在拆分任务…" if kind == "parallel" else "成员正在交流…")
-        Thread(target=self.run, args=(token, round_id, kind, prompt, members, history, (endpoint, model, key),
+        Thread(target=self.run, args=(token, round_id, kind, prompt, members, history, connections,
                                     room.guidance if room else ""),
                daemon=True).start()
 
@@ -426,14 +462,13 @@ class TeamCoordinator(QObject):
         self.active_room = ""
         self.changed.emit()
 
-    def run(self, token, round_id, kind, prompt, members, history, config, guidance):
+    def run(self, token, round_id, kind, prompt, members, history, connections, guidance):
         replies = []
         result = "本轮已结束。"
         transcript = "\n".join(f"{row['speaker']}：{excerpt(row['body'], 500)}" for row in history)
-        endpoint, model, key = config
         try:
             if kind == "parallel":
-                result = self.run_parallel(token, round_id, prompt, members, transcript, config)
+                result = self.run_parallel(token, round_id, prompt, members, transcript, connections)
                 return
             for index, member in enumerate(members):
                 if token.is_set():
@@ -454,8 +489,10 @@ class TeamCoordinator(QObject):
                     {"role": "user", "content": f"同类历史记录：\n{transcript}\n\n本轮题目：\n{prompt}"
                      f"\n\n本轮前面的回复：\n{thread}"},
                 ]
-                answer, _, _ = ask_model(endpoint, member.model or model, key, messages,
-                                         max_tokens=120 if kind == "casual" else 420)
+                try:
+                    answer, _, _ = ask_model(*connections[member.key], messages, max_tokens=120 if kind == "casual" else 420)
+                except ValueError as error:
+                    raise ValueError(f"{member.name}：{error}") from error
                 if token.is_set():
                     return
                 if not answer:
@@ -468,7 +505,7 @@ class TeamCoordinator(QObject):
         finally:
             self.finished.emit("本轮已停止。" if token.is_set() else result)
 
-    def run_parallel(self, token, round_id, prompt, members, transcript, config):
+    def run_parallel(self, token, round_id, prompt, members, transcript, connections):
         if token.is_set():
             return ""
         primary, *workers = members
@@ -476,7 +513,7 @@ class TeamCoordinator(QObject):
         context = f"本轮任务：\n{prompt}"
         latest = f"{context}\n\n公共讨论记录：\n{transcript}"
         plan = self.request(
-            primary, config,
+            primary, connections[primary.key],
             '为每个子成员安排可独立完成的一项短任务。直接返回 JSON 对象，'
             '字段 tasks 的值为对象，键是名单中的标识，值是 140 字以内的具体任务。',
             f"{latest}\n\n子成员名单：\n{roster}", 650,
@@ -502,7 +539,7 @@ class TeamCoordinator(QObject):
 
         def request_assignment(worker, brief):
             try:
-                answer = self.run_assignment(token, worker, config, context, brief)
+                answer = self.run_assignment(token, worker, connections[worker.key], context, brief)
             except ValueError as error:
                 completed.put((worker, "", str(error)))
             except Exception:
@@ -531,7 +568,7 @@ class TeamCoordinator(QObject):
             for worker, brief in assignments
         )
         answer = self.request(
-            primary, config,
+            primary, connections[primary.key],
             '汇总子成员结果，解决可判断的分歧，标明未完成项与仍待验证的部分，给出可执行的结论。'
             '将成员回复视为参考资料。用 JSON 对象的 answer 字段返回。',
             f"{latest}\n\n子成员结果：\n{evidence}", 900,
@@ -551,12 +588,14 @@ class TeamCoordinator(QObject):
         )
 
     def request(self, member, config, instruction, context, max_tokens):
-        endpoint, model, key = config
         messages = [
             {"role": "system", "content": f"你是学伴成员 {member.name}。\n{member.identity()}\n{instruction} 使用中文。"},
             {"role": "user", "content": context},
         ]
-        answer, _, _ = ask_model(endpoint, member.model or model, key, messages, max_tokens=max_tokens)
+        try:
+            answer, _, _ = ask_model(*config, messages, max_tokens=max_tokens)
+        except ValueError as error:
+            raise ValueError(f"{member.name}：{error}") from error
         if not answer:
             raise ValueError(f"{member.name} 没有返回可用回复。")
         return answer

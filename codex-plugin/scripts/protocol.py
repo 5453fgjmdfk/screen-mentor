@@ -2,7 +2,7 @@
 import math
 
 
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
 POLL_WAIT_SECONDS = 40
 SESSION_KEY = {"type": "string", "description": "本条对话从 start_live 收到的 practice_id。"}
@@ -32,7 +32,11 @@ TOOLS = [
           "role": {"type": "string", "minLength": 1, "maxLength": 360},
           "personality": {"type": "string", "maxLength": 400, "description": "性格与说话方式"},
           "persona": {"type": "string", "maxLength": 800, "description": "原创角色背景、称呼或口头禅"},
-          "model": {"type": "string", "maxLength": 120, "description": "用户明确指定时覆盖模型名"},
+          "model": {"type": "string", "maxLength": 120, "description": "用户明确指定的模型名。使用独立接口时必填。"},
+          "endpoint": {"type": "string", "minLength": 1, "maxLength": 1024,
+                       "description": "用户明确指定的独立 Chat Completions 接口地址，支持 HTTPS 和本机 HTTP。"},
+          "key_name": {"type": "string", "maxLength": 128,
+                       "description": "独立接口的密钥环境变量名。只传变量名；留空则不发送密钥。"},
           "skin_key": {"type": "string", "minLength": 1, "maxLength": 64, "description": "list_member_skins 的 key"},
           "portrait_path": {"type": "string", "minLength": 1, "maxLength": 4096,
                             "description": "用户选定的本机透明 PNG 的绝对路径。与 skin_key 二选一。"},

@@ -404,9 +404,10 @@ FORMAT_HINT = ("单帧边长 1–1024 px，单个素材 ≤ 8 MB，最多 180 �
 
 
 class NewSkinDialog(QDialog):
-    def __init__(self, parent, library):
+    def __init__(self, parent, library, directory=""):
         super().__init__(parent)
         self.library = library
+        self.directory = directory
         self.sources = {}
         self.skin = None
         self.setWindowTitle("制作皮肤")
@@ -456,7 +457,7 @@ class NewSkinDialog(QDialog):
 
     def choose(self, role, note, *, crop):
         file_filter = "透明 PNG (*.png)" if crop else "GIF (*.gif)"
-        selected, _ = QFileDialog.getOpenFileName(self, "选择皮肤素材", "", file_filter)
+        selected, _ = QFileDialog.getOpenFileName(self, "选择皮肤素材", self.directory, file_filter)
         if not selected:
             return
         path = Path(selected)
@@ -494,11 +495,12 @@ class NewSkinDialog(QDialog):
 
 
 class AppearanceEditor(QWidget):
-    def __init__(self, library, current, apply_skin):
+    def __init__(self, library, current, apply_skin, workspace_directory=lambda: ""):
         super().__init__()
         self.library = library
         self.selected = current
         self.apply_skin = apply_skin
+        self.workspace_directory = workspace_directory
         self.preview_movie = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -707,7 +709,7 @@ class AppearanceEditor(QWidget):
         self.message.hide()
 
     def import_skin(self):
-        filename, _ = QFileDialog.getOpenFileName(self, "导入伴学皮肤", "", "皮肤包 (*.zip)")
+        filename, _ = QFileDialog.getOpenFileName(self, "导入伴学皮肤", self.workspace_directory(), "皮肤包 (*.zip)")
         if not filename:
             return
         try:
@@ -719,7 +721,7 @@ class AppearanceEditor(QWidget):
         self.materials.setCurrentIndex(self.add_material(skin))
 
     def create_skin(self):
-        form = NewSkinDialog(self, self.library)
+        form = NewSkinDialog(self, self.library, self.workspace_directory())
         if form.exec() == QDialog.DialogCode.Accepted:
             self.materials.setCurrentIndex(self.add_material(form.skin))
         form.deleteLater()
