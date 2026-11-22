@@ -3,24 +3,25 @@ from functools import partial
 import json
 import sqlite3
 import sys
-from threading import Thread
+from threading import Event, Thread
 
 from capture import enable_dpi_awareness
 
 enable_dpi_awareness()
 
 from PyQt6 import sip
-from PyQt6.QtCore import QLockFile, QObject, QSettings, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
+from PyQt6.QtCore import QPoint, QLockFile, QObject, QSettings, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QTextCursor
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu,
-    QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout,
+    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu,
+    QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from appearance import APP_ICON
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
-from manager import ManagerWindow, TeamPet, show_centered
+from companion import fit_position
+from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
 from server import MentorServer
 from team import PRIMARY, TeamCoordinator, TeamStore
@@ -94,28 +95,33 @@ class MemoryDialog(QDialog):
             self.refresh()
 
 
-class ChatWindow(QDialog):
-    completed = pyqtSignal(str, str)
+class ChatPane(QWidget):
+    completed = pyqtSignal(str, str, str)
+    chunk = pyqtSignal(str)
+    started = pyqtSignal()
+    response = pyqtSignal(str, str)
 
-    def __init__(self, archive, member=None, open_team=None):
+    def __init__(self, archive, member, open_team, open_model):
         super().__init__()
         self.archive = archive
         self.member = member
         self.settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.busy = False
         self.taken = False
-        self.setWindowTitle("屏幕伴学 · " + (member.name if member else "桌面学伴"))
-        self.setStyleSheet(STYLE)
-        self.resize(560, 490)
+        self.cancel = Event()
+        self.preview = ""
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(65)
+        self.preview_timer.timeout.connect(self.render_preview)
+        self.draft_position = 0
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 17, 20, 17)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        self.heading = QLabel(member.name if member else "桌面学伴")
-        self.heading.setObjectName("heading")
-        layout.addWidget(self.heading)
         self.notice = QLabel("日常对话保存在本机。")
         self.notice.setObjectName("notice")
         self.notice.setWordWrap(True)
+        self.notice.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.notice)
         self.history = QPlainTextEdit()
         self.history.setAccessibleName("对话记录")
@@ -128,7 +134,7 @@ class ChatWindow(QDialog):
         actions = QHBoxLayout()
         layout.addLayout(actions)
         settings = QPushButton("设置模型")
-        settings.clicked.connect(self.configure)
+        settings.clicked.connect(open_model)
         actions.addWidget(settings)
         memory = QPushButton("长期记忆")
         memory.clicked.connect(self.open_memory)
@@ -144,58 +150,48 @@ class ChatWindow(QDialog):
         self.send_button.setObjectName("primary")
         self.send_button.clicked.connect(self.send)
         actions.addWidget(self.send_button)
-        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.input)
         shortcut.activated.connect(self.send)
+        self.chunk.connect(self.receive_chunk)
         self.completed.connect(self.receive)
         self.refresh()
 
     def refresh(self):
-        name = self.member.name if self.member else "学伴"
+        name = self.member.name
         self.history.setPlainText("\n\n".join(
             f"{'你' if row['role'] == 'user' else name}\n{row['body']}"
             for row in self.archive.transcript()
         ))
         scrollbar = self.history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+        self.draft_position = self.history.document().characterCount() - 1
 
     def set_member(self, member):
-        renamed = self.member and self.member.name != member.name
+        renamed = self.member.name != member.name
         self.member = member
-        if member:
-            self.heading.setText(member.name)
-            self.setWindowTitle("屏幕伴学 · " + member.name)
-        if renamed:
+        if renamed and not self.busy:
             self.refresh()
 
-    def configure(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("常驻模型")
-        form = QFormLayout(dialog)
-        endpoint = QLineEdit(self.settings.value("endpoint", "", type=str))
-        endpoint.setPlaceholderText("例如 http://127.0.0.1:11434/v1")
-        model = QLineEdit(self.settings.value("model", "", type=str))
-        key_name = QLineEdit(self.settings.value("key_name", "", type=str))
-        key_name.setPlaceholderText("例如 SCREEN_MENTOR_MODEL_KEY，可留空")
-        form.addRow("接口地址", endpoint)
-        form.addRow("模型名", model)
-        form.addRow("密钥环境变量", key_name)
-        buttons = QHBoxLayout()
-        cancel = QPushButton("取消")
-        cancel.clicked.connect(dialog.reject)
-        save = QPushButton("保存")
-        save.setObjectName("primary")
-        save.clicked.connect(dialog.accept)
-        buttons.addStretch()
-        buttons.addWidget(cancel)
-        buttons.addWidget(save)
-        form.addRow(buttons)
-        dialog.setMinimumWidth(520)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            for name, field in (("endpoint", endpoint), ("model", model), ("key_name", key_name)):
-                self.settings.setValue(name, field.text().strip())
-            self.settings.sync()
-            self.notice.setText("模型设置已保存。")
-        dialog.deleteLater()
+    def receive_chunk(self, text):
+        if self.cancel.is_set():
+            return
+        self.preview = text
+        if not self.preview_timer.isActive():
+            self.preview_timer.start()
+
+    def render_preview(self):
+        scrollbar = self.history.verticalScrollBar()
+        following = scrollbar.value() >= scrollbar.maximum() - 12
+        cursor = QTextCursor(self.history.document())
+        cursor.setPosition(self.draft_position)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        if self.preview:
+            cursor.insertText(f"\n\n{self.member.name}\n{self.preview}")
+        if following:
+            scrollbar.setValue(scrollbar.maximum())
+        self.notice.setText("正在回复…" if self.preview else "正在思考…")
+        self.response.emit("stream" if self.preview else "think", self.preview)
 
     def open_memory(self):
         dialog = MemoryDialog(self, self.archive)
@@ -209,22 +205,32 @@ class ChatWindow(QDialog):
         if self.team_button:
             self.team_button.setEnabled(not taken)
         if taken:
+            self.cancel.set()
+            self.preview_timer.stop()
+            self.preview = ""
+            self.refresh()
             self.notice.setText("当前由外部对话伴学。结束后会回到日常对话。")
-            self.hide()
         else:
             self.notice.setText("已回到日常对话。")
 
     def send(self):
+        if self.send_message(self.input.toPlainText()):
+            self.input.clear()
+
+    def send_message(self, prompt):
         if self.busy or self.taken:
-            return
-        prompt = self.input.toPlainText().strip()
+            return False
+        prompt = prompt.strip()
         if not prompt:
-            return
+            return False
         if len(prompt) > MAX_INPUT:
             self.notice.setText(f"每条消息最多 {MAX_INPUT} 字，请拆成几条发送。")
-            return
-        source = self.archive.write("user", prompt)
-        self.input.clear()
+            return False
+        try:
+            source = self.archive.write("user", prompt)
+        except sqlite3.Error:
+            self.notice.setText("无法保存消息，请检查本机档案。")
+            return False
         self.refresh()
         marker, raw_value = prompt[:3], prompt[3:].strip()
         if marker in {"记住：", "记住:"}:
@@ -233,57 +239,134 @@ class ChatWindow(QDialog):
             except ValueError as error:
                 self.notice.setText(str(error))
             else:
-                self.archive.write("assistant", "已经存入长期记忆。")
+                reply = "已经存入长期记忆。"
+                self.archive.write("assistant", reply)
                 self.refresh()
-            return
+                self.response.emit("done", reply)
+            return True
         if marker in {"回忆：", "回忆:"}:
             hits = self.archive.search(raw_value, exclude=(source,), limit=5)
             answer = "\n\n".join(f"档案 #{row['id']} · {row['created'][:10]}\n{excerpt(row['body'], 1800)}"
                                  for row in hits)
             self.notice.setText(answer or "没有查到相关记录。可以换成更具体的关键词。")
-            return
+            self.response.emit("done", self.notice.text())
+            return True
         self.settings.sync()
         endpoint, model, key = (self.settings.value(field, "", type=str)
                                 for field in ("endpoint", "model", "key_name"))
         member = self.member
-        config = (endpoint, (member.model if member else "") or model, key)
+        config = (endpoint, member.model or model, key)
         self.busy = True
+        self.cancel = Event()
+        self.preview = ""
         self.send_button.setEnabled(False)
-        self.notice.setText("正在回应…")
-        Thread(target=self.answer, args=(config, prompt, source, member), daemon=True).start()
+        self.notice.setText("正在思考…")
+        self.started.emit()
+        Thread(target=self.answer, args=(config, prompt, source, member, self.cancel), daemon=True).start()
+        return True
 
-    def answer(self, config, prompt, source, member):
+    def answer(self, config, prompt, source, member, cancel):
+        reply = note = error_message = ""
         try:
             def context_for(*queries):
                 messages = self.archive.request_messages(prompt, queries)
-                if member:
-                    messages[0]["content"] += f"你的名字是{member.name}，你的分工是：{member.role}"
+                messages[0]["content"] += (
+                    f"你的名字是{member.name}，你的分工是：{member.role}。"
+                    "若需要重新检索，请先返回 recall，其余字段留空。"
+                )
                 return messages
 
+            if cancel.is_set():
+                return
             context = context_for()
-            answer, learn, recall = ask_model(*config, context)
+            answer, learn, recall = ask_model(*config, context, publish=self.chunk.emit, cancelled=cancel.is_set)
+            if cancel.is_set():
+                return
             if 1 <= len(recall) <= 70 and recall != prompt:
                 expanded = context_for(recall)
                 if expanded != context:
+                    self.chunk.emit("")
                     expanded[0]["content"] += "本轮已重新检索，请依据现有证据回复；recall 留空。"
-                    answer, learn, _ = ask_model(*config, expanded)
+                    answer, learn, _ = ask_model(*config, expanded, publish=self.chunk.emit, cancelled=cancel.is_set)
+            if cancel.is_set():
+                return
             if not answer:
                 answer = "这次没有找到足够的资料。可以换一个更具体的关键词。"
             self.archive.write("assistant", answer)
+            reply = answer
             if 1 <= len(learn) <= 240 and learn in prompt:
                 self.archive.remember(learn, source_id=source, candidate=True)
-                self.completed.emit("回复已保存，可在「长期记忆」确认新提取的内容。", "")
-            else:
-                self.completed.emit("", "")
+                note = "回复已保存，可在「长期记忆」确认新提取的内容。"
         except (ValueError, sqlite3.Error) as error:
-            self.completed.emit("", str(error))
+            error_message = str(error)
+        finally:
+            self.completed.emit(reply, note, error_message)
 
-    def receive(self, note, error):
+    def receive(self, reply, note, error):
+        self.preview_timer.stop()
         self.busy = False
         self.send_button.setEnabled(not self.taken)
         self.refresh()
-        if not self.taken:
+        if not self.cancel.is_set() and not self.taken:
             self.notice.setText(error or note or "回复已保存在本机。")
+            self.response.emit("error" if error else "done", error or reply)
+
+
+class QuickChat(QFrame):
+    def __init__(self, pane, anchor, open_history):
+        super().__init__(None, Qt.WindowType.Popup)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setObjectName("card")
+        self.setStyleSheet(PANEL_STYLE)
+        self.pane = pane
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        row = QHBoxLayout()
+        name = QLabel(pane.member.name)
+        name.setTextFormat(Qt.TextFormat.PlainText)
+        row.addWidget(name, 1)
+        history = QPushButton("打开会话")
+        history.clicked.connect(lambda: self.open_history(open_history))
+        row.addWidget(history)
+        layout.addLayout(row)
+        entry = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("给这位学伴发消息…")
+        self.input.setMaxLength(MAX_INPUT)
+        self.input.setMinimumWidth(227)
+        self.input.returnPressed.connect(self.send)
+        entry.addWidget(self.input, 1)
+        submit = QPushButton("发送")
+        submit.setObjectName("primary")
+        submit.clicked.connect(self.send)
+        entry.addWidget(submit)
+        layout.addLayout(entry)
+        self.status = QLabel()
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setWordWrap(True)
+        self.status.hide()
+        layout.addWidget(self.status)
+        self.adjustSize()
+        area = anchor.screen().availableGeometry()
+        point = anchor.mapToGlobal(QPoint(anchor.width() // 2, anchor.height()))
+        position = point + QPoint(-self.width() // 2, 8)
+        if position.y() + self.height() > area.bottom():
+            position.setY(point.y() - anchor.height() - self.height() - 8)
+        self.move(fit_position(position, self.size(), area))
+
+    def send(self):
+        if self.pane.send_message(self.input.text()):
+            self.close()
+        elif self.pane.busy or self.input.text().strip():
+            self.status.setText("上一条消息还在回复。" if self.pane.busy else self.pane.notice.text())
+            self.status.show()
+
+    def open_history(self, callback):
+        draft = self.input.text()
+        self.close()
+        callback()
+        if draft and not self.pane.input.toPlainText():
+            self.pane.input.setPlainText(draft)
 
 
 class Desktop(QObject):
@@ -295,6 +378,8 @@ class Desktop(QObject):
         self.chat = None
         self.member_chats = {}
         self.manager = None
+        self.quick_chat = None
+        self.chat_bubbles = set()
         self.pets = {}
         self.agent_settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.team = TeamCoordinator(TeamStore(PROFILE / "team.sqlite3"), PROFILE / "team.ini",
@@ -305,7 +390,8 @@ class Desktop(QObject):
         self.main_bubble_timer.setSingleShot(True)
         self.main_bubble_timer.setInterval(12_000)
         self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
-        self.engine.practice.idle_chat.connect(self.show_chat)
+        self.engine.practice.idle_chat.connect(lambda: self.show_quick_chat(PRIMARY))
+        self.engine.practice.panel.clicked.connect(lambda: self.show_quick_chat(PRIMARY))
         self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
@@ -319,7 +405,7 @@ class Desktop(QObject):
         self.menu = QMenu()
         self.menu.addAction("管理面板", self.show_manager)
         self.menu.addAction("日常对话", self.show_chat)
-        self.menu.addAction("桌宠外观", self.show_appearance)
+        self.menu.addAction("桌宠外观", lambda: self.show_appearance())
         self.menu.addAction("退出桌面学伴", self.app.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
@@ -330,14 +416,18 @@ class Desktop(QObject):
         self.show_member_chat(PRIMARY)
 
     def show_manager(self):
+        manager = self.get_manager()
+        manager.refresh()
+        show_centered(manager)
+
+    def get_manager(self):
         if self.manager is None:
             self.manager = ManagerWindow(self.team, self)
-        self.manager.refresh()
-        show_centered(self.manager)
+        return self.manager
 
-    def show_appearance(self):
+    def show_appearance(self, key=PRIMARY):
         self.show_manager()
-        self.manager.open_appearance()
+        self.manager.open_appearance(key)
 
     def show_team(self, draft=""):
         self.show_manager()
@@ -354,18 +444,41 @@ class Desktop(QObject):
         return self.archive if key == PRIMARY else Archive(PROFILE / "members" / key / "agent.sqlite3")
 
     def show_member_chat(self, key):
+        self.show_manager()
+        self.manager.open_chat(key)
+
+    def chat_for(self, key):
         member = next((entry for entry in self.team.store.members() if entry.key == key), None)
         if member is None:
-            return
+            return None
         if key not in self.member_chats:
-            self.member_chats[key] = ChatWindow(self.member_archive(key), member, self.show_team if key == PRIMARY else None)
+            chat = ChatPane(self.member_archive(key), member, self.show_team if key == PRIMARY else None,
+                            self.get_manager().open_model)
+            self.member_chats[key] = chat
+            chat.started.connect(lambda: self.show_chat_response(key, "think", ""))
+            chat.response.connect(lambda phase, text: self.show_chat_response(key, phase, text))
         chat = self.member_chats[key]
         chat.set_member(member)
         if key == PRIMARY:
             self.chat = chat
         if self.team.blocked:
             chat.set_taken(True)
-        show_centered(chat)
+        return chat
+
+    def show_quick_chat(self, key):
+        if self.team.blocked:
+            return
+        panel = self.engine.practice.panel if key == PRIMARY else self.pets.get(key)
+        if panel is None or not panel.isVisible():
+            return
+        pane = self.get_manager().private_chat(key)
+        if pane is None:
+            return
+        if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
+            self.quick_chat.close()
+        self.quick_chat = QuickChat(pane, panel.sprite, lambda: self.show_member_chat(key))
+        self.quick_chat.show()
+        self.quick_chat.input.setFocus()
 
     def show_member_memory(self, key):
         dialog = MemoryDialog(self.manager, self.member_archive(key))
@@ -383,7 +496,7 @@ class Desktop(QObject):
         slots = iter(slot for slot in range(len(members) + len(occupied)) if slot not in occupied)
         for member in members:
             if member.key not in self.pets:
-                pet = TeamPet(member, self.show_member_chat, next(slots))
+                pet = TeamPet(member, self.show_quick_chat, self.show_appearance, next(slots))
                 self.pets[member.key] = pet
                 if not self.team.blocked:
                     pet.show()
@@ -391,7 +504,7 @@ class Desktop(QObject):
             self.pets[member.key].suspend(self.team.blocked)
 
     def show_team_line(self, key, name, body):
-        if self.team.blocked or self.team.token is None or self.team.token.is_set():
+        if self.team.blocked or self.team.token is None or self.team.token.is_set() or key in self.chat_bubbles:
             return
         if key == PRIMARY:
             self.main_line = f"{name} · {excerpt(' '.join(body.split()), 250)}"
@@ -401,6 +514,32 @@ class Desktop(QObject):
         elif key in self.pets:
             self.pets[key].say(body)
 
+    def show_chat_response(self, key, phase, body):
+        if self.team.blocked:
+            return
+        complete = phase in {"done", "error"}
+        if phase == "think":
+            body = "正在思考…"
+        else:
+            body = " ".join(body.split())
+            if len(body) > 105:
+                body = body[:104] + "…" if phase == "error" else "…" + body[-104:]
+        if key == PRIMARY:
+            practice = self.engine.practice
+            self.main_line = body
+            self.main_bubble_timer.stop()
+            practice.set_status(body)
+            practice.panel.set_pose("thinking" if phase == "think" else "ready" if complete else "idle")
+            if complete:
+                self.main_bubble_timer.start()
+        elif key in self.pets:
+            self.pets[key].say(body, pose="thinking" if phase == "think" else "ready" if complete else "idle",
+                               transient=complete)
+        if complete:
+            self.chat_bubbles.discard(key)
+        else:
+            self.chat_bubbles.add(key)
+
     def reset_main_bubble(self):
         practice = self.engine.practice
         if not self.team.blocked and practice.status.text() == self.main_line:
@@ -408,6 +547,9 @@ class Desktop(QObject):
 
     def takeover(self):
         self.team.set_blocked(True)
+        self.chat_bubbles.clear()
+        if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
+            self.quick_chat.close()
         self.main_bubble_timer.stop()
         for pet in self.pets.values():
             pet.suspend(True)

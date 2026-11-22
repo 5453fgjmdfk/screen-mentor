@@ -66,7 +66,7 @@ def show_centered(dialog):
 
 
 class TeamPet(CompanionPanel):
-    def __init__(self, member, open_chat, slot):
+    def __init__(self, member, open_chat, open_appearance, slot):
         super().__init__(skin_key=member.skin, sprite_size=102)
         self.member = member
         self.slot = slot
@@ -88,7 +88,11 @@ class TeamPet(CompanionPanel):
         layout.addWidget(self.sprite, alignment=Qt.AlignmentFlag.AlignHCenter)
         chat = CompanionAction("chat")
         chat.clicked.connect(lambda: open_chat(self.member.key))
+        self.clicked.connect(lambda: open_chat(self.member.key))
         self.controls.layout().addWidget(chat)
+        appearance = CompanionAction("appearance")
+        appearance.clicked.connect(lambda: open_appearance(self.member.key))
+        self.controls.layout().addWidget(appearance)
         layout.addWidget(self.controls, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.bubble_timer = QTimer(self)
         self.bubble_timer.setSingleShot(True)
@@ -113,19 +117,21 @@ class TeamPet(CompanionPanel):
             self.sprite.setAccessibleName(member.name)
             self.say("")
 
-    def say(self, text):
-        message = f"{self.member.name}\n{excerpt(' '.join(text.split()), 220)}" if text else self.member.name
+    def say(self, text, *, pose="ready", transient=True):
+        message = f"{self.member.name}\n{excerpt(' '.join(text.split()), 350)}" if text else self.member.name
         bottom = self.y() + self.height()
         self.caption.setText(message)
         self.layout().activate()
         self.adjustSize()
-        if self.isVisible():
+        if self.isVisible() and self.drag_handle is None:
             area = self.screen().availableGeometry()
             self.move(fit_position(QPoint(self.x(), bottom - self.height()), self.size(), area))
         self.peek.set_thought(message)
+        self.bubble_timer.stop()
         if text:
-            self.set_pose("ready")
-            self.bubble_timer.start()
+            self.set_pose(pose)
+            if transient:
+                self.bubble_timer.start()
 
     def suspend(self, suspend):
         if self.suspended == suspend:
@@ -218,16 +224,17 @@ class ManagerWindow(QDialog):
         self.nav.setObjectName("nav")
         self.nav.setAccessibleName("管理面板导航")
         nav_layout.addWidget(self.nav, 1)
-        self.nav.addItems(["桌面", "群聊", "成员", "外观", "模型", "闲聊"])
+        self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊"])
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
         self.pages.addWidget(self.home_page())
+        self.chat_index = self.pages.addWidget(self.chat_page())
         self.group_index = self.pages.addWidget(self.group_page())
         self.pages.addWidget(self.members_page())
         self.appearance_index = self.pages.addWidget(self.appearance_page())
-        self.pages.addWidget(self.model_page())
+        self.model_index = self.pages.addWidget(self.model_page())
         self.pages.addWidget(self.schedule_page())
-        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self.switch_page)
         self.nav.setCurrentRow(0)
         self.team.changed.connect(self.refresh)
         self.team.line.connect(self.add_line)
@@ -243,6 +250,11 @@ class ManagerWindow(QDialog):
         layout.setSpacing(12)
         layout.addWidget(label(title, "title"))
         return page, layout
+
+    def switch_page(self, index):
+        self.pages.setCurrentIndex(index)
+        if index == self.chat_index:
+            self.select_chat()
 
     def home_page(self):
         page, layout = self.page("桌面学伴")
@@ -301,6 +313,43 @@ class ManagerWindow(QDialog):
         for action in (self.stop_button, self.task_button, self.parallel_button, self.send_button):
             actions.addWidget(action)
         return page
+
+    def chat_page(self):
+        page, layout = self.page("学伴会话")
+        row = QHBoxLayout()
+        row.addWidget(label("对话对象"))
+        self.chat_member = QComboBox()
+        self.chat_member.setAccessibleName("选择对话的学伴")
+        row.addWidget(self.chat_member, 1)
+        layout.addLayout(row)
+        self.private_chats = QStackedWidget()
+        layout.addWidget(self.private_chats, 1)
+        self.chat_member.currentIndexChanged.connect(self.select_chat)
+        return page
+
+    def private_chat(self, key):
+        pane = self.desktop.chat_for(key)
+        if pane is not None and self.private_chats.indexOf(pane) < 0:
+            self.private_chats.addWidget(pane)
+        return pane
+
+    def open_chat(self, key=PRIMARY):
+        self.chat_member.setCurrentIndex(max(0, self.chat_member.findData(key)))
+        self.nav.setCurrentRow(self.chat_index)
+        self.select_chat()
+        pane = self.private_chats.currentWidget()
+        if pane is not None:
+            pane.input.setFocus()
+
+    def select_chat(self):
+        key = self.chat_member.currentData()
+        if key is not None:
+            pane = self.private_chat(key)
+            if pane is not None:
+                self.private_chats.setCurrentWidget(pane)
+
+    def open_model(self):
+        self.nav.setCurrentRow(self.model_index)
 
     def members_page(self):
         page, layout = self.page("成员")
@@ -466,12 +515,13 @@ class ManagerWindow(QDialog):
                 self.participants.addItem(entry)
         if self.members.currentRow() < 0:
             self.members.setCurrentRow(0)
-        current_target = self.appearance_member.currentData()
-        with QSignalBlocker(self.appearance_member):
-            self.appearance_member.clear()
-            for member in members:
-                self.appearance_member.addItem(member.name, member.key)
-            self.appearance_member.setCurrentIndex(max(0, self.appearance_member.findData(current_target)))
+        for combo in (self.appearance_member, self.chat_member):
+            current_target = combo.currentData()
+            with QSignalBlocker(combo):
+                combo.clear()
+                for member in members:
+                    combo.addItem(member.name, member.key)
+                combo.setCurrentIndex(max(0, combo.findData(current_target)))
 
     def current_member(self):
         item = self.members.currentItem()

@@ -175,18 +175,19 @@ class PeekFrames:
         return self.still
 
 
-def paint_peek(painter, width, height, pose, bottom, elapsed, mirror=False):
+def paint_peek(painter, width, height, pose, bottom, elapsed, mirror=False, thinking=False):
     if pose.isNull():
         return
     hidden = (1 - min(1, elapsed / .54)) ** 3
     idle = max(0, elapsed - .54)
     breathe = .021 * sin(idle * 2.7)
     glance = sin(pi * min(1, max(0, (idle % 5.6 - 3) / 1.35))) ** 2
+    nod = .5 * (1 - sin(idle * 3.8)) if thinking else 0
     size = pose.size().scaled(QSize(width - (2 if bottom else 3), height - 1),
                               Qt.AspectRatioMode.KeepAspectRatio)
     if bottom:
         painter.translate(0, height * (1 + hidden))
-        painter.scale(1, 1 + breathe + .055 * glance)
+        painter.scale(1, 1 + breathe + .055 * glance - .047 * nod)
         painter.translate(0, -height)
         x, y = (width - size.width()) / 2, height - size.height()
     else:
@@ -197,7 +198,7 @@ def paint_peek(painter, width, height, pose, bottom, elapsed, mirror=False):
         painter.scale(1 + breathe, 1)
         pivot = height * .65
         painter.translate(3, pivot)
-        painter.rotate(4 * glance)
+        painter.rotate(4 * glance + 5 * nod)
         painter.translate(-3, -pivot)
         x, y = 0, (height - size.height()) / 2
     painter.drawPixmap(QRectF(x, y, size.width(), size.height()), pose, QRectF(pose.rect()))

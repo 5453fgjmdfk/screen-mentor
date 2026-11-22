@@ -1,17 +1,18 @@
 """Frameless companion with a speech bubble and hover controls."""
+from dataclasses import replace
+
+from PIL import Image
 from PyQt6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter,
-    QPainterPath, QPainterPathStroker, QPen, QTransform,
+    QImage, QPainterPath, QPainterPathStroker, QPen, QTransform,
 )
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
-
-from dataclasses import replace
 
 from appearance import BUILT_INS, PeekFrames, SkinLibrary, paint_peek, palette_for
 from skin_assets import STATES
 
-SNAP_DISTANCE = 22
+SNAP_DISTANCE = 1
 RESTORE_GAP = 30
 
 
@@ -219,6 +220,7 @@ class EdgePeek(QWidget):
         self.setToolTip("点击或向屏幕内拖动，展开伴学")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.edge = None
+        self.thinking = False
         self.press_at = None
         self.frames = {}
         self.art_path = None
@@ -352,11 +354,12 @@ class EdgePeek(QWidget):
             return
 
         paint_peek(painter, self.width(), self.height(), pose, bottom, elapsed,
-                   mirror=self.edge == Qt.Edge.RightEdge)
+                   mirror=self.edge == Qt.Edge.RightEdge, thinking=self.thinking)
 
 
 class CompanionPanel(QWidget):
     closed = pyqtSignal()
+    clicked = pyqtSignal()
 
     def __init__(self, *, skin_key=None, sprite_size=138):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -374,6 +377,8 @@ class CompanionPanel(QWidget):
         self.drag_handle = None
         self.drag_offset = None
         self.drag_start = None
+        self.model_frame = None
+        self.model_pixels = QRect()
         self.peek = EdgePeek()
         self.peek.restore_requested.connect(self.restore_from_edge)
         self.destroyed.connect(self.peek.deleteLater)
@@ -399,7 +404,7 @@ class CompanionPanel(QWidget):
         self.ready_timer.setSingleShot(True)
         self.ready_timer.setInterval(2650)
         self.ready_timer.timeout.connect(lambda: self.set_pose("idle"))
-        self.sprite.setToolTip("拖到屏幕两侧或底部，进入探头状态")
+        self.sprite.setToolTip("拖到人物碰到屏幕两侧或底部，进入探头状态")
         self.add_drag_handle(self.sprite)
         self.library = SkinLibrary()
         self.skin_key = skin_key
@@ -446,6 +451,7 @@ class CompanionPanel(QWidget):
         self.peek.set_skin(skin)
 
     def set_pose(self, state):
+        self.peek.thinking = state == "thinking"
         if self.state == state:
             if state == "ready":
                 self.ready_timer.start()
@@ -496,7 +502,7 @@ class CompanionPanel(QWidget):
             cursor = event.globalPosition().toPoint()
             position = cursor - self.drag_offset
             screen = QGuiApplication.screenAt(cursor) or self.screen()
-            self.move(fit_position(position, self.size(), screen.availableGeometry()))
+            self.move(self.fit_model(position, screen.availableGeometry()))
             return True
         released = kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton
         if released or kind == QEvent.Type.UngrabMouse:
@@ -510,24 +516,56 @@ class CompanionPanel(QWidget):
             if released and dragged:
                 screen = QGuiApplication.screenAt(cursor) or self.screen()
                 area = screen.availableGeometry()
-                self.move(fit_position(position, self.size(), area))
-                self.snap_to_edge(area)
+                self.move(self.fit_model(position, area))
+                if not self.snap_to_edge(area):
+                    self.move(fit_position(position, self.size(), area))
+            elif released and handle is self.sprite:
+                self.clicked.emit()
             return released
         return False
 
+    def model_bounds(self):
+        movie = self.sprite.movie()
+        frame = movie.currentPixmap() if movie is not None else self.sprite.pixmap()
+        bounds = self.sprite.rect()
+        if frame is not None and not frame.isNull():
+            key = frame.cacheKey()
+            if key != self.model_frame:
+                self.model_frame = key
+                rgba = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+                raw = rgba.constBits().asstring(rgba.sizeInBytes())
+                pixels = Image.frombytes("RGBA", (rgba.width(), rgba.height()), raw).getchannel("A").getbbox()
+                self.model_pixels = QRect()
+                if pixels:
+                    left, top, right, bottom = pixels
+                    ratio = frame.devicePixelRatio()
+                    self.model_pixels = QRectF(left / ratio, top / ratio, (right - left) / ratio,
+                                               (bottom - top) / ratio).toAlignedRect()
+            if not self.model_pixels.isEmpty():
+                origin = bounds.center() - QRect(QPoint(), frame.deviceIndependentSize().toSize()).center()
+                bounds = self.model_pixels.translated(origin)
+        return bounds.translated(self.sprite.mapTo(self, QPoint()))
+
+    def fit_model(self, position, area):
+        model = self.model_bounds()
+        offset = model.topLeft()
+        return fit_position(position + offset, model.size(), area) - offset
+
     def snap_to_edge(self, area):
-        bounds = self.geometry()
+        bounds = self.model_bounds().translated(self.pos())
         distances = {
             Qt.Edge.LeftEdge: abs(bounds.left() - area.left()),
             Qt.Edge.RightEdge: abs(area.right() - bounds.right()),
             Qt.Edge.BottomEdge: abs(area.bottom() - bounds.bottom()),
         }
         edge = min(distances, key=distances.get)
-        if distances[edge] <= SNAP_DISTANCE:
-            self.peek.dock(edge, self.sprite.mapToGlobal(self.sprite.rect().center()), area)
-            self.hover_timer.stop()
-            self.controls.hide()
-            self.hide()
+        if distances[edge] > SNAP_DISTANCE:
+            return False
+        self.peek.dock(edge, bounds.center(), area)
+        self.hover_timer.stop()
+        self.controls.hide()
+        self.hide()
+        return True
 
     def restore_from_edge(self, cursor):
         anchor = self.peek.geometry().center() if cursor is None else cursor
@@ -558,8 +596,6 @@ class CompanionPanel(QWidget):
         if event.isAccepted():
             self.peek.close()
             self.skin_timer.stop()
-            if self.appearance_dialog is not None:
-                self.appearance_dialog.close()
             self.ready_timer.stop()
             for movie in self.anims.values():
                 movie.stop()

@@ -1,6 +1,6 @@
 {
   "name": "screen-mentor",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Windows 智能伴学。Codex 看窗口、圈出下一步，由你亲手操作。",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",

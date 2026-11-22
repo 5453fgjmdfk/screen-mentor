@@ -208,6 +208,7 @@ class Practice(QObject):
         self.pause_button.set_action("pause")
         for control in self.practice_controls:
             control.show()
+        self.set_progress()
         self.set_status("切回练习软件，提示会跟着画面更新。")
         self.session_started.emit()
 
@@ -336,7 +337,7 @@ class Practice(QObject):
         self.panel.layout().activate()
         self.panel.adjustSize()
         self.sync_edge_thought()
-        if self.panel.isVisible():
+        if self.panel.isVisible() and self.panel.drag_handle is None:
             top = self.panel.screen().availableGeometry().top()
             self.panel.move(self.panel.x(), max(top, bottom - self.panel.height()))
 
