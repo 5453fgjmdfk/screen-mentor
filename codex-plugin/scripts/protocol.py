@@ -2,7 +2,7 @@
 import math
 
 
-VERSION = "0.11.2"
+VERSION = "0.12.0"
 COPY_TEXT = {"type": "string", "maxLength": 4000, "description": "用户需要复制粘贴的原文。只传实际输入内容。"}
 POLL_WAIT_SECONDS = 40
 SESSION_KEY = {"type": "string", "description": "本条对话从 start_live 收到的 practice_id。"}
@@ -24,6 +24,7 @@ def tool(name, description, properties, required=(), *, read_only=False):
 
 
 TOOLS = [
+    tool("open_management", "打开本机屏幕伴学管理面板。用于管理成员、群聊、模型和桌面闲聊。", {}),
     tool("open_appearance", "用户明确想换肤、编辑外观或打开外观管理器时，打开本机伴学外观窗口。", {}),
     tool("start_live", "启动当前对话的伴学。恢复现有伴学时传原 practice_id。",
          {"window_id": {"type": "string", "pattern": "^[0-9]+$"}, "practice_id": SESSION_KEY,

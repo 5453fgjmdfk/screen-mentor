@@ -166,7 +166,7 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def ask_model(endpoint, model, key_name, messages):
+def ask_model(endpoint, model, key_name, messages, *, max_tokens=900):
     if not endpoint.strip() or not model.strip():
         raise ValueError("尚未配置常驻模型。打开「设置模型」填写接口和模型名。")
     target = urlsplit(endpoint.rstrip("/"))
@@ -183,7 +183,7 @@ def ask_model(endpoint, model, key_name, messages):
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = "Bearer " + key
-    request = Request(url, data=json.dumps({"model": model, "messages": messages, "max_tokens": 900}).encode(),
+    request = Request(url, data=json.dumps({"model": model, "messages": messages, "max_tokens": max_tokens}).encode(),
                       headers=headers, method="POST")
     try:
         with build_opener(NoRedirect()).open(request, timeout=35) as response:

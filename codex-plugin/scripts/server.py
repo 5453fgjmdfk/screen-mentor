@@ -14,7 +14,7 @@ from capture import enable_dpi_awareness
 enable_dpi_awareness()
 
 from PIL import Image, ImageChops, ImageStat
-from PyQt6.QtCore import QEventLoop, QObject, QTimer
+from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 
 import native
 from overlay import GuideOverlay
@@ -42,6 +42,8 @@ def text_content(data):
 
 
 class MentorServer(QObject):
+    management_requested = pyqtSignal()
+
     def __init__(self, app, archive):
         super().__init__()
         self.archive = archive
@@ -464,6 +466,9 @@ class MentorServer(QObject):
             if name == "open_appearance":
                 self.practice.panel.open_appearance()
                 blocks = [text_content({"opened": True, "surface": "appearance_manager"})]
+            elif name == "open_management":
+                self.management_requested.emit()
+                blocks = [text_content({"opened": True, "surface": "desktop_manager"})]
             elif name == "start_live":
                 blocks = self.start_practice(owner=owner, **args)
             elif name == "end_live":

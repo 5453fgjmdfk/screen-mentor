@@ -356,7 +356,7 @@ class EdgePeek(QWidget):
 class CompanionPanel(QWidget):
     closed = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, *, skin_key=None, sprite_size=138):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("屏幕伴学 · 当前对话")
@@ -367,7 +367,7 @@ class CompanionPanel(QWidget):
         self.sprite = QLabel()
         self.sprite.setAccessibleName("小龙学伴")
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sprite.setFixedSize(138, 138)
+        self.sprite.setFixedSize(sprite_size, sprite_size)
         self.drag_handles = set()
         self.drag_handle = None
         self.drag_offset = None
@@ -400,6 +400,7 @@ class CompanionPanel(QWidget):
         self.sprite.setToolTip("拖到屏幕两侧或底部，进入探头状态")
         self.add_drag_handle(self.sprite)
         self.library = SkinLibrary()
+        self.skin_key = skin_key
         self.skin = None
         self.appearance_dialog = None
         self.refresh_skin()
@@ -409,7 +410,10 @@ class CompanionPanel(QWidget):
         self.skin_timer.start()
 
     def refresh_skin(self):
-        skin = self.library.current()
+        if self.skin_key is None:
+            skin = self.library.current()
+        else:
+            skin = next((item for item in self.library.all() if item.key == self.skin_key), BUILT_INS[0])
         if skin == self.skin:
             return
         previous_skin = self.skin

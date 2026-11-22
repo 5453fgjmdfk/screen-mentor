@@ -78,6 +78,7 @@ class Practice(QObject):
     capture_failed = pyqtSignal(int, str)
     wake = pyqtSignal()
     idle_chat = pyqtSignal()
+    session_started = pyqtSignal()
     session_ended = pyqtSignal()
 
     def __init__(self, scope, app, *, persistent=False):
@@ -207,6 +208,7 @@ class Practice(QObject):
         for control in self.practice_controls:
             control.show()
         self.set_status("切回练习软件，提示会跟着画面更新。")
+        self.session_started.emit()
 
     def set_idle(self):
         for control in self.practice_controls:

@@ -20,8 +20,10 @@ from PyQt6.QtWidgets import (
 
 from appearance import APP_ICON
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
+from manager import ManagerWindow, TeamPet, show_centered
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
 from server import MentorServer
+from team import PRIMARY, TeamCoordinator, TeamStore
 
 
 STYLE = """
@@ -95,21 +97,22 @@ class MemoryDialog(QDialog):
 class ChatWindow(QDialog):
     completed = pyqtSignal(str, str)
 
-    def __init__(self, archive):
+    def __init__(self, archive, member=None):
         super().__init__()
         self.archive = archive
+        self.member = member
         self.settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.busy = False
         self.taken = False
-        self.setWindowTitle("屏幕伴学 · 桌面学伴")
+        self.setWindowTitle("屏幕伴学 · " + (member.name if member else "桌面学伴"))
         self.setStyleSheet(STYLE)
         self.resize(560, 490)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 17, 20, 17)
         layout.setSpacing(10)
-        title = QLabel("桌面学伴")
-        title.setObjectName("heading")
-        layout.addWidget(title)
+        self.heading = QLabel(member.name if member else "桌面学伴")
+        self.heading.setObjectName("heading")
+        layout.addWidget(self.heading)
         self.notice = QLabel("日常对话保存在本机。")
         self.notice.setObjectName("notice")
         self.notice.setWordWrap(True)
@@ -141,12 +144,22 @@ class ChatWindow(QDialog):
         self.refresh()
 
     def refresh(self):
+        name = self.member.name if self.member else "学伴"
         self.history.setPlainText("\n\n".join(
-            f"{'你' if row['role'] == 'user' else '学伴'}\n{row['body']}"
+            f"{'你' if row['role'] == 'user' else name}\n{row['body']}"
             for row in self.archive.transcript()
         ))
         scrollbar = self.history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    def set_member(self, member):
+        renamed = self.member and self.member.name != member.name
+        self.member = member
+        if member:
+            self.heading.setText(member.name)
+            self.setWindowTitle("屏幕伴学 · " + member.name)
+        if renamed:
+            self.refresh()
 
     def configure(self):
         dialog = QDialog(self)
@@ -221,18 +234,28 @@ class ChatWindow(QDialog):
                                  for row in hits)
             self.notice.setText(answer or "没有查到相关记录。可以换成更具体的关键词。")
             return
-        config = tuple(self.settings.value(field, "", type=str) for field in ("endpoint", "model", "key_name"))
+        self.settings.sync()
+        endpoint, model, key = (self.settings.value(field, "", type=str)
+                                for field in ("endpoint", "model", "key_name"))
+        member = self.member
+        config = (endpoint, (member.model if member else "") or model, key)
         self.busy = True
         self.send_button.setEnabled(False)
         self.notice.setText("正在回应…")
-        Thread(target=self.answer, args=(config, prompt, source), daemon=True).start()
+        Thread(target=self.answer, args=(config, prompt, source, member), daemon=True).start()
 
-    def answer(self, config, prompt, source):
+    def answer(self, config, prompt, source, member):
         try:
-            context = self.archive.request_messages(prompt)
+            def context_for(*queries):
+                messages = self.archive.request_messages(prompt, queries)
+                if member:
+                    messages[0]["content"] += f"你的名字是{member.name}，你的分工是：{member.role}"
+                return messages
+
+            context = context_for()
             answer, learn, recall = ask_model(*config, context)
             if 1 <= len(recall) <= 70 and recall != prompt:
-                expanded = self.archive.request_messages(prompt, (recall,))
+                expanded = context_for(recall)
                 if expanded != context:
                     expanded[0]["content"] += "本轮已重新检索，请依据现有证据回复；recall 留空。"
                     answer, learn, _ = ask_model(*config, expanded)
@@ -262,38 +285,128 @@ class Desktop(QObject):
         self.archive = Archive(PROFILE / "agent.sqlite3")
         self.engine = MentorServer(app, self.archive)
         self.chat = None
+        self.member_chats = {}
+        self.manager = None
+        self.pets = {}
+        self.agent_settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
+        self.team = TeamCoordinator(TeamStore(PROFILE / "team.sqlite3"), PROFILE / "team.ini",
+                                    self.model_settings, self.quiet_ready, self)
+        self.team.line.connect(self.show_team_line)
+        self.main_line = ""
+        self.main_bubble_timer = QTimer(self)
+        self.main_bubble_timer.setSingleShot(True)
+        self.main_bubble_timer.setInterval(12_000)
+        self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
         self.engine.practice.idle_chat.connect(self.show_chat)
+        self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
         self.engine.practice.panel.closed.connect(app.quit)
+        self.engine.management_requested.connect(self.show_manager)
         self.listener = QLocalServer(self)
         self.listener.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.listener.newConnection.connect(self.accept)
         self.tray = QSystemTrayIcon(QIcon(str(APP_ICON)), self)
         self.tray.setToolTip("屏幕伴学")
         self.menu = QMenu()
+        self.menu.addAction("管理面板", self.show_manager)
         self.menu.addAction("日常对话", self.show_chat)
         self.menu.addAction("外观管理", self.engine.practice.panel.open_appearance)
         self.menu.addAction("退出桌面学伴", self.app.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
         self.tray.show()
+        self.sync_pets()
 
     def show_chat(self):
-        if self.chat is None:
-            self.chat = ChatWindow(self.archive)
-        if not self.engine.practice.ending.is_set():
-            self.chat.set_taken(True)
-        self.chat.show()
-        self.chat.raise_()
-        self.chat.activateWindow()
+        self.show_member_chat(PRIMARY)
+
+    def show_manager(self):
+        if self.manager is None:
+            self.manager = ManagerWindow(self.team, self)
+        self.manager.refresh()
+        show_centered(self.manager)
+
+    def model_settings(self):
+        self.agent_settings.sync()
+        return tuple(self.agent_settings.value(name, "", type=str) for name in ("endpoint", "model", "key_name"))
+
+    def quiet_ready(self):
+        return not any(chat.busy for chat in self.member_chats.values())
+
+    def member_archive(self, key):
+        return self.archive if key == PRIMARY else Archive(PROFILE / "members" / key / "agent.sqlite3")
+
+    def show_member_chat(self, key):
+        member = next((entry for entry in self.team.store.members() if entry.key == key), None)
+        if member is None:
+            return
+        if key not in self.member_chats:
+            self.member_chats[key] = ChatWindow(self.member_archive(key), member)
+        chat = self.member_chats[key]
+        chat.set_member(member)
+        if key == PRIMARY:
+            self.chat = chat
+        if self.team.blocked:
+            chat.set_taken(True)
+        show_centered(chat)
+
+    def show_member_memory(self, key):
+        dialog = MemoryDialog(self.manager, self.member_archive(key))
+        dialog.setStyleSheet(STYLE)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def sync_pets(self):
+        members = [member for member in self.team.store.members()
+                   if member.key != PRIMARY and member.active and member.visible]
+        visible = {member.key for member in members}
+        for key in set(self.pets) - visible:
+            self.pets.pop(key).close()
+        occupied = {pet.slot for pet in self.pets.values()}
+        slots = iter(slot for slot in range(len(members) + len(occupied)) if slot not in occupied)
+        for member in members:
+            if member.key not in self.pets:
+                pet = TeamPet(member, self.show_member_chat, next(slots))
+                self.pets[member.key] = pet
+                if not self.team.blocked:
+                    pet.show()
+            self.pets[member.key].update_member(member)
+            self.pets[member.key].suspend(self.team.blocked)
+
+    def show_team_line(self, key, name, body):
+        if self.team.blocked or self.team.token is None or self.team.token.is_set():
+            return
+        if key == PRIMARY:
+            self.main_line = f"{name} · {excerpt(' '.join(body.split()), 250)}"
+            self.engine.practice.set_status(self.main_line)
+            self.engine.practice.panel.set_pose("ready")
+            self.main_bubble_timer.start()
+        elif key in self.pets:
+            self.pets[key].say(body)
+
+    def reset_main_bubble(self):
+        practice = self.engine.practice
+        if not self.team.blocked and practice.status.text() == self.main_line:
+            practice.set_idle()
+
+    def takeover(self):
+        self.team.set_blocked(True)
+        self.main_bubble_timer.stop()
+        for pet in self.pets.values():
+            pet.suspend(True)
+        for chat in self.member_chats.values():
+            chat.set_taken(True)
 
     def tray_clicked(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            self.show_chat()
+            self.show_manager()
 
     def after_session(self):
-        if self.chat is not None:
-            self.chat.set_taken(False)
+        self.team.set_blocked(False)
+        for pet in self.pets.values():
+            pet.suspend(False)
+        for chat in self.member_chats.values():
+            chat.set_taken(False)
 
     def accept(self):
         while self.listener.hasPendingConnections():
@@ -317,14 +430,11 @@ class Desktop(QObject):
             owner = envelope["owner"]
             if not isinstance(owner, str) or not 1 <= len(owner) <= 64:
                 raise ValueError
-            active = not self.engine.practice.ending.is_set()
             if request.get("method") == "show_desktop":
-                self.show_chat()
+                self.show_manager()
                 result = {"shown": True}
             else:
                 result = self.engine.respond(request, owner)
-            if self.chat is not None and not active and not self.engine.practice.ending.is_set():
-                self.chat.set_taken(True)
         except (KeyError, AttributeError, TypeError, ValueError):
             result = {"error": {"code": -32600, "message": "Invalid request"}}
         if not sip.isdeleted(socket) and socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
@@ -350,7 +460,7 @@ def main():
     if not desktop.listener.listen(CHANNEL):
         return 1
     if "--background" not in sys.argv:
-        desktop.show_chat()
+        desktop.show_manager()
     try:
         return app.exec()
     finally:
