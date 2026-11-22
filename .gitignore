@@ -13,3 +13,8 @@ config.json
 !codex-plugin/assets/app-icon.png
 !codex-plugin/assets/companion/peek-poses.png
 !codex-plugin/assets/companion/peek-blink.png
+!codex-plugin/assets/companion/whale-maid/side.png
+!codex-plugin/assets/companion/whale-maid/bottom.png
+!tools/whale-maid/peeks.png
+!tools/whale-maid/poses.png
+!tools/whale-maid/wave.png

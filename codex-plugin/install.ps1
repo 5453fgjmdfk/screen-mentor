@@ -80,10 +80,15 @@ $files = @(
     'scripts/manager.py', 'scripts/team.py', 'scripts/scheduled.py',
     'assets/app-icon.ico', 'assets/app-icon.png', 'assets/companion/idle.gif', 'assets/companion/reading.gif',
     'assets/companion/ready.gif', 'assets/companion/thinking.gif', 'assets/companion/peek-poses.png',
-    'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md'
+    'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md',
+    'assets/companion/whale-maid/idle.gif', 'assets/companion/whale-maid/reading.gif',
+    'assets/companion/whale-maid/thinking.gif', 'assets/companion/whale-maid/ready.gif',
+    'assets/companion/whale-maid/side.gif', 'assets/companion/whale-maid/side.png',
+    'assets/companion/whale-maid/bottom.gif', 'assets/companion/whale-maid/bottom.png',
+    'assets/companion/whale-maid/SOURCE.md'
 )
 foreach ($destination in $destinations) {
-    foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'assets/companion')) {
+    foreach ($relative in @('.codex-plugin', 'skills/screen-mentor', 'scripts', 'assets/companion', 'assets/companion/whale-maid')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $destination $relative) | Out-Null
     }
     foreach ($relative in $files) {

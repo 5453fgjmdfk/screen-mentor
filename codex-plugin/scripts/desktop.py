@@ -480,14 +480,20 @@ class Desktop(QObject):
 
     def set_pets_visible(self, visible):
         self.pets_visible = visible
-        self.engine.practice.panel.suspend(not visible)
-        for pet in self.pets.values():
-            pet.suspend(not visible or self.team.blocked)
-        if not visible and self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
-            self.quick_chat.close()
+        self.sync_pet_visibility()
         self.update_pets_action()
         if self.manager is not None:
             self.manager.update_pet_visibility()
+
+    def sync_pet_visibility(self):
+        self.engine.practice.panel.suspend(not self.pets_visible)
+        for pet in self.pets.values():
+            pet.suspend(not self.pets_visible or self.team.blocked or not pet.member.visible)
+        quick = self.quick_chat
+        if quick is not None and not sip.isdeleted(quick):
+            key = quick.pane.member.key
+            if not self.pets_visible or (key != PRIMARY and (key not in self.pets or self.pets[key].suspended)):
+                quick.close()
 
     def apply_pet_preferences(self):
         interval = max(4, min(30, self.preferences.value("bubble_seconds", 12, type=int))) * 1000
@@ -625,15 +631,16 @@ class Desktop(QObject):
         dialog.deleteLater()
 
     def sync_pets(self):
-        members = [member for member in self.team.store.members()
-                   if member.key != PRIMARY and member.active and member.visible]
-        visible = {member.key for member in members}
-        for key in set(self.pets) - visible:
+        members = [member for member in self.team.store.members() if member.key != PRIMARY]
+        keys = {member.key for member in members}
+        for key in set(self.pets) - keys:
             self.pets.pop(key).close()
         occupied = {pet.slot for pet in self.pets.values()}
         slots = iter(slot for slot in range(len(members) + len(occupied)) if slot not in occupied)
         for member in members:
             if member.key not in self.pets:
+                if not member.visible:
+                    continue
                 pet = TeamPet(member, self, next(slots))
                 self.pets[member.key] = pet
                 self.attach_pet_menu(pet)
@@ -642,7 +649,7 @@ class Desktop(QObject):
                 if not self.team.blocked and self.pets_visible:
                     pet.show()
             self.pets[member.key].update_member(member, self.team.store.palette(member.key))
-            self.pets[member.key].suspend(self.team.blocked or not self.pets_visible)
+        self.sync_pet_visibility()
 
     def show_team_line(self, key, name, body):
         if self.team.blocked or self.team.token is None or self.team.token.is_set() or key in self.chat_bubbles:
@@ -692,8 +699,7 @@ class Desktop(QObject):
         if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
             self.quick_chat.close()
         self.main_bubble_timer.stop()
-        for pet in self.pets.values():
-            pet.suspend(True)
+        self.sync_pet_visibility()
         for chat in self.member_chats.values():
             chat.set_taken(True)
 
@@ -705,8 +711,7 @@ class Desktop(QObject):
         if self.exiting:
             return
         self.team.set_blocked(False)
-        for pet in self.pets.values():
-            pet.suspend(not self.pets_visible)
+        self.sync_pet_visibility()
         for chat in self.member_chats.values():
             chat.set_taken(False)
 

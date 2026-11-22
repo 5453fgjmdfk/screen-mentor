@@ -484,7 +484,7 @@ class CompanionPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
         self.sprite = PetSprite()
-        self.sprite.setAccessibleName("小龙学伴")
+        self.sprite.setAccessibleName("桌面学伴")
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sprite.setFixedSize(sprite_size, sprite_size)
         self.drag_handles = set()
@@ -492,6 +492,7 @@ class CompanionPanel(QWidget):
         self.drag_offset = None
         self.drag_start = None
         self.edge_dragging = False
+        self.lift_depth = 0
         self.lift_widgets = []
         self.suspended = False
         self.dock_position = None
@@ -669,10 +670,7 @@ class CompanionPanel(QWidget):
             handle.setCursor(Qt.CursorShape.OpenHandCursor)
             if released and dragged:
                 screen = QGuiApplication.screenAt(cursor) or self.screen()
-                area = screen.availableGeometry()
-                self.move(self.fit_model(position, area))
-                if not self.snap_to_edge(area):
-                    self.move(fit_position(position, self.size(), area))
+                self.place_on_release(position, screen.availableGeometry())
             elif released and handle is self.sprite:
                 self.clicked.emit()
             return released
@@ -713,6 +711,14 @@ class CompanionPanel(QWidget):
         model = self.model_bounds()
         return QPoint(model.center().x(), model.top() + round(model.height() * .18))
 
+    def distance_from_lift_edge(self, cursor):
+        area = self.peek.area
+        if self.peek.edge == Qt.Edge.LeftEdge:
+            return cursor.x() - area.left()
+        if self.peek.edge == Qt.Edge.RightEdge:
+            return area.right() - cursor.x()
+        return area.bottom() - cursor.y()
+
     def pull_from_edge(self, cursor):
         if not self.edge_dragging:
             self.edge_dragging = True
@@ -727,6 +733,7 @@ class CompanionPanel(QWidget):
             layout.activate()
             self.adjustSize()
             self.sprite.pickup(self.peek.edge)
+        self.lift_depth = max(self.lift_depth, self.distance_from_lift_edge(cursor))
         screen = QGuiApplication.screenAt(cursor) or self.peek.screen()
         self.move(self.fit_model(cursor - self.grab_point(), screen.availableGeometry()))
         if not self.isVisible():
@@ -736,6 +743,7 @@ class CompanionPanel(QWidget):
         if not self.edge_dragging:
             return
         self.edge_dragging = False
+        self.lift_depth = 0
         for widget in self.lift_widgets:
             widget.show()
         self.lift_widgets.clear()
@@ -746,14 +754,22 @@ class CompanionPanel(QWidget):
     def drop_from_edge(self, cursor):
         if not self.edge_dragging:
             return
-        self.peek.hide()
-        self.cancel_lift()
         screen = QGuiApplication.screenAt(cursor) or self.screen()
         area = screen.availableGeometry()
-        position = cursor - self.grab_point()
-        self.move(fit_position(position, self.size(), area))
+        returned = self.lift_depth - self.distance_from_lift_edge(cursor) >= QApplication.startDragDistance()
+        # A short pull can leave the full sprite touching the source edge. Require a return
+        # movement before redocking there so a short inward pull still unfolds the sprite.
+        ignored_edge = self.peek.edge if area == self.peek.area and not returned else None
+        self.peek.hide()
+        self.cancel_lift()
+        self.place_on_release(cursor - self.grab_point(), area, ignored_edge=ignored_edge)
 
-    def snap_to_edge(self, area):
+    def place_on_release(self, position, area, *, ignored_edge=None):
+        self.move(self.fit_model(position, area))
+        if not self.snap_to_edge(area, ignored_edge=ignored_edge):
+            self.move(fit_position(position, self.size(), area))
+
+    def snap_to_edge(self, area, *, ignored_edge=None):
         if not self.snapping_enabled:
             return False
         bounds = self.model_bounds().translated(self.pos())
@@ -762,6 +778,7 @@ class CompanionPanel(QWidget):
             Qt.Edge.RightEdge: abs(area.right() - bounds.right()),
             Qt.Edge.BottomEdge: abs(area.bottom() - bounds.bottom()),
         }
+        distances.pop(ignored_edge, None)
         edge = min(distances, key=distances.get)
         if distances[edge] > SNAP_DISTANCE:
             return False

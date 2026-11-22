@@ -212,6 +212,7 @@ BUILT_INS = (
     Skin("default", "窗边小龙 · 薰衣草", ART, PALETTES["lilac"]),
     Skin("mint", "窗边小龙 · 薄荷绿", ART, PALETTES["mint"]),
     Skin("blue", "窗边小龙 · 雾蓝", ART, PALETTES["blue"]),
+    Skin("whale-maid", "鲸鱼娘 · 海雾蓝", ART / "whale-maid", PALETTES["blue"]),
 )
 
 

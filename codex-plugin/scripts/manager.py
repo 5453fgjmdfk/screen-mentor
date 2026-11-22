@@ -645,9 +645,16 @@ class ManagerWindow(QDialog):
 
     def members_page(self):
         page, layout = self.page("成员")
+        toolbar = QHBoxLayout()
+        self.member_display = button("显示到桌面", self.toggle_member_display)
+        toolbar.addWidget(self.member_display)
+        toolbar.addStretch()
+        toolbar.addWidget(button("添加成员", lambda: self.edit_member(add=True), primary=True))
+        layout.addLayout(toolbar)
         self.members = QListWidget()
         self.members.setAccessibleName("桌面学伴成员")
         self.members.setIconSize(QSize(36, 36))
+        self.members.currentItemChanged.connect(self.update_member_display_action)
         layout.addWidget(self.members, 1)
         self.member_hint = label("", "quiet")
         layout.addWidget(self.member_hint)
@@ -658,7 +665,6 @@ class ManagerWindow(QDialog):
         actions.addWidget(button("编辑外观", lambda: self.member_action(self.open_appearance)))
         actions.addWidget(button("编辑档案", lambda: self.edit_member()))
         actions.addStretch()
-        actions.addWidget(button("添加成员", lambda: self.edit_member(add=True), primary=True))
         return page
 
     def appearance_page(self):
@@ -1234,9 +1240,7 @@ class ManagerWindow(QDialog):
         icons = {skin.key: portrait_icon(skin) for skin in self.skin_library.all(saved_palettes=False) if skin.key in keys}
         icons[PRIMARY] = portrait_icon(self.skin_library.current())
         for member in members:
-            state = "显示在桌面" if member.visible and member.active else "未显示"
-            role = "主学伴" if member.key == PRIMARY else "子成员"
-            item = QListWidgetItem(f"{member.name}　·　{role}　·　{state}\n{excerpt(member.role, 156)}")
+            item = QListWidgetItem(self.member_row_text(member))
             item.setIcon(icons.get(PRIMARY if member.key == PRIMARY else member.skin, QIcon()))
             item.setData(Qt.ItemDataRole.UserRole, member)
             self.members.addItem(item)
@@ -1266,6 +1270,49 @@ class ManagerWindow(QDialog):
     def current_member(self):
         item = self.members.currentItem()
         return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def member_row_text(self, member):
+        if not member.visible:
+            state = "未显示"
+        elif not self.desktop.pets_visible:
+            state = "桌宠已统一隐藏"
+        elif self.team.blocked and member.key != PRIMARY:
+            state = "伴学中暂收起"
+        else:
+            state = "显示在桌面"
+        role = "主学伴" if member.key == PRIMARY else "子成员"
+        return f"{member.name}　·　{role}　·　{state}\n{excerpt(member.role, 156)}"
+
+    def update_member_display_action(self):
+        member = self.current_member()
+        visible = self.desktop.pets_visible
+        primary_shown = member is not None and member.key == PRIMARY and visible
+        self.member_display.setEnabled(member is not None and not primary_shown)
+        if primary_shown:
+            caption = "主学伴已显示"
+            hint = "在「桌面」页可统一隐藏桌宠。"
+        elif member is not None and member.visible and visible:
+            caption = "隐藏此桌宠"
+            hint = "只隐藏所选成员的桌宠。"
+        else:
+            caption = "显示到桌面"
+            hint = "显示所选桌宠。若桌宠已统一隐藏，先恢复桌面显示。"
+        self.member_display.setText(caption)
+        self.member_display.setToolTip(hint)
+
+    def toggle_member_display(self):
+        member = self.current_member()
+        if member is None:
+            return
+        restore = not self.desktop.pets_visible
+        if member.key != PRIMARY and (not restore or not member.visible):
+            try:
+                self.desktop.save_member(replace(member, visible=restore or not member.visible))
+            except ValueError as error:
+                self.member_hint.setText(str(error))
+                return
+        if restore:
+            self.desktop.set_pets_visible(True)
 
     def member_action(self, callback):
         member = self.current_member()
@@ -1312,8 +1359,12 @@ class ManagerWindow(QDialog):
     def update_pet_visibility(self):
         visible = self.desktop.pets_visible
         self.pets_toggle.setText("隐藏桌宠" if visible else "显示桌宠")
-        count = 1 if self.team.blocked else sum(member.visible and member.active for member in self.team.store.members())
+        count = 1 if self.team.blocked else sum(member.visible for member in self.team.store.members())
         room = self.team.automatic_room()
         schedule = f"{room.name} · 每 {room.minutes} 分钟" if room else "定时闲聊关闭"
         status = f"{count} 位学伴显示在桌面" if visible else "桌宠已隐藏"
         self.info.setText(f"{status} · {schedule}")
+        for index in range(self.members.count()):
+            item = self.members.item(index)
+            item.setText(self.member_row_text(item.data(Qt.ItemDataRole.UserRole)))
+        self.update_member_display_action()
