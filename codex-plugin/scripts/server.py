@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import io
 import json
 import math
+import sys
 import time
 from uuid import uuid4
 
@@ -19,7 +20,7 @@ from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 import native
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
-from protocol import POLL_WAIT_SECONDS, PROGRESS_PHASES, validated_arguments
+from protocol import DEFAULT_POLL_SECONDS, PROGRESS_PHASES, validated_arguments
 from target import tighten
 from window_reader import WindowReader
 
@@ -46,6 +47,7 @@ class MentorServer(QObject):
 
     def __init__(self, app, archive, *, create_member=None, list_skins=None):
         super().__init__()
+        self.app = app
         self.archive = archive
         self.create_member = create_member
         self.list_skins = list_skins
@@ -79,13 +81,17 @@ class MentorServer(QObject):
         self.action_poll.setInterval(16)
         self.action_poll.timeout.connect(self.check_action)
 
-    def hide_guide(self):
+    def reset_guide(self):
         self.guard.stop()
         self.expiration.stop()
         self.action_poll.stop()
         self.action = None
+        self.pressed_target = False
         self.displayed_frame = self.guide_window = None
         self.displayed_regions = ()
+
+    def hide_guide(self):
+        self.reset_guide()
         self.overlay.clear()
         self.overlay.hide()
 
@@ -95,6 +101,9 @@ class MentorServer(QObject):
             return
         down, x, y = mouse
         if down == self.mouse_down:
+            return
+        if self.practice.scope.active() != self.guide_window[0]:
+            self.check_window()
             return
         self.mouse_down = down
         (left, top, width, height), destination = self.action
@@ -121,20 +130,37 @@ class MentorServer(QObject):
         self.practice.wake.emit()
 
     def check_window(self):
+        if self.guide_window is None:
+            return
+        hwnd, bounds = self.guide_window
         try:
-            hwnd, bounds = self.guide_window
-            if native.window_state(hwnd) == bounds and (
-                self.displayed_frame is None or self.practice.scope.active() == hwnd
-            ):
-                return
-        except (TypeError, native.WindowError):
-            pass
-        self.hide_guide()
+            same_window = native.window_state(hwnd) == bounds
+        except native.WindowError:
+            same_window = False
+        if not same_window:
+            self.hide_guide()
+            self.practice.force = True
+        elif self.displayed_frame is not None and self.practice.scope.active() != hwnd:
+            self.conceal_guide()
 
-    def observe_window(self, window_id):
+    def conceal_guide(self):
+        self.action_poll.stop()
+        self.pressed_target = False
+        self.overlay.hide()
+
+    def observe_window(self, window_id, *, live=False):
+        hwnd = int(window_id)
+        if live:
+            practice = self.practice
+            frame = practice.current
+            if (frame is None or frame[:2] != (hwnd, native.window_state(hwnd))
+                    or practice.scope.active() != hwnd or time.monotonic() - practice.last_sample > 4):
+                practice.force = True
+                raise native.WindowError("正在等待练习窗口的新画面，请切回窗口后继续等待。")
+            self.use_practice_frame(frame)
+            return self.image_blocks(frame[2])
         self.hide_guide()
         self.snapshot = None
-        hwnd = int(window_id)
         window = native.window_state(hwnd)
         _, _, width, height, _ = window
         with WindowReader() as reader:
@@ -145,6 +171,12 @@ class MentorServer(QObject):
         self.snapshot = Snapshot(uuid4().hex, hwnd, window, image.size, time.monotonic())
         self.practice_frame = None
         return self.image_blocks(image)
+
+    def use_practice_frame(self, frame):
+        hwnd, bounds, image = frame[:3]
+        self.practice_frame = frame
+        self.snapshot = Snapshot(uuid4().hex, hwnd, bounds, image.size, time.monotonic())
+        self.snapshot_owner = self.practice_owner
 
     @staticmethod
     def encode_image(image):
@@ -211,13 +243,28 @@ class MentorServer(QObject):
         current = practice.current
         if self.practice_frame and (current is None or self.practice_frame[:2] != current[:2]):
             self.snapshot = self.practice_frame = None
-        if self.displayed_frame and (
-            current is None or self.displayed_frame[:2] != current[:2]
-            or (time.monotonic() - practice.pending >= .55
-                and any(self.region_changed(self.displayed_frame, current, box) for box in self.displayed_regions))
-        ):
-            self.hide_guide()
-            practice.force = True
+        if self.displayed_frame is not None:
+            if current is None or practice.scope.active() != current[0]:
+                self.conceal_guide()
+            elif self.displayed_frame[:2] != current[:2]:
+                self.hide_guide()
+                practice.force = True
+            else:
+                changed_region = any(self.region_changed(self.displayed_frame, current, box)
+                                     for box in self.displayed_regions)
+                if changed_region and not self.overlay.isVisible():
+                    # A previously hidden guide must not cover a different control after a task switch.
+                    self.hide_guide()
+                    practice.force = True
+                elif changed_region and time.monotonic() - practice.pending >= .55:
+                    self.hide_guide()
+                    practice.force = True
+                elif not changed_region and not self.overlay.isVisible():
+                    self.overlay.restore_guide()
+                    if self.action is not None:
+                        mouse = native.primary_mouse()
+                        self.mouse_down = bool(mouse and mouse[0])
+                        self.action_poll.start()
         if self.pending_hint:
             self.display_pending_hint()
 
@@ -245,8 +292,9 @@ class MentorServer(QObject):
         hwnd = practice.scope.active()
         if hwnd is None:
             return
-        if self.guide_window and self.guide_window[0] == hwnd and self.overlay.has_guide:
-            if not self.overlay.isVisible() or not native.is_visible(int(self.overlay.winId())):
+        # A hidden overlay needs a fresh frame before being restored.
+        if self.guide_window and self.guide_window[0] == hwnd and self.overlay.isVisible():
+            if not native.is_visible(int(self.overlay.winId())):
                 self.overlay.restore_guide()
         if now - self.last_watchdog < 20:
             return
@@ -279,7 +327,7 @@ class MentorServer(QObject):
         after = second[2].crop(crop).convert("L")
         return ImageStat.Stat(ImageChops.difference(before, after)).mean[0] >= 16
 
-    def wait_for_practice_change(self, practice_id):
+    def wait_for_practice_change(self, practice_id, timeout_seconds=DEFAULT_POLL_SECONDS, *, disconnected):
         practice = self.practice
         if practice is None or practice_id != self.practice_id or self.waiting:
             raise ValueError("当前工具没有对应的伴学会话。")
@@ -287,7 +335,7 @@ class MentorServer(QObject):
             return [text_content({"state": "ended"})]
         self.waiting = True
         self.renew_practice()
-        deadline = practice.last_poll + POLL_WAIT_SECONDS
+        deadline = practice.last_poll + timeout_seconds
         loop = QEventLoop()
         timer = QTimer()
         timer.setInterval(180)
@@ -296,6 +344,8 @@ class MentorServer(QObject):
         timer.start()
         try:
             while not practice.ending.is_set():
+                if disconnected():
+                    return [text_content({"state": "waiting", "reason": "cancelled"})]
                 if practice.running.is_set() and practice.issues:
                     problem, images = practice.issues.popleft()
                     blocks = [text_content({"state": "issue", "user_reported": problem,
@@ -305,11 +355,9 @@ class MentorServer(QObject):
                     return blocks
                 frame = practice.take() if practice.running.is_set() else None
                 if frame:
-                    hwnd, bounds, image, _, _ = frame
+                    hwnd, _, image, _, _ = frame
                     if practice.scope.active() == hwnd:
-                        self.practice_frame = frame
-                        self.snapshot = Snapshot(uuid4().hex, hwnd, bounds, image.size, time.monotonic())
-                        self.snapshot_owner = self.practice_owner
+                        self.use_practice_frame(frame)
                         self.last_analysis = time.monotonic()
                         event = {"state": "changed", "window_title": native.window_title(hwnd)}
                         if self.last_window is not None and self.last_window != hwnd:
@@ -319,7 +367,8 @@ class MentorServer(QObject):
                         elif practice.recheck_reason:
                             event["reason"], practice.recheck_reason = practice.recheck_reason, None
                         self.last_window = hwnd
-                        practice.set_progress("画面已收到，正在判断下一步")
+                        if not self.displayed_regions or not self.overlay.isVisible():
+                            practice.set_progress("画面已收到，正在判断下一步")
                         return [text_content(event), *self.image_blocks(image)]
                 if time.monotonic() >= deadline:
                     state = "waiting" if practice.running.is_set() else "paused"
@@ -382,7 +431,7 @@ class MentorServer(QObject):
                 raise ValueError("拖动落点被遮挡或不在同一屏幕，请重新确认起点和落点。")
             drag_to = dx - ml, dy - mt
         gx, gy, right, bottom = max(gx, ml), max(gy, mt), min(gx + gw, mr), min(gy + gh, mb)
-        self.hide_guide()
+        self.reset_guide()
         self.pending_hint = None
         self.place_overlay(screen, mr - ml, mb - mt)
         live = self.practice_frame is not None
@@ -421,8 +470,13 @@ class MentorServer(QObject):
 
     def place_overlay(self, screen, width, height):
         self.overlay.winId()
-        self.overlay.windowHandle().setScreen(screen)
-        self.overlay.setGeometry(screen.geometry())
+        handle = self.overlay.windowHandle()
+        if handle.screen() != screen:
+            self.overlay.hide()
+            handle.setScreen(screen)
+        geometry = screen.geometry()
+        if self.overlay.geometry() != geometry:
+            self.overlay.setGeometry(geometry)
         self.overlay.set_capture_size(width, height)
 
     def display_pending_hint(self):
@@ -437,7 +491,7 @@ class MentorServer(QObject):
             return False
         title, detail = self.pending_hint
         self.pending_hint = None
-        self.hide_guide()
+        self.reset_guide()
         self.place_overlay(screen, mr - ml, mb - mt)
         self.overlay.show_guide(None, title, detail, seconds=0,
                                 hint_at_phys=(left + width / 2 - ml, top + min(98, height / 4) - mt))
@@ -446,7 +500,7 @@ class MentorServer(QObject):
         self.guard.start(250)
         return True
 
-    def call_tool(self, params, owner):
+    def call_tool(self, params, owner, *, disconnected=lambda: False):
         try:
             name = params.get("name")
             args = validated_arguments(name, params.get("arguments", {}))
@@ -488,7 +542,7 @@ class MentorServer(QObject):
                 self.practice.close()
                 blocks = [text_content({"state": "ended", "summary_saved": bool(summary)})]
             elif name == "wait_for_practice_change":
-                blocks = self.wait_for_practice_change(**args)
+                blocks = self.wait_for_practice_change(**args, disconnected=disconnected)
             elif name == "show_practice_progress":
                 if not self.practice or self.practice.ending.is_set() or args["practice_id"] != self.practice_id:
                     raise ValueError("当前工具没有对应的伴学会话。")
@@ -510,7 +564,7 @@ class MentorServer(QObject):
             elif name == "observe_window":
                 if live and not self.practice.scope.accepts(int(args["window_id"])):
                     raise ValueError("该窗口不在本场伴学的范围内。")
-                blocks = self.observe_window(args["window_id"])
+                blocks = self.observe_window(args["window_id"], live=live)
                 self.snapshot_owner = owner
             elif name == "show_guide":
                 if self.snapshot_owner != owner:
@@ -528,13 +582,15 @@ class MentorServer(QObject):
         except (native.WindowError, ValueError) as exc:
             return {"isError": True, "content": [text_content(str(exc))]}
 
-    def respond(self, request, owner):
+    def respond(self, request, owner, *, disconnected=lambda: False):
         if (not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request
                 or request.get("method") != "tools/call" or not isinstance(request.get("params", {}), dict)):
             raise ValueError("Invalid request")
         response = {"jsonrpc": "2.0", "id": request["id"]}
         try:
-            response["result"] = self.call_tool(request.get("params", {}), owner)
-        except Exception:
-            response["error"] = {"code": -32603, "message": "Screen Mentor request failed"}
+            response["result"] = self.call_tool(request.get("params", {}), owner, disconnected=disconnected)
+        except Exception as exc:
+            if sys.excepthook is not sys.__excepthook__:
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+            response["error"] = {"code": -32603, "message": "伴学窗口暂时无法处理这一步。请重新获取画面。"}
         return response

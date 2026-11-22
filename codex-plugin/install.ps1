@@ -14,6 +14,8 @@ $marketRoot = Join-Path $InstallRoot 'marketplace'
 $pluginRoot = Join-Path $marketRoot 'screen-mentor'
 $marketManifest = Join-Path $marketRoot '.agents/plugins/marketplace.json'
 $runtime = Join-Path $InstallRoot 'runtime'
+$mcpRoot = Join-Path $InstallRoot 'mcp'
+$launcher = Join-Path $mcpRoot 'launch.py'
 $runtimePython = Join-Path $runtime 'Scripts/python.exe'
 $installUtf8 = [Text.UTF8Encoding]::new($false)
 
@@ -68,6 +70,8 @@ $runtimeResolved = Resolve-InstalledPath $runtimePython
 $runtimeWindowed = Join-Path (Split-Path -Parent $runtimeResolved) 'pythonw.exe'
 $mcp = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $PSScriptRoot '.mcp.json') | ConvertFrom-Json
 $mcp.mcpServers.screen_mentor.command = $runtimeResolved
+$installedRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $runtimeResolved))
+$mcp.mcpServers.screen_mentor.args = @('-B', (Join-Path $installedRoot 'mcp/launch.py'))
 $mcpJson = $mcp | ConvertTo-Json -Depth 12
 
 $destinations = @($desktopRoot)
@@ -77,6 +81,7 @@ $files = @(
     'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py',
     'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py',
     'scripts/desktop.py', 'scripts/bridge.py', 'scripts/protocol.py', 'scripts/resident_agent.py',
+    'scripts/agent_config.py',
     'scripts/manager.py', 'scripts/team.py', 'scripts/scheduled.py',
     'assets/app-icon.ico', 'assets/app-icon.png', 'assets/companion/idle.gif', 'assets/companion/reading.gif',
     'assets/companion/ready.gif', 'assets/companion/thinking.gif', 'assets/companion/peek-poses.png',
@@ -132,5 +137,19 @@ foreach ($shortcut in @(@{Label = $appearanceLabel; File = 'appearance.py'}, @{L
     $link.WorkingDirectory = Join-Path $desktopResolved 'scripts'
     $link.IconLocation = (Join-Path $desktopResolved 'assets/app-icon.ico') + ',0'
     $link.Save()
+}
+New-Item -ItemType Directory -Force -Path $mcpRoot | Out-Null
+$stagedLauncher = Join-Path $mcpRoot ('launch.' + [guid]::NewGuid().ToString('N') + '.tmp')
+$stagedVersion = Join-Path $mcpRoot ('version.' + [guid]::NewGuid().ToString('N') + '.tmp')
+$versionPointer = Join-Path $mcpRoot 'version.txt'
+try {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts/mcp_launch.py') -Destination $stagedLauncher
+    [IO.File]::WriteAllText($stagedVersion, $manifest.version, $installUtf8)
+    & $runtimePython -B -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2]); os.replace(sys.argv[3], sys.argv[4])' $stagedLauncher $launcher $stagedVersion $versionPointer
+    if ($LASTEXITCODE -ne 0) { throw 'Could not activate the local MCP entry point.' }
+} finally {
+    foreach ($pending in @($stagedLauncher, $stagedVersion)) {
+        if (Test-Path -LiteralPath $pending) { Remove-Item -LiteralPath $pending }
+    }
 }
 Write-Output "Screen Mentor $($manifest.version) installed."

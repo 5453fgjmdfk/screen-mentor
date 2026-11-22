@@ -11,6 +11,8 @@ STAGE = (256, 256)
 SIDE = (190, 250)
 BOTTOM = (256, 214)
 FRAME_MS = 50
+BLINK_MS = 20
+BLINK_PROGRESS = (.22, .53, .84, 1, 1, .89, .69, .46, .25, .10)
 
 
 def load(name):
@@ -36,22 +38,58 @@ def split(sheet, midpoint_y):
             for left, right in ((0, midpoint_x), (midpoint_x, sheet.width))]
 
 
-def eyelids(open_cel, closed_cel, eyes, radius):
-    mask = Image.new("L", open_cel.size)
+def eye_mask(size, eyes, radius):
+    mask = Image.new("L", size)
     draw = ImageDraw.Draw(mask)
     dx, dy = radius
     for x, y in eyes:
         draw.ellipse((x - dx, y - dy, x + dx, y + dy), fill=255)
-    return Image.composite(closed_cel, open_cel, mask.filter(ImageFilter.GaussianBlur(2)))
+    return mask.filter(ImageFilter.GaussianBlur(2))
 
 
-def blink(open_cel, closed_cel, index, starts):
-    age = next((index - start for start in starts if 0 <= index - start < 4), None)
-    if age is None:
-        return open_cel
-    if age in (1, 2):
-        return closed_cel
-    return Image.blend(open_cel, closed_cel, .63)
+def eye_mesh(eyes, radius, progress):
+    # Compress the iris and lashes towards the closing line while the outer skin stays in place.
+    dx, dy = radius
+    for x, y in eyes:
+        left, right = x - dx, x + dx + 1
+        top, bottom = y - dy, y + dy + 1
+        upper, lower = y - round(dy * .67), y + round(dy * .70)
+        closing_line = y + round(dy * .14)
+        warped_upper = round(upper + (closing_line - upper) * progress)
+        warped_lower = max(warped_upper + 1, round(lower + (closing_line - lower) * progress))
+        source = (top, upper, lower, bottom)
+        target = (top, warped_upper, warped_lower, bottom)
+        for before, after, begin, end in zip(source, source[1:], target, target[1:]):
+            yield ((left, begin, right, end),
+                   (left, before, left, after, right, after, right, before))
+
+
+def blink_cels(open_cel, closed_cel, eyes, radius):
+    mask = eye_mask(open_cel.size, eyes, radius)
+    # Keep the blend within the transformed area, including the soft edges of the eye patches.
+    mesh_radius = (radius[0] + 6, radius[1] + 6)
+    closed = Image.composite(closed_cel, open_cel, mask)
+    for progress in BLINK_PROGRESS:
+        if progress == 1:
+            yield closed
+            continue
+        mesh = list(eye_mesh(eyes, mesh_radius, progress))
+        warped = open_cel.transform(open_cel.size, Image.Transform.MESH, mesh, Image.Resampling.BICUBIC)
+        cel = Image.composite(warped, open_cel, mask)
+        # Only switch to the drawn closed lash once the iris is nearly flat.
+        closed_weight = max(0, (progress - .65) / .35)
+        yield Image.blend(cel, closed, closed_weight) if closed_weight else cel
+
+
+def blink_timeline(still, cels, starts, loop_ms, steady_ms):
+    previous = 0
+    for start in (*starts, loop_ms):
+        for at in range(previous, start, steady_ms):
+            yield at, still, min(steady_ms, start - at)
+        if start < loop_ms:
+            for index, cel in enumerate(cels):
+                yield start + index * BLINK_MS, cel, BLINK_MS
+        previous = start + len(cels) * BLINK_MS
 
 
 def body_motion(cel, phase, state):
@@ -71,7 +109,7 @@ def body_motion(cel, phase, state):
     return image.rotate(angle, resample=Image.Resampling.BICUBIC, center=(128, anchor - 24))
 
 
-def save_gif(name, frames):
+def save_gif(name, frames, durations=FRAME_MS):
     samples = []
     for frame in frames[::3]:
         pixels = frame.tobytes()
@@ -87,21 +125,21 @@ def save_gif(name, frames):
         colors.paste(255, mask=frame.getchannel("A").point(lambda alpha: 255 if alpha < 128 else 0))
         indexed.append(colors)
     indexed[0].save(OUTPUT / f"{name}.gif", save_all=True, append_images=indexed[1:],
-                    duration=FRAME_MS, loop=0, transparency=255, disposal=2, optimize=False)
+                    duration=durations, loop=0, transparency=255, disposal=2, optimize=False)
 
 
 def main():
     OUTPUT.mkdir(parents=True, exist_ok=True)
     poses = split(load("poses.png"), 627)
     idle, eyes_closed, reading, thinking = [build_cel(image, STAGE, (236, 235), "feet") for image in poses]
-    idle_closed = eyelids(idle, eyes_closed, ((107, 103), (142, 100)), (17, 13))
+    cels = tuple(blink_cels(idle, eyes_closed, ((107, 103), (142, 100)), (17, 13)))
+    idle_timeline = list(blink_timeline(idle, cels, (1300, 3900), 4800, FRAME_MS))
+    idle_frames = [body_motion(cel, 2 * pi * at / 4800, "idle") for at, cel, _ in idle_timeline]
+    save_gif("idle", idle_frames, [duration for _, _, duration in idle_timeline])
+
     ready = build_cel(load("wave.png"), STAGE, (236, 235), "feet")
-    for state, still, count in (("idle", idle, 96), ("reading", reading, 60),
-                                ("thinking", thinking, 80), ("ready", ready, 58)):
-        frames = []
-        for index in range(count):
-            image = blink(still, idle_closed, index, (26, 78)) if state == "idle" else still
-            frames.append(body_motion(image, 2 * pi * index / count, state))
+    for state, still, count in (("reading", reading, 60), ("thinking", thinking, 80), ("ready", ready, 58)):
+        frames = [body_motion(still, 2 * pi * index / count, state) for index in range(count)]
         save_gif(state, frames)
 
     side, side_closed, bottom, bottom_closed = split(load("peeks.png"), 625)
@@ -110,9 +148,11 @@ def main():
         ("bottom", bottom, bottom_closed, BOTTOM, (248, 214), "bottom", ((101, 161), (157, 157)), (24, 19)),
     ):
         still = build_cel(open_pose, stage, size, anchor)
-        closed = eyelids(still, build_cel(closed_pose, stage, size, anchor), eyes, radius)
+        closed = build_cel(closed_pose, stage, size, anchor)
+        cels = tuple(blink_cels(still, closed, eyes, radius))
         still.save(OUTPUT / f"{state}.png", optimize=True)
-        save_gif(state, [blink(still, closed, index, (31, 94)) for index in range(140)])
+        timeline = list(blink_timeline(still, cels, (1550, 4700), 7000, 7000))
+        save_gif(state, [cel for _, cel, _ in timeline], [duration for _, _, duration in timeline])
 
 
 if __name__ == "__main__":

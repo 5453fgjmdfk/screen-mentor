@@ -154,10 +154,12 @@ class PeekFrames:
         self.cels = blink_cels(self.still, bottom) if skin.path == ART else (self.still,)
         path = skin.path / ("bottom.gif" if bottom else "side.gif")
         self.movie = open_movie(path, owner, QSize(164, 168)) if path.is_file() else None
+        if self.movie is not None:
+            self.movie.frameChanged.connect(owner.update)
 
     def start(self):
         if self.movie is not None:
-            self.movie.jumpToFrame(0)
+            self.movie.stop()
             self.movie.start()
 
     def stop(self):

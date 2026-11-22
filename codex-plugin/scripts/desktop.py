@@ -1,10 +1,13 @@
 """Resident Windows application for chat and external-agent practice."""
 from functools import partial
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sqlite3
 import sys
 from threading import Event, Thread
+import traceback
 from uuid import uuid4
 
 from capture import enable_dpi_awareness
@@ -744,12 +747,34 @@ class Desktop(QObject):
                     self.show_manager()
                 result = {"shown": True}
             else:
-                result = self.engine.respond(request, owner)
+                def disconnected():
+                    return sip.isdeleted(socket) or socket.state() != QLocalSocket.LocalSocketState.ConnectedState
+
+                result = self.engine.respond(request, owner, disconnected=disconnected)
         except (KeyError, AttributeError, TypeError, ValueError):
             result = {"error": {"code": -32600, "message": "Invalid request"}}
         if not sip.isdeleted(socket) and socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
             socket.write(json.dumps(result, ensure_ascii=False).encode() + b"\n")
             socket.disconnectFromServer()
+
+
+def log_unexpected_errors():
+    """Keep crash locations without retaining prompts, screenshots, or exception messages."""
+    logger = logging.getLogger("screen_mentor")
+    try:
+        handler = RotatingFileHandler(PROFILE / "desktop-errors.log", maxBytes=65536, backupCount=1,
+                                      encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger.addHandler(handler)
+
+    def report(error_type, _error, stack):
+        locations = " > ".join(f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                               for frame in traceback.extract_tb(stack))
+        logger.error("%s %s", error_type.__name__, locations)
+
+    sys.excepthook = report
 
 
 def main(*, initial_page=None):
@@ -765,19 +790,21 @@ def main(*, initial_page=None):
             if socket:
                 roundtrip(socket, {"owner": "desktop", "request": {"method": "show_desktop", "page": initial_page}})
         return 0
+    log_unexpected_errors()
     desktop = Desktop(app)
-    QLocalServer.removeServer(CHANNEL)
-    if not desktop.listener.listen(CHANNEL):
-        return 1
-    if "--background" not in sys.argv:
-        if initial_page == "appearance":
-            desktop.show_appearance()
-        else:
-            desktop.show_manager()
     try:
+        QLocalServer.removeServer(CHANNEL)
+        if not desktop.listener.listen(CHANNEL):
+            return 1
+        if "--background" not in sys.argv:
+            if initial_page == "appearance":
+                desktop.show_appearance()
+            else:
+                desktop.show_manager()
         return app.exec()
     finally:
         desktop.listener.close()
+        desktop.engine.practice.stop_worker()
         lock.unlock()
 
 

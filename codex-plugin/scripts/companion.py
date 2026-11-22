@@ -618,14 +618,28 @@ class CompanionPanel(QWidget):
                 self.sprite.setText("学伴")
                 return
         self.ready_timer.stop()
-        if self.state is not None:
-            self.anims[self.state].stop()
+        previous = self.sprite.movie()
+        if previous is not None:
+            previous.stop()
         self.state = state
-        self.sprite.setMovie(movie)
-        movie.jumpToFrame(0)
         movie.start()
+        if not self.isVisible():
+            movie.setPaused(True)
+        self.sprite.setMovie(movie)
         if state == "ready":
             self.ready_timer.start()
+
+    def showEvent(self, event):
+        movie = self.sprite.movie()
+        if movie is not None and movie.state() == movie.MovieState.Paused:
+            movie.setPaused(False)
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        movie = self.sprite.movie()
+        if movie is not None and movie.state() == movie.MovieState.Running:
+            movie.setPaused(True)
+        super().hideEvent(event)
 
     def eventFilter(self, target, event):
         if target in self.drag_handles and self.drag_window(target, event):

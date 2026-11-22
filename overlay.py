@@ -41,19 +41,6 @@ def virtual_geometry() -> QRect:
     return geo
 
 
-def _anchor_on_rect(rect: QRectF, toward: QPointF) -> QPointF:
-    """求矩形边框上离 toward 最近的点（用来当箭头起点）。"""
-    cx, cy = rect.center().x(), rect.center().y()
-    dx, dy = toward.x() - cx, toward.y() - cy
-    if abs(dx) < 1e-6 and abs(dy) < 1e-6:
-        return QPointF(cx, cy)
-    hw, hh = rect.width() / 2, rect.height() / 2
-    sx = hw / abs(dx) if abs(dx) > 1e-6 else float("inf")
-    sy = hh / abs(dy) if abs(dy) > 1e-6 else float("inf")
-    s = min(sx, sy)
-    return QPointF(cx + dx * s, cy + dy * s)
-
-
 class GuideOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__(
@@ -161,9 +148,11 @@ class GuideOverlay(QWidget):
 
     def restore_guide(self) -> None:
         if self.has_guide:
-            self.show()
-            self.raise_()
-            self.update()
+            self._reveal(0)
+
+    def hideEvent(self, event) -> None:
+        self._anim.stop()
+        super().hideEvent(event)
 
     # ---------- 内部 ----------
 
@@ -183,7 +172,10 @@ class GuideOverlay(QWidget):
 
     def _tick(self) -> None:
         self._phase = (self._phase + 0.09) % (math.pi * 4)
-        if self._mode:
+        if self.has_guide and self._rect is not None:
+            region = QRectF(self._rect.center(), self._drag_to).normalized() if self._drag_to else self._rect
+            self.update(region.adjusted(-27, -27, 50, 50).toAlignedRect())
+        elif self._mode:
             self.update()
 
     # ---------- 绘制 ----------
@@ -250,19 +242,15 @@ class GuideOverlay(QWidget):
             card.moveTo(min(max(where.x() - card.width() / 2, 16), self.width() - card.width() - 16),
                         min(max(where.y(), 16), self.height() - card.height() - 16))
 
-        if target is not None and self._drag_to is not None:
-            p.setPen(QPen(ACCENT.lighter(140), 2))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(self._drag_to, 8, 8)
+        if target is not None:
             self._paint_target(p, target)
-            self._paint_mouse_demo(p, center, self._drag_to)
-        elif target is not None and self._mark_target:
-            self._paint_target(p, target)
-            self._paint_mouse_demo(p, center)
-        elif target is not None:
-            start = _anchor_on_rect(QRectF(card), center)
-            end = _anchor_on_rect(QRectF(target), start)
-            self._paint_arrow(p, start, end)
+            if self._drag_to is not None:
+                p.setPen(QPen(ACCENT.lighter(140), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(self._drag_to, 8, 8)
+                self._paint_mouse_demo(p, center, self._drag_to)
+            elif self._mark_target:
+                self._paint_mouse_demo(p, center)
 
         self._paint_card(p, card, inner)
 
@@ -303,52 +291,14 @@ class GuideOverlay(QWidget):
         p.drawPolygon(pointer)
         p.restore()
 
-    def _paint_arrow(self, p: QPainter, a: QPointF, b: QPointF) -> None:
-        dx, dy = b.x() - a.x(), b.y() - a.y()
-        dist = max(1.0, math.hypot(dx, dy))
-        # 稍微拐个弯，别像一根钢筋
-        nx, ny = -dy / dist, dx / dist
-        ctrl = QPointF(
-            (a.x() + b.x()) / 2 + nx * dist * 0.12,
-            (a.y() + b.y()) / 2 + ny * dist * 0.12,
-        )
-        path = QPainterPath(a)
-        path.quadTo(ctrl, b)
-
-        glow = QPen(QColor(10, 18, 34, 100), 4)
-        glow.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.strokePath(path, glow)
-
-        pen = QPen(ACCENT, 1.8)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.strokePath(path, pen)
-
-        # 箭头尖
-        ang = math.atan2(b.y() - ctrl.y(), b.x() - ctrl.x())
-        size = 7.5
-        head = QPolygonF(
-            [
-                b,
-                QPointF(
-                    b.x() - size * math.cos(ang - 0.42),
-                    b.y() - size * math.sin(ang - 0.42),
-                ),
-                QPointF(
-                    b.x() - size * math.cos(ang + 0.42),
-                    b.y() - size * math.sin(ang + 0.42),
-                ),
-            ]
-        )
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(ACCENT)
-        p.drawPolygon(head)
-
     def _paint_target(self, p: QPainter, target: QRectF) -> None:
         radius = min(4.0, target.width() / 4, target.height() / 4)
         p.setPen(QPen(QColor(15, 24, 40, 165), 3.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(target, radius, radius)
-        p.setPen(QPen(ACCENT.lighter(130), 1.7))
+        outline = QPen(ACCENT.lighter(130), 1.7)
+        outline.setDashPattern([7, 5])
+        p.setPen(outline)
         p.drawRoundedRect(target, radius, radius)
 
     def _paint_card(self, p: QPainter, card: QRectF, inner: int) -> None:

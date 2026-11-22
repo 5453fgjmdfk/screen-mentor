@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QVBoxLayout, QWidget,
 )
 
+from agent_config import CLIENTS, configuration
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position, style_row_views
 from resident_agent import MAX_INPUT, excerpt, model_url
@@ -818,6 +819,7 @@ class ManagerWindow(QDialog):
         general = self.settings_section("通用")
         pets = self.settings_section("桌宠")
         workspace = self.settings_section("工作空间")
+        self.add_agent_settings(self.settings_section("Agent 接入"))
         self.theme = QComboBox()
         for key, (name, _) in PANEL_THEMES.items():
             self.theme.addItem(name, key)
@@ -889,6 +891,39 @@ class ManagerWindow(QDialog):
         self.settings_tabs.currentChanged.connect(self.show_settings_actions)
         return page
 
+    def add_agent_settings(self, form):
+        self.agent_tab = self.settings_tabs.count() - 1
+        self.agent_client = QComboBox()
+        for key, name, help_text in CLIENTS:
+            self.agent_client.addItem(name, (key, help_text))
+        form.addRow("客户端", self.agent_client)
+        self.agent_help = label("", "quiet")
+        form.addRow(self.agent_help)
+        self.agent_config = QPlainTextEdit()
+        self.agent_config.setReadOnly(True)
+        self.agent_config.setAccessibleName("本机 MCP 配置")
+        form.addRow(self.agent_config)
+        row = QHBoxLayout()
+        row.addWidget(button("复制配置", self.copy_agent_config, primary=True))
+        row.addStretch()
+        form.addRow(row)
+        self.agent_tip = label("", "notice")
+        form.addRow(self.agent_tip)
+        form.addRow(label("客户端连接后，在原对话里请它用屏幕伴学带你练习指定窗口。"
+                          "需要能在本机启动 MCP，并能读取工具返回的图片。", "quiet"))
+        self.agent_client.currentIndexChanged.connect(self.show_agent_config)
+        self.show_agent_config()
+
+    def show_agent_config(self):
+        client, help_text = self.agent_client.currentData()
+        self.agent_help.setText(help_text)
+        self.agent_config.setPlainText(configuration(client))
+        self.agent_tip.clear()
+
+    def copy_agent_config(self):
+        QGuiApplication.clipboard().setText(self.agent_config.toPlainText())
+        self.agent_tip.setText("已复制。合并后重新加载客户端的 MCP 工具。")
+
     def settings_section(self, name):
         panel = QWidget()
         form = QFormLayout(panel)
@@ -898,7 +933,7 @@ class ManagerWindow(QDialog):
         return form
 
     def show_settings_actions(self, index):
-        self.settings_save.setVisible(index != 0)
+        self.settings_save.setVisible(index not in (0, self.agent_tab))
         self.settings_notice.clear()
 
     def show_theme_color(self, theme):

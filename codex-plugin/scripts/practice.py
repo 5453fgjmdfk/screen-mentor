@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 
 import native
 from companion import CompanionAction, CompanionPanel, style_row_views
-from window_reader import WindowReader
+from window_reader import CAPTURE_DEADLINE, WindowReader
 
 
 CHAT_LEASE_SECONDS = 120
@@ -104,7 +104,12 @@ class Practice(QObject):
             self.begin(scope)
         self.sampled.connect(self.accept_sample)
         self.capture_failed.connect(self.note_capture_failure)
-        Thread(target=self.watch, daemon=True).start()
+        self.worker = Thread(target=self.watch, daemon=True, name="mentor-capture")
+        self.worker.start()
+
+    def stop_worker(self):
+        self.shutdown.set()
+        self.worker.join(timeout=CAPTURE_DEADLINE + 1)
 
     def reset_capture(self):
         self.last_poll = time.monotonic()
@@ -243,13 +248,16 @@ class Practice(QObject):
                 try:
                     bounds = native.window_state(hwnd)
                     raw = reader.read(hwnd, *bounds[2:4])
-                    if generation != self.capture_generation or not self.running.is_set() or scope.active() != hwnd:
+                    if (self.shutdown.is_set() or generation != self.capture_generation
+                            or not self.running.is_set() or scope.active() != hwnd):
                         continue
                     preview = raw.copy()
                     preview.thumbnail((1440, 1000), Image.Resampling.LANCZOS)
                     key = preview.convert("L").resize((144, 90), Image.Resampling.BILINEAR)
                     self.sampled.emit(generation, (hwnd, bounds, preview, key, raw))
                 except native.WindowError as exc:
+                    if self.shutdown.is_set():
+                        break
                     self.capture_failed.emit(generation, str(exc))
                     if self.shutdown.wait(.6):
                         break
@@ -259,8 +267,9 @@ class Practice(QObject):
             if self.running.is_set() and time.monotonic() - self.last_poll < CHAT_LEASE_SECONDS:
                 if frame is None:
                     self.capture_error = None
-                    self.set_progress()
-                    self.set_status("等待练习窗口回到前台。")
+                    if self.progress_text:
+                        self.set_progress()
+                    # Keep the instruction readable while the user visits another window.
                 elif self.capture_error:
                     self.capture_error = None
                     self.set_status("画面已恢复，正在查看下一步。")
@@ -317,10 +326,13 @@ class Practice(QObject):
         self.wake.emit()
 
     def set_status(self, text, *, bottom=None):
+        if self.status.text() == text and bottom is None:
+            return
         if bottom is None:
             bottom = self.panel.y() + self.panel.height()
-        self.status.setText(text)
-        self.fit_text(self.status, text, 8)
+        if self.status.text() != text:
+            self.status.setText(text)
+            self.fit_text(self.status, text, 8)
         self.fit_panel(bottom)
 
     @staticmethod
@@ -339,10 +351,12 @@ class Practice(QObject):
         self.sync_edge_thought()
         if self.panel.isVisible() and not self.panel.moving:
             top = self.panel.screen().availableGeometry().top()
-            self.panel.move(self.panel.x(), max(top, bottom - self.panel.height()))
+            y = max(top, bottom - self.panel.height())
+            if y != self.panel.y():
+                self.panel.move(self.panel.x(), y)
 
-    def set_progress(self, text="", *, pose="thinking", label=""):
-        self.panel.set_pose(pose if text else "idle")
+    def set_progress(self, text="", *, pose=None, label=""):
+        self.panel.set_pose(pose or ("thinking" if text else "idle"))
         if text == self.progress_text and label == self.progress_label:
             return
         bottom = self.panel.y() + self.panel.height()
@@ -379,14 +393,13 @@ class Practice(QObject):
             self.sync_edge_thought()
 
     def show_instruction(self, text, text_to_type=""):
-        self.set_progress()
+        self.set_progress(pose="ready")
         bottom = self.panel.y() + self.panel.height()
         if self.input_value.toPlainText() != text_to_type:
             self.input_value.setPlainText(text_to_type)
             self.copy_button.setText("复制")
         self.copy_area.setVisible(bool(text_to_type))
         self.set_status(text, bottom=bottom)
-        self.panel.set_pose("ready")
 
     def copy_input(self):
         QApplication.clipboard().setText(self.input_value.toPlainText())
