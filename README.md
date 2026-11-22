@@ -4,6 +4,8 @@
 
 Windows 桌面学伴。可以独立聊天和记事，也可以在已有的 Codex 对话里接着练习。同一个浮窗会显示步骤、键盘快捷键和可复制文字，点击和拖动由你自己完成。
 
+**当前版本 v0.11.2**。更换抽象应用图标。
+
 ## 下载与安装
 
 从 [GitHub Releases](https://github.com/5453fgjmdfk/screen-mentor/releases) 下载 Windows ZIP 并解压。需要 Windows 和 Python 3.11+，安装时会下载独立环境的依赖。

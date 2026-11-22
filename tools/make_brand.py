@@ -6,7 +6,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 
-INK = "#211735"
 PLUM = "#694999"
 LILAC = "#b798f0"
 ICE = "#f3eaff"
@@ -14,34 +13,19 @@ MINT = "#a9ebd8"
 
 
 def make_icon():
-    image = Image.new("RGBA", (512, 512))
-    background = Image.new("RGBA", image.size)
-    color = ImageDraw.Draw(background)
-    for y in range(background.height):
-        amount = y / 511
-        color.line((0, y, 512, y), fill=tuple(round(a * (1 - amount) + b * amount)
-                                             for a, b in zip((65, 43, 98), (28, 23, 47))))
-    mask = Image.new("L", image.size)
-    ImageDraw.Draw(mask).rounded_rectangle((14, 14, 498, 498), radius=120, fill=255)
-    image.paste(background, mask=mask)
+    image = Image.new("RGBA", (1024, 1024))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((19, 19, 493, 493), radius=115, outline="#7961a5", width=5)
 
-    for x, y, sx, sy in ((102, 113, 1, 1), (410, 113, -1, 1),
-                         (102, 399, 1, -1), (410, 399, -1, -1)):
-        draw.line((x + sx * 50, y, x, y, x, y + sy * 50), fill=LILAC, width=17, joint="curve")
-        draw.ellipse((x - 8, y - 8, x + 8, y + 8), fill=LILAC)
+    def rounded(box, radius, color):
+        draw.rounded_rectangle(tuple(value * 2 for value in box), radius=radius * 2, fill=color)
 
-    draw.polygon(((162, 240), (141, 189), (158, 150), (183, 208), (208, 233)), fill=MINT)
-    draw.polygon(((350, 240), (371, 189), (354, 150), (329, 208), (304, 233)), fill=MINT)
-    draw.ellipse((143, 205, 369, 362), fill="#6e55aa")
-    draw.ellipse((143, 196, 369, 349), fill=ICE)
-    draw.rounded_rectangle((200, 249, 221, 285), radius=10, fill=PLUM)
-    draw.rounded_rectangle((291, 249, 312, 285), radius=10, fill=PLUM)
-    draw.arc((236, 270, 277, 299), 19, 161, fill=PLUM, width=7)
-    draw.ellipse((397, 193, 419, 215), fill=MINT)
-    draw.ellipse((429, 165, 442, 178), fill=MINT)
-    return image
+    rounded((16, 16, 496, 496), 106, "#283D4A")
+    frame = "#E5ECEF"
+    for box in ((123, 123, 251, 161), (123, 123, 161, 251),
+                (261, 351, 389, 389), (351, 261, 389, 389)):
+        rounded(box, 19, frame)
+    rounded((210, 220, 306, 292), 15, "#9CB9C7")
+    return image.resize((512, 512), Image.Resampling.LANCZOS)
 
 
 def make_portrait(side, closed):
