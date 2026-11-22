@@ -10,7 +10,7 @@ from uuid import uuid4
 from PyQt6.QtCore import QCoreApplication
 from PyQt6.QtNetwork import QLocalSocket
 
-from protocol import discovery
+from protocol import discovery, validated_arguments
 from resident_agent import PROFILE
 
 
@@ -61,6 +61,19 @@ def ensure_desktop():
     raise ValueError("无法启动桌面学伴，可从桌面快捷方式打开后再试。")
 
 
+def handle_call(request, owner):
+    params = request.get("params")
+    if request.get("method") == "tools/call" and isinstance(params, dict):
+        if params.get("name") == "wait_for_practice_change":
+            validated_arguments("wait_for_practice_change", params.get("arguments", {}))
+            socket = connect()
+            if socket is None:
+                return {"jsonrpc": "2.0", "id": request["id"], "result": {
+                    "content": [{"type": "text", "text": json.dumps({"state": "ended"})}]}}
+            return roundtrip(socket, {"owner": owner, "request": request})
+    return roundtrip(ensure_desktop(), {"owner": owner, "request": request})
+
+
 def main():
     app = QCoreApplication(sys.argv[:1])
     owner = uuid4().hex
@@ -74,7 +87,7 @@ def main():
         try:
             response = discovery(request)
             if response is None:
-                response = roundtrip(ensure_desktop(), {"owner": owner, "request": request})
+                response = handle_call(request, owner)
         except (OSError, ValueError) as error:
             response = {"jsonrpc": "2.0", "id": request["id"],
                         "error": {"code": -32001, "message": str(error)}}

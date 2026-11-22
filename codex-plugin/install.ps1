@@ -77,7 +77,7 @@ $files = @(
     'scripts/native.py', 'scripts/server.py', 'scripts/practice.py', 'scripts/target.py',
     'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py',
     'scripts/desktop.py', 'scripts/bridge.py', 'scripts/protocol.py', 'scripts/resident_agent.py',
-    'scripts/manager.py', 'scripts/team.py',
+    'scripts/manager.py', 'scripts/team.py', 'scripts/scheduled.py',
     'assets/app-icon.ico', 'assets/app-icon.png', 'assets/companion/idle.gif', 'assets/companion/reading.gif',
     'assets/companion/ready.gif', 'assets/companion/thinking.gif', 'assets/companion/peek-poses.png',
     'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md'

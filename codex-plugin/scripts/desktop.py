@@ -23,6 +23,7 @@ from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from companion import fit_position
 from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
+from scheduled import TaskScheduler
 from server import MentorServer
 from team import PRIMARY, TeamCoordinator, TeamStore
 
@@ -380,10 +381,12 @@ class Desktop(QObject):
         self.manager = None
         self.quick_chat = None
         self.chat_bubbles = set()
+        self.exiting = False
         self.pets = {}
         self.agent_settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.team = TeamCoordinator(TeamStore(PROFILE / "team.sqlite3"), PROFILE / "team.ini",
                                     self.model_settings, self.quiet_ready, self)
+        self.scheduler = TaskScheduler(self.team, self)
         self.team.line.connect(self.show_team_line)
         self.main_line = ""
         self.main_bubble_timer = QTimer(self)
@@ -395,7 +398,7 @@ class Desktop(QObject):
         self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
-        self.engine.practice.panel.closed.connect(app.quit)
+        self.engine.practice.panel.closed.connect(self.quit)
         self.engine.management_requested.connect(self.show_manager)
         self.listener = QLocalServer(self)
         self.listener.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
@@ -406,7 +409,7 @@ class Desktop(QObject):
         self.menu.addAction("管理面板", self.show_manager)
         self.menu.addAction("日常对话", self.show_chat)
         self.menu.addAction("桌宠外观", lambda: self.show_appearance())
-        self.menu.addAction("退出桌面学伴", self.app.quit)
+        self.menu.addAction("退出桌面学伴", self.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
         self.tray.show()
@@ -424,6 +427,28 @@ class Desktop(QObject):
         if self.manager is None:
             self.manager = ManagerWindow(self.team, self)
         return self.manager
+
+    def hide_to_tray(self):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.manager.hide()
+        else:
+            self.manager.showMinimized()
+
+    def quit(self):
+        if self.exiting:
+            return
+        self.exiting = True
+        self.engine.practice.shutdown.set()
+        self.engine.practice.close()
+        self.scheduler.stop()
+        self.team.stop()
+        self.team.timer.stop()
+        for chat in self.member_chats.values():
+            chat.cancel.set()
+        if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
+            self.quick_chat.close()
+        self.tray.hide()
+        self.app.quit()
 
     def show_appearance(self, key=PRIMARY):
         self.show_manager()
@@ -561,6 +586,8 @@ class Desktop(QObject):
             self.show_manager()
 
     def after_session(self):
+        if self.exiting:
+            return
         self.team.set_blocked(False)
         for pet in self.pets.values():
             pet.suspend(False)

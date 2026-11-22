@@ -1,24 +1,26 @@
 """Native management panel and desktop views for companion members."""
 from dataclasses import replace
+from datetime import datetime
 import sqlite3
 from uuid import uuid4
 
-from PyQt6.QtCore import QPoint, QSignalBlocker, QTimer, Qt
+from PyQt6.QtCore import QDateTime, QPoint, QSignalBlocker, QTimer, Qt
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDateTimeEdit, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position
 from resident_agent import excerpt
+from scheduled import FREQUENCIES, MODES, ScheduledTask
 from team import MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, Member, PRIMARY
 
 
 PANEL_STYLE = """
 QDialog, QWidget#panel {background:#1a232b;color:#e5edf1;}
-QLabel, QLineEdit, QPlainTextEdit, QListWidget, QPushButton, QCheckBox, QComboBox, QSpinBox {
+QLabel, QLineEdit, QPlainTextEdit, QListWidget, QPushButton, QCheckBox, QComboBox, QSpinBox, QDateTimeEdit {
     color:#e5edf1;font:13px 'Microsoft YaHei UI';
 }
 QLabel#title {font-size:23px;font-weight:600;}
@@ -27,7 +29,7 @@ QLabel#quiet {color:#a7bbc7;}
 QLabel#notice {color:#b2ccd9;}
 QFrame#rail {background:#202b35;border:1px solid #354752;border-radius:14px;}
 QFrame#card {background:#222f3a;border:1px solid #344754;border-radius:13px;}
-QListWidget, QPlainTextEdit, QLineEdit, QComboBox, QSpinBox {
+QListWidget, QPlainTextEdit, QLineEdit, QComboBox, QSpinBox, QDateTimeEdit {
     background:#1d2933;border:1px solid #3f5360;border-radius:8px;padding:7px;selection-background-color:#416272;
 }
 QListWidget#nav {background:transparent;border:0;}
@@ -201,6 +203,66 @@ class MemberDialog(QDialog):
         self.accept()
 
 
+class ScheduledTaskDialog(QDialog):
+    def __init__(self, parent, task, persist):
+        super().__init__(parent)
+        self.setWindowTitle("编辑定时任务" if task else "新建定时任务")
+        self.setMinimumWidth(480)
+        self.persist = persist
+        self.key = task.key if task else uuid4().hex
+        form = QFormLayout(self)
+        self.name = QLineEdit(task.name if task else "")
+        self.name.setMaxLength(50)
+        self.prompt = QPlainTextEdit(task.prompt if task else "")
+        self.prompt.setPlaceholderText("例如：出 3 道运放题，最后附上核对提示。")
+        self.prompt.setFixedHeight(100)
+        when = task.next_at if task else QDateTime.currentDateTime().addSecs(300).toPyDateTime()
+        if task and not task.enabled and when < datetime.now():
+            when = QDateTime.currentDateTime().addSecs(300).toPyDateTime()
+        self.when = QDateTimeEdit(QDateTime(when))
+        self.when.setCalendarPopup(True)
+        self.when.setDisplayFormat("yyyy-MM-dd HH:mm")
+        self.frequency = QComboBox()
+        for days, name in FREQUENCIES.items():
+            self.frequency.addItem(name, days)
+        self.mode = QComboBox()
+        for mode, name in MODES.items():
+            self.mode.addItem(name, mode)
+        self.mode.setToolTip("并行协作由主学伴带队，使用当前启用的前三位子成员。")
+        if task:
+            self.frequency.setCurrentIndex(self.frequency.findData(task.repeat_days))
+            self.mode.setCurrentIndex(self.mode.findData(task.mode))
+        self.enabled = QCheckBox("保存后启用")
+        self.enabled.setChecked(task is None or task.enabled)
+        form.addRow("名称", self.name)
+        form.addRow("任务内容", self.prompt)
+        form.addRow("执行时间", self.when)
+        form.addRow("重复", self.frequency)
+        form.addRow("执行方式", self.mode)
+        form.addRow(self.enabled)
+        self.notice = label("", "notice")
+        form.addRow(self.notice)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("取消", self.reject))
+        actions.addWidget(button("保存任务", self.save, primary=True))
+        form.addRow(actions)
+
+    def save(self):
+        when = self.when.dateTime().toPyDateTime().replace(second=0, microsecond=0, tzinfo=None)
+        if self.enabled.isChecked() and when < datetime.now().replace(second=0, microsecond=0):
+            self.notice.setText("请选择当前或之后的时间。")
+            return
+        task = ScheduledTask(self.key, self.name.text().strip(), self.prompt.toPlainText().strip(),
+                             when, self.frequency.currentData(), self.mode.currentData(), self.enabled.isChecked())
+        try:
+            self.persist(task)
+        except (ValueError, sqlite3.Error) as error:
+            self.notice.setText(str(error))
+            return
+        self.accept()
+
+
 class ManagerWindow(QDialog):
     def __init__(self, team, desktop):
         super().__init__()
@@ -224,7 +286,9 @@ class ManagerWindow(QDialog):
         self.nav.setObjectName("nav")
         self.nav.setAccessibleName("管理面板导航")
         nav_layout.addWidget(self.nav, 1)
-        self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊"])
+        self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊", "定时任务"])
+        nav_layout.addWidget(button("收起到托盘", self.desktop.hide_to_tray))
+        nav_layout.addWidget(button("退出桌面学伴", self.desktop.quit))
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
         self.pages.addWidget(self.home_page())
@@ -234,12 +298,16 @@ class ManagerWindow(QDialog):
         self.appearance_index = self.pages.addWidget(self.appearance_page())
         self.model_index = self.pages.addWidget(self.model_page())
         self.pages.addWidget(self.schedule_page())
+        self.tasks_index = self.pages.addWidget(self.tasks_page())
         self.nav.currentRowChanged.connect(self.switch_page)
         self.nav.setCurrentRow(0)
         self.team.changed.connect(self.refresh)
         self.team.line.connect(self.add_line)
         self.team.notice.connect(self.show_notice)
+        self.desktop.scheduler.changed.connect(self.load_tasks)
+        self.desktop.scheduler.notice.connect(self.tasks_notice.setText)
         self.reload_members()
+        self.load_tasks()
         self.refresh()
 
     def page(self, title):
@@ -255,6 +323,8 @@ class ManagerWindow(QDialog):
         self.pages.setCurrentIndex(index)
         if index == self.chat_index:
             self.select_chat()
+        elif index == self.tasks_index:
+            self.load_tasks()
 
     def home_page(self):
         page, layout = self.page("桌面学伴")
@@ -277,6 +347,7 @@ class ManagerWindow(QDialog):
         layout.addLayout(row)
         row.addWidget(button("长期记忆", lambda: self.desktop.show_member_memory(PRIMARY)))
         row.addWidget(button("桌宠外观", lambda: self.open_appearance(PRIMARY)))
+        row.addWidget(button("定时任务", lambda: self.nav.setCurrentRow(self.tasks_index)))
         row.addStretch()
         layout.addStretch()
         return page
@@ -457,6 +528,11 @@ class ManagerWindow(QDialog):
         self.casual_interval.setSuffix(" 分钟")
         self.casual_interval.setValue(interval)
         form.addRow("间隔", self.casual_interval)
+        layout.addWidget(label("闲聊话题", "section"))
+        self.casual_topics = QPlainTextEdit(self.team.custom_topics())
+        self.casual_topics.setAccessibleName("自定义闲聊话题")
+        self.casual_topics.setPlaceholderText("每行一个话题，留空使用内置话题。\n例如：新手怎么练习读电路图？")
+        layout.addWidget(self.casual_topics, 1)
         actions = QHBoxLayout()
         layout.addLayout(actions)
         self.try_chat = button("聊一次", self.try_casual)
@@ -465,19 +541,129 @@ class ManagerWindow(QDialog):
         actions.addStretch()
         self.casual_notice = label("", "notice")
         layout.addWidget(self.casual_notice)
-        layout.addStretch()
         return page
 
     def save_schedule(self):
+        try:
+            self.team.set_topics(self.casual_topics.toPlainText())
+        except ValueError as error:
+            self.casual_notice.setText(str(error))
+            return
         self.team.set_schedule(self.casual_enabled.isChecked(), self.casual_interval.value())
-        self.casual_notice.setText("定时闲聊已开启。" if self.casual_enabled.isChecked() else "定时闲聊已关闭。")
+        self.casual_notice.setText("话题已保存，定时闲聊已开启。" if self.casual_enabled.isChecked()
+                                   else "话题已保存，可随时点「聊一次」。")
         self.refresh()
 
     def try_casual(self):
         try:
-            self.team.casual()
+            self.team.casual(self.team.parse_topics(self.casual_topics.toPlainText()))
         except (ValueError, sqlite3.Error) as error:
             self.casual_notice.setText(str(error))
+
+    def tasks_page(self):
+        page, layout = self.page("定时任务")
+        layout.addWidget(label("按电脑本地时间执行。收起到托盘后继续运行，伴学或聊天时会等到空闲。", "quiet"))
+        self.task_list = QListWidget()
+        self.task_list.setAccessibleName("定时任务列表")
+        self.task_list.setMinimumHeight(75)
+        layout.addWidget(self.task_list, 1)
+        actions = QHBoxLayout()
+        self.edit_task_button = button("编辑", lambda: self.edit_task(self.current_task()))
+        self.toggle_task_button = button("暂停计划", self.toggle_task)
+        self.stop_task_button = button("停止本次", self.team.stop)
+        self.remove_task_button = button("移除", self.remove_task)
+        for control in (self.edit_task_button, self.toggle_task_button, self.stop_task_button, self.remove_task_button):
+            actions.addWidget(control)
+        actions.addStretch()
+        actions.addWidget(button("新建任务", lambda: self.edit_task(), primary=True))
+        layout.addLayout(actions)
+        layout.addWidget(label("最近一次执行", "section"))
+        self.tasks_notice = label("", "notice")
+        layout.addWidget(self.tasks_notice)
+        self.task_result = QPlainTextEdit()
+        self.task_result.setReadOnly(True)
+        self.task_result.setAccessibleName("定时任务的最近一次执行结果")
+        self.task_result.setPlaceholderText("选中任务即可查看结果。")
+        layout.addWidget(self.task_result, 1)
+        self.task_list.currentItemChanged.connect(self.show_task_result)
+        self.task_list.itemDoubleClicked.connect(lambda: self.edit_task(self.current_task()))
+        return page
+
+    def current_task(self):
+        item = self.task_list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def load_tasks(self):
+        previous = self.current_task()
+        try:
+            tasks = self.desktop.scheduler.tasks()
+        except sqlite3.Error as error:
+            self.tasks_notice.setText(str(error))
+            return
+        with QSignalBlocker(self.task_list):
+            self.task_list.clear()
+            for task in tasks:
+                if task.enabled:
+                    next_run = f"下次 {task.next_at:%Y-%m-%d %H:%M}"
+                else:
+                    next_run = "已结束" if not task.repeat_days and task.last_round else "已暂停"
+                item = QListWidgetItem(f"{task.name}\n{FREQUENCIES[task.repeat_days]} · {MODES[task.mode]} · {next_run}")
+                item.setData(Qt.ItemDataRole.UserRole, task)
+                self.task_list.addItem(item)
+                if previous and task.key == previous.key:
+                    self.task_list.setCurrentItem(item)
+            if self.task_list.currentRow() < 0 and self.task_list.count():
+                self.task_list.setCurrentRow(0)
+        self.show_task_result()
+
+    def show_task_result(self):
+        task = self.current_task()
+        for control in (self.edit_task_button, self.toggle_task_button, self.remove_task_button):
+            control.setEnabled(task is not None)
+        self.stop_task_button.setEnabled(bool(task and task.last_round and
+                                             task.last_round == self.desktop.scheduler.active_round))
+        if task is None:
+            self.tasks_notice.setText("还没有定时任务。")
+            self.task_result.clear()
+            return
+        self.toggle_task_button.setText("暂停计划" if task.enabled else "启用计划")
+        self.tasks_notice.setText(task.last_status or "尚未执行。")
+        try:
+            rows = self.team.store.lines(round_id=task.last_round) if task.last_round else []
+        except sqlite3.Error as error:
+            self.tasks_notice.setText(str(error))
+            return
+        self.task_result.setPlainText("\n\n".join(f"{row['speaker']}\n{row['body']}" for row in rows))
+
+    def edit_task(self, task=None):
+        dialog = ScheduledTaskDialog(self, task, self.desktop.scheduler.save)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def toggle_task(self):
+        task = self.current_task()
+        if task is None:
+            return
+        if not task.enabled and not task.repeat_days and task.last_round:
+            self.edit_task(task)
+            return
+        try:
+            self.desktop.scheduler.save(replace(task, enabled=not task.enabled))
+        except sqlite3.Error as error:
+            self.tasks_notice.setText(str(error))
+
+    def remove_task(self):
+        task = self.current_task()
+        if task is None:
+            return
+        reply = QMessageBox.question(self, "移除定时任务", f"移除「{task.name}」？群聊中的执行记录会保留。",
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                self.desktop.scheduler.remove(task.key)
+            except sqlite3.Error as error:
+                self.tasks_notice.setText(str(error))
 
     def selected(self):
         return [self.participants.item(index).data(Qt.ItemDataRole.UserRole)
@@ -547,6 +733,9 @@ class ManagerWindow(QDialog):
 
     def add_line(self, key, name, body):
         self.refresh_history()
+        task = self.current_task()
+        if task and task.last_round and task.last_round == self.desktop.scheduler.active_round:
+            self.show_task_result()
 
     def refresh_history(self):
         kinds = {"task": "接力", "parallel": "并行协作", "chat": "群聊", "casual": "闲聊"}

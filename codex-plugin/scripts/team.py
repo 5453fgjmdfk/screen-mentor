@@ -1,8 +1,8 @@
 """Local companion roster, shared conversation and bounded group turns."""
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import dataclass
 import json
+from queue import Queue
 import re
 import sqlite3
 from threading import Event, Thread
@@ -19,6 +19,8 @@ MAX_SPEAKERS = 4
 MAX_WORKERS = 3
 MIN_INTERVAL = 15
 MAX_INTERVAL = 240
+MAX_TOPICS = 30
+MAX_TOPIC_LENGTH = 120
 TOPICS = (
     "聊聊你们各自觉得练习新软件时最舒服的节奏。",
     "用几句话聊聊今天想学的小知识。",
@@ -117,16 +119,22 @@ class TeamStore:
                 raise ValueError("找不到选中的桌宠。")
             db.execute("INSERT OR REPLACE INTO member_appearance(member_key, palette) VALUES (?, ?)", (key, palette))
 
-    def lines(self, limit=80, *, kinds=()):
+    def lines(self, limit=80, *, kinds=(), round_id=None):
         query = """
             SELECT room.*, CASE WHEN parallel_round.id IS NULL THEN room.kind ELSE 'parallel' END AS display_kind
             FROM room LEFT JOIN parallel_round ON room.round = parallel_round.id
         """
-        params = ()
+        where = []
+        params = []
         if kinds:
             placeholders = ", ".join("?" for _ in kinds)
-            query += f" WHERE kind IN ({placeholders})"
-            params = kinds
+            where.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        if round_id:
+            where.append("room.round = ?")
+            params.append(round_id)
+        if where:
+            query += " WHERE " + " AND ".join(where)
         with closing(self.connect()) as db:
             rows = db.execute(query + " ORDER BY room.id DESC LIMIT ?", (*params, limit))
             return list(reversed(list(rows)))
@@ -173,6 +181,23 @@ class TeamCoordinator(QObject):
         self.settings.sync()
         self.configure_timer()
 
+    def custom_topics(self):
+        return self.settings.value("casual_topics", "", type=str)
+
+    @staticmethod
+    def parse_topics(text):
+        topics = tuple(line.strip() for line in text.splitlines() if line.strip())
+        if len(topics) > MAX_TOPICS or any(len(topic) > MAX_TOPIC_LENGTH for topic in topics):
+            raise ValueError(f"最多填写 {MAX_TOPICS} 条，每条不超过 {MAX_TOPIC_LENGTH} 字。")
+        return topics
+
+    def set_topics(self, text):
+        value = "\n".join(self.parse_topics(text))
+        if value != self.custom_topics():
+            self.settings.setValue("casual_topics", value)
+            self.settings.sync()
+            self.topic_index = 0
+
     def set_blocked(self, blocked):
         if self.blocked == blocked:
             return
@@ -190,7 +215,7 @@ class TeamCoordinator(QObject):
         except (ValueError, sqlite3.Error) as error:
             self.notice.emit(str(error))
 
-    def casual(self):
+    def casual(self, topics=None):
         if not self.quiet_ready():
             raise ValueError("正在处理私聊，完成后再试。")
         members = [member.key for member in self.store.members()
@@ -198,11 +223,13 @@ class TeamCoordinator(QObject):
         if len(members) < 2:
             raise ValueError("请先在「成员」中显示至少两位桌宠。")
         offset = self.topic_index % len(members)
-        topic = TOPICS[self.topic_index % len(TOPICS)]
+        topics = self.parse_topics(self.custom_topics()) if topics is None else topics
+        topics = topics or TOPICS
+        topic = topics[self.topic_index % len(topics)]
         self.start("casual", topic, [members[offset], members[(offset + 1) % len(members)]])
         self.topic_index += 1
 
-    def start(self, kind, prompt, selected):
+    def start(self, kind, prompt, selected, *, scheduled=None):
         if self.blocked:
             raise ValueError("当前正在屏幕伴学。结束后可以继续群聊。")
         if self.running:
@@ -211,7 +238,7 @@ class TeamCoordinator(QObject):
         if not prompt or len(prompt) > MAX_INPUT:
             raise ValueError(f"请输入 1–{MAX_INPUT} 个字。")
         roster = [member for member in self.store.members() if member.active]
-        if kind == "chat":
+        if kind == "chat" and not scheduled:
             by_name = {member.name: member.key for member in roster}
             names = "|".join(re.escape(name) for name in sorted(by_name, key=len, reverse=True))
             mentions = re.findall(r"@(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])", prompt) if names else []
@@ -230,9 +257,15 @@ class TeamCoordinator(QObject):
         endpoint, model, key = self.model_settings()
         if not endpoint or any(not (member.model or model) for member in members):
             raise ValueError("请在「模型」配置接口，并为参与成员设置模型。")
-        round_id = uuid4().hex
-        history = self.store.lines(7, kinds=("casual",) if kind == "casual" else ("chat", "task"))
-        self.store.add_line(round_id, kind, "闲聊话题" if kind == "casual" else "你", prompt)
+        if scheduled:
+            round_id, name = scheduled
+            speaker = f"定时 · {name}"
+            history = []
+        else:
+            round_id = uuid4().hex
+            speaker = "闲聊话题" if kind == "casual" else "你"
+            history = self.store.lines(7, kinds=("casual",) if kind == "casual" else ("chat", "task"))
+        self.store.add_line(round_id, kind, speaker, prompt)
         token = Event()
         self.token = token
         self.changed.emit()
@@ -320,22 +353,29 @@ class TeamCoordinator(QObject):
         self.publish(round_id, primary, f"本轮分工\n{plan_text}")
         self.notice.emit(f"{len(workers)} 位子成员正在并行处理…")
         results = {}
-        with ThreadPoolExecutor(max_workers=len(workers), thread_name_prefix="mentor") as pool:
-            pending = {
-                pool.submit(self.run_assignment, token, worker, config, context, brief): worker
-                for worker, brief in assignments
-            }
-            for future in as_completed(pending):
-                if token.is_set():
-                    return ""
-                worker = pending[future]
-                try:
-                    answer = future.result()
-                except ValueError as error:
-                    self.publish(round_id, worker, f"本项未完成。{error}")
-                else:
-                    results[worker.key] = answer
-                    self.publish(round_id, worker, answer)
+        completed = Queue()
+
+        def request_assignment(worker, brief):
+            try:
+                answer = self.run_assignment(token, worker, config, context, brief)
+            except ValueError as error:
+                completed.put((worker, "", str(error)))
+            except Exception:
+                completed.put((worker, "", "子成员未能返回结果。"))
+            else:
+                completed.put((worker, answer, ""))
+
+        for worker, brief in assignments:
+            Thread(target=request_assignment, args=(worker, brief), daemon=True).start()
+        for _ in assignments:
+            worker, answer, error = completed.get()
+            if token.is_set():
+                continue
+            if error:
+                self.publish(round_id, worker, f"本项未完成。{error}")
+            else:
+                results[worker.key] = answer
+                self.publish(round_id, worker, answer)
         if token.is_set():
             return ""
         if not results:
