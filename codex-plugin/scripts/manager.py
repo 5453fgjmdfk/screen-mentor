@@ -3,17 +3,17 @@ from dataclasses import replace
 import sqlite3
 from uuid import uuid4
 
-from PyQt6.QtCore import QPoint, QTimer, Qt
+from PyQt6.QtCore import QPoint, QSignalBlocker, QTimer, Qt
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from appearance import SkinLibrary
+from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position
 from resident_agent import excerpt
-from team import MAX_MEMBERS, MAX_SPEAKERS, MAX_INTERVAL, MIN_INTERVAL, Member, PRIMARY
+from team import MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, Member, PRIMARY
 
 
 PANEL_STYLE = """
@@ -102,10 +102,11 @@ class TeamPet(CompanionPanel):
         y = area.bottom() - 38 - self.height() - slot // columns * (self.height() + 28)
         self.move(fit_position(QPoint(x, y), self.size(), area))
 
-    def update_member(self, member):
+    def update_member(self, member, palette):
         changed = self.member != member
         self.member = member
         self.skin_key = member.skin
+        self.skin_palette = palette
         self.refresh_skin()
         if changed:
             self.setWindowTitle(member.name)
@@ -162,10 +163,6 @@ class MemberDialog(QDialog):
         self.model = QLineEdit(self.member.model)
         self.model.setMaxLength(120)
         self.model.setPlaceholderText("留空则使用默认模型")
-        self.skin = QComboBox()
-        for skin in SkinLibrary().all():
-            self.skin.addItem(skin.name, skin.key)
-        self.skin.setCurrentIndex(max(0, self.skin.findData(self.member.skin)))
         self.visible_pet = QCheckBox("在桌面显示这个伙伴")
         self.visible_pet.setChecked(self.member.visible)
         self.active = QCheckBox("可参加群聊和协作")
@@ -173,11 +170,10 @@ class MemberDialog(QDialog):
         form.addRow("成员名称", self.name)
         form.addRow("分工", self.role)
         form.addRow("模型覆盖", self.model)
-        form.addRow("角色皮肤", self.skin)
         form.addRow(self.visible_pet)
         form.addRow(self.active)
         if self.member.key == PRIMARY:
-            for control in (self.skin, self.visible_pet, self.active):
+            for control in (self.visible_pet, self.active):
                 control.setEnabled(False)
         self.notice = label("", "notice")
         form.addRow(self.notice)
@@ -189,7 +185,7 @@ class MemberDialog(QDialog):
 
     def save(self):
         member = replace(self.member, name=self.name.text().strip(), role=self.role.toPlainText().strip(),
-                         model=self.model.text().strip(), skin=self.skin.currentData(),
+                         model=self.model.text().strip(),
                          visible=self.visible_pet.isChecked(), active=self.active.isChecked())
         try:
             self.persist(member)
@@ -222,12 +218,13 @@ class ManagerWindow(QDialog):
         self.nav.setObjectName("nav")
         self.nav.setAccessibleName("管理面板导航")
         nav_layout.addWidget(self.nav, 1)
-        self.nav.addItems(["桌面", "群聊", "成员", "模型", "闲聊"])
+        self.nav.addItems(["桌面", "群聊", "成员", "外观", "模型", "闲聊"])
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
         self.pages.addWidget(self.home_page())
-        self.pages.addWidget(self.group_page())
+        self.group_index = self.pages.addWidget(self.group_page())
         self.pages.addWidget(self.members_page())
+        self.appearance_index = self.pages.addWidget(self.appearance_page())
         self.pages.addWidget(self.model_page())
         self.pages.addWidget(self.schedule_page())
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -267,7 +264,7 @@ class ManagerWindow(QDialog):
         row = QHBoxLayout()
         layout.addLayout(row)
         row.addWidget(button("长期记忆", lambda: self.desktop.show_member_memory(PRIMARY)))
-        row.addWidget(button("外观管理", self.desktop.engine.practice.panel.open_appearance))
+        row.addWidget(button("桌宠外观", lambda: self.open_appearance(PRIMARY)))
         row.addStretch()
         layout.addStretch()
         return page
@@ -282,7 +279,7 @@ class ManagerWindow(QDialog):
         body.addWidget(self.history, 1)
         roster = QVBoxLayout()
         roster.addWidget(label("参与成员", "section"))
-        roster.addWidget(label(f"每轮最多 {MAX_SPEAKERS} 位发言。", "quiet"))
+        roster.addWidget(label(f"群聊每轮最多 {MAX_SPEAKERS} 位。\n并行协作由主学伴带队，最多 {MAX_WORKERS} 位子成员。", "quiet"))
         self.participants = QListWidget()
         self.participants.setAccessibleName("勾选参与成员")
         self.participants.setFixedWidth(156)
@@ -297,9 +294,11 @@ class ManagerWindow(QDialog):
         self.group_notice = label("", "notice")
         actions.addWidget(self.group_notice, 1)
         self.stop_button = button("停止", self.team.stop)
-        self.task_button = button("分工协作", lambda: self.start("task"))
+        self.task_button = button("接力讨论", lambda: self.start("task"))
+        self.parallel_button = button("并行协作", lambda: self.start("parallel"))
+        self.parallel_button.setToolTip("主学伴负责拆分与汇总，勾选的子成员同时处理各自任务。")
         self.send_button = button("发送", lambda: self.start("chat"), primary=True)
-        for action in (self.stop_button, self.task_button, self.send_button):
+        for action in (self.stop_button, self.task_button, self.parallel_button, self.send_button):
             actions.addWidget(action)
         return page
 
@@ -314,10 +313,60 @@ class ManagerWindow(QDialog):
         layout.addLayout(actions)
         actions.addWidget(button("私聊", lambda: self.member_action(self.desktop.show_member_chat)))
         actions.addWidget(button("查看记忆", lambda: self.member_action(self.desktop.show_member_memory)))
+        actions.addWidget(button("编辑外观", lambda: self.member_action(self.open_appearance)))
         actions.addWidget(button("编辑", lambda: self.edit_member()))
         actions.addStretch()
         actions.addWidget(button("添加成员", lambda: self.edit_member(add=True), primary=True))
         return page
+
+    def appearance_page(self):
+        page, layout = self.page("桌宠外观")
+        row = QHBoxLayout()
+        row.addWidget(label("编辑桌宠"))
+        self.appearance_member = QComboBox()
+        self.appearance_member.setAccessibleName("选择要编辑的桌宠")
+        row.addWidget(self.appearance_member, 1)
+        layout.addLayout(row)
+        self.skin_library = SkinLibrary()
+        self.skin_editor = AppearanceEditor(self.skin_library, self.skin_library.current(), self.apply_appearance)
+        layout.addWidget(self.skin_editor, 1)
+        self.appearance_member.currentIndexChanged.connect(self.load_appearance)
+        return page
+
+    def open_appearance(self, key=PRIMARY):
+        self.appearance_member.setCurrentIndex(max(0, self.appearance_member.findData(key)))
+        self.nav.setCurrentRow(self.appearance_index)
+
+    def load_appearance(self):
+        key = self.appearance_member.currentData()
+        if key == PRIMARY:
+            skin = self.skin_library.current()
+        else:
+            member = next(item for item in self.team.store.members() if item.key == key)
+            skin = self.skin_library.resolve(member.skin, saved_palette=False)
+            palette = self.team.store.palette(key)
+            if palette:
+                skin = replace(skin, palette=palette_for(palette))
+        self.skin_editor.load(skin)
+
+    def apply_appearance(self, skin):
+        key = self.appearance_member.currentData()
+        if key == PRIMARY:
+            self.skin_library.select(skin)
+            self.desktop.engine.practice.panel.refresh_skin()
+        else:
+            try:
+                self.team.store.set_appearance(key, skin.key, palette_key(skin.palette))
+            except sqlite3.Error as error:
+                raise ValueError("无法保存桌宠外观，请检查本机目录的写入权限。") from error
+            self.desktop.sync_pets()
+            self.reload_members()
+
+    def open_group(self, draft=""):
+        self.nav.setCurrentRow(self.group_index)
+        if draft and not self.prompt.toPlainText().strip():
+            self.prompt.setPlainText(draft)
+        self.prompt.setFocus()
 
     def model_page(self):
         page, layout = self.page("模型")
@@ -400,9 +449,11 @@ class ManagerWindow(QDialog):
         first_load = not self.participants.count()
         self.members.clear()
         self.participants.clear()
-        for member in self.team.store.members():
+        members = self.team.store.members()
+        for member in members:
             state = "显示在桌面" if member.visible and member.active else "未显示"
-            item = QListWidgetItem(f"{member.name}　·　{state}\n{excerpt(member.role, 156)}")
+            role = "主学伴" if member.key == PRIMARY else "子成员"
+            item = QListWidgetItem(f"{member.name}　·　{role}　·　{state}\n{excerpt(member.role, 156)}")
             item.setData(Qt.ItemDataRole.UserRole, member)
             self.members.addItem(item)
             if previous and previous.key == member.key:
@@ -415,6 +466,12 @@ class ManagerWindow(QDialog):
                 self.participants.addItem(entry)
         if self.members.currentRow() < 0:
             self.members.setCurrentRow(0)
+        current_target = self.appearance_member.currentData()
+        with QSignalBlocker(self.appearance_member):
+            self.appearance_member.clear()
+            for member in members:
+                self.appearance_member.addItem(member.name, member.key)
+            self.appearance_member.setCurrentIndex(max(0, self.appearance_member.findData(current_target)))
 
     def current_member(self):
         item = self.members.currentItem()
@@ -442,10 +499,10 @@ class ManagerWindow(QDialog):
         self.refresh_history()
 
     def refresh_history(self):
-        kinds = {"task": "协作", "chat": "群聊", "casual": "闲聊"}
+        kinds = {"task": "接力", "parallel": "并行协作", "chat": "群聊", "casual": "闲聊"}
         rows = self.team.store.lines()
         self.history.setPlainText("\n\n".join(
-            f"{row['speaker']} · {kinds[row['kind']]}\n{row['body']}" for row in rows))
+            f"{row['speaker']} · {kinds[row['display_kind']]}\n{row['body']}" for row in rows))
         scrollbar = self.history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -458,7 +515,7 @@ class ManagerWindow(QDialog):
         self.info.setText(f"{count} 位伙伴显示在桌面 · {schedule}")
         self.member_hint.setText(f"最多保存 {MAX_MEMBERS} 位成员。私聊和长期记忆分别保存。")
         self.exit_practice.setEnabled(active)
-        for control in (self.send_button, self.task_button, self.try_chat):
+        for control in (self.send_button, self.task_button, self.parallel_button, self.try_chat):
             control.setEnabled(not active and not self.team.running)
         self.stop_button.setEnabled(self.team.running)
         self.refresh_history()

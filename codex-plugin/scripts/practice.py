@@ -78,6 +78,7 @@ class Practice(QObject):
     capture_failed = pyqtSignal(int, str)
     wake = pyqtSignal()
     idle_chat = pyqtSignal()
+    appearance_requested = pyqtSignal()
     session_started = pyqtSignal()
     session_ended = pyqtSignal()
 
@@ -180,7 +181,7 @@ class Practice(QObject):
         issue = CompanionAction("help")
         issue.clicked.connect(self.report_issue)
         appearance = CompanionAction("appearance")
-        appearance.clicked.connect(self.panel.open_appearance)
+        appearance.clicked.connect(self.appearance_requested)
         end = CompanionAction("stop")
         end.clicked.connect(self.close if self.persistent else self.panel.close)
         self.chat_button = CompanionAction("chat")

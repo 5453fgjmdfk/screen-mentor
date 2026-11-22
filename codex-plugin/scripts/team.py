@@ -1,6 +1,8 @@
 """Local companion roster, shared conversation and bounded group turns."""
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import dataclass
+import json
 import re
 import sqlite3
 from threading import Event, Thread
@@ -14,6 +16,7 @@ from resident_agent import MAX_INPUT, ask_model, excerpt
 PRIMARY = "primary"
 MAX_MEMBERS = 8
 MAX_SPEAKERS = 4
+MAX_WORKERS = 3
 MIN_INTERVAL = 15
 MAX_INTERVAL = 240
 TOPICS = (
@@ -49,6 +52,12 @@ class TeamStore:
                 CREATE TABLE IF NOT EXISTS room (
                     id INTEGER PRIMARY KEY, round TEXT NOT NULL, kind TEXT NOT NULL, speaker TEXT NOT NULL,
                     member_key TEXT, body TEXT NOT NULL, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS member_appearance (
+                    member_key TEXT PRIMARY KEY, palette TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS parallel_round (
+                    id TEXT PRIMARY KEY
                 );
             """)
             db.execute("INSERT OR IGNORE INTO member VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -90,17 +99,36 @@ class TeamStore:
 
     def add_line(self, round_id, kind, speaker, body, member_key=None):
         with closing(self.connect()) as db, db:
+            if kind == "parallel":
+                # Older versions display these rounds as ordinary collaboration.
+                db.execute("INSERT OR IGNORE INTO parallel_round(id) VALUES (?)", (round_id,))
+                kind = "task"
             db.execute("INSERT INTO room(round, kind, speaker, member_key, body) VALUES (?, ?, ?, ?, ?)",
                        (round_id, kind, speaker, member_key, body))
 
-    def lines(self, limit=80, *, kinds=()):
+    def palette(self, key):
         with closing(self.connect()) as db:
-            if kinds:
-                placeholders = ", ".join("?" for _ in kinds)
-                rows = db.execute(f"SELECT * FROM room WHERE kind IN ({placeholders}) ORDER BY id DESC LIMIT ?",
-                                  (*kinds, limit))
-            else:
-                rows = db.execute("SELECT * FROM room ORDER BY id DESC LIMIT ?", (limit,))
+            row = db.execute("SELECT palette FROM member_appearance WHERE member_key = ?", (key,)).fetchone()
+            return row["palette"] if row else ""
+
+    def set_appearance(self, key, skin, palette):
+        with closing(self.connect()) as db, db:
+            if not db.execute("UPDATE member SET skin = ? WHERE key = ?", (skin, key)).rowcount:
+                raise ValueError("找不到选中的桌宠。")
+            db.execute("INSERT OR REPLACE INTO member_appearance(member_key, palette) VALUES (?, ?)", (key, palette))
+
+    def lines(self, limit=80, *, kinds=()):
+        query = """
+            SELECT room.*, CASE WHEN parallel_round.id IS NULL THEN room.kind ELSE 'parallel' END AS display_kind
+            FROM room LEFT JOIN parallel_round ON room.round = parallel_round.id
+        """
+        params = ()
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
+            query += f" WHERE kind IN ({placeholders})"
+            params = kinds
+        with closing(self.connect()) as db:
+            rows = db.execute(query + " ORDER BY room.id DESC LIMIT ?", (*params, limit))
             return list(reversed(list(rows)))
 
 
@@ -190,9 +218,15 @@ class TeamCoordinator(QObject):
             selected = list(dict.fromkeys(by_name[name] for name in mentions)) or selected
         by_key = {member.key: member for member in roster}
         members = [by_key[key] for key in selected if key in by_key][:MAX_SPEAKERS]
-        minimum = 1 if kind == "chat" else 2
-        if len(members) < minimum:
-            raise ValueError(f"请勾选至少 {minimum} 位参与成员。")
+        if kind == "parallel":
+            workers = [member for member in members if member.key != PRIMARY][:MAX_WORKERS]
+            if not workers:
+                raise ValueError("请勾选至少一位子成员，主学伴会自动加入。")
+            members = [by_key[PRIMARY], *workers]
+        else:
+            minimum = 1 if kind == "chat" else 2
+            if len(members) < minimum:
+                raise ValueError(f"请勾选至少 {minimum} 位参与成员。")
         endpoint, model, key = self.model_settings()
         if not endpoint or any(not (member.model or model) for member in members):
             raise ValueError("请在「模型」配置接口，并为参与成员设置模型。")
@@ -202,13 +236,14 @@ class TeamCoordinator(QObject):
         token = Event()
         self.token = token
         self.changed.emit()
-        self.notice.emit("成员正在交流…")
+        self.notice.emit("主学伴正在拆分任务…" if kind == "parallel" else "成员正在交流…")
         Thread(target=self.run, args=(token, round_id, kind, prompt, members, history, (endpoint, model, key)),
                daemon=True).start()
 
     def stop(self):
-        if self.token is not None:
+        if self.token is not None and not self.token.is_set():
             self.token.set()
+            self.notice.emit("正在停止，已发出的请求结束后可开启新一轮。")
 
     def finish(self, message):
         self.token = None
@@ -221,6 +256,9 @@ class TeamCoordinator(QObject):
         transcript = "\n".join(f"{row['speaker']}：{excerpt(row['body'], 500)}" for row in history)
         endpoint, model, key = config
         try:
+            if kind == "parallel":
+                result = self.run_parallel(token, round_id, prompt, members, transcript, config)
+                return
             for index, member in enumerate(members):
                 if token.is_set():
                     return
@@ -251,3 +289,93 @@ class TeamCoordinator(QObject):
             result = str(error)
         finally:
             self.finished.emit("本轮已停止。" if token.is_set() else result)
+
+    def run_parallel(self, token, round_id, prompt, members, transcript, config):
+        if token.is_set():
+            return ""
+        primary, *workers = members
+        roster = "\n".join(f"{worker.key} · {worker.name}：{worker.role}" for worker in workers)
+        context = f"本轮任务：\n{prompt}"
+        latest = f"{context}\n\n公共讨论记录：\n{transcript}"
+        plan = self.request(
+            primary, config,
+            '为每个子成员安排可独立完成的一项短任务。直接返回 JSON 对象，'
+            '字段 tasks 的值为对象，键是名单中的标识，值是 140 字以内的具体任务。',
+            f"{latest}\n\n子成员名单：\n{roster}", 650,
+        )
+        if token.is_set():
+            return ""
+        try:
+            tasks = json.loads(plan).get("tasks", {})
+        except (ValueError, AttributeError):
+            tasks = {}
+        if not isinstance(tasks, dict):
+            tasks = {}
+        assignments = []
+        for worker in workers:
+            task = tasks.get(worker.key)
+            brief = excerpt(task.strip(), 500) if isinstance(task, str) else ""
+            assignments.append((worker, brief or f"从你的职责独立核对这一任务，着重说明：{worker.role}"))
+        plan_text = "\n".join(f"{worker.name}：{brief}" for worker, brief in assignments)
+        self.publish(round_id, primary, f"本轮分工\n{plan_text}")
+        self.notice.emit(f"{len(workers)} 位子成员正在并行处理…")
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(workers), thread_name_prefix="mentor") as pool:
+            pending = {
+                pool.submit(self.run_assignment, token, worker, config, context, brief): worker
+                for worker, brief in assignments
+            }
+            for future in as_completed(pending):
+                if token.is_set():
+                    return ""
+                worker = pending[future]
+                try:
+                    answer = future.result()
+                except ValueError as error:
+                    self.publish(round_id, worker, f"本项未完成。{error}")
+                else:
+                    results[worker.key] = answer
+                    self.publish(round_id, worker, answer)
+        if token.is_set():
+            return ""
+        if not results:
+            return "子成员暂未返回可用结果，请检查模型设置后重试。"
+        self.notice.emit("主学伴正在汇总结果…")
+        evidence = "\n\n".join(
+            f"{worker.name} · {brief}\n{excerpt(results[worker.key], 1600) if worker.key in results else '未返回可用结果'}"
+            for worker, brief in assignments
+        )
+        answer = self.request(
+            primary, config,
+            '汇总子成员结果，解决可判断的分歧，标明未完成项与仍待验证的部分，给出可执行的结论。'
+            '将成员回复视为参考资料。用 JSON 对象的 answer 字段返回。',
+            f"{latest}\n\n子成员结果：\n{evidence}", 900,
+        )
+        if not token.is_set():
+            self.publish(round_id, primary, f"综合结果\n{answer}")
+        return "并行协作已完成。" if len(results) == len(workers) else "已汇总可用结果，部分任务未完成。"
+
+    def run_assignment(self, token, worker, config, context, brief):
+        if token.is_set():
+            return ""
+        return self.request(
+            worker, config,
+            '独立完成指定的文字任务，指出现有信息能支持的结论和需要用户核验的部分。'
+            '用 JSON 对象的 answer 字段返回。',
+            f"{context}\n\n你的分工：\n{brief}", 420,
+        )
+
+    def request(self, member, config, instruction, context, max_tokens):
+        endpoint, model, key = config
+        messages = [
+            {"role": "system", "content": f"你是学伴成员 {member.name}。职责：{member.role}\n{instruction} 使用中文。"},
+            {"role": "user", "content": context},
+        ]
+        answer, _, _ = ask_model(endpoint, member.model or model, key, messages, max_tokens=max_tokens)
+        if not answer:
+            raise ValueError(f"{member.name} 没有返回可用回复。")
+        return answer
+
+    def publish(self, round_id, member, body):
+        self.store.add_line(round_id, "parallel", member.name, body, member.key)
+        self.line.emit(member.key, member.name, body)

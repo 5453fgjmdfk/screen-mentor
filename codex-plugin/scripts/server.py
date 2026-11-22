@@ -464,7 +464,7 @@ class MentorServer(QObject):
                 }:
                     return {"content": [text_content({"state": "paused", "shown": False})]}
             if name == "open_appearance":
-                self.practice.panel.open_appearance()
+                self.practice.appearance_requested.emit()
                 blocks = [text_content({"opened": True, "surface": "appearance_manager"})]
             elif name == "open_management":
                 self.management_requested.emit()

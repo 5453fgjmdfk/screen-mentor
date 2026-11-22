@@ -97,7 +97,7 @@ class MemoryDialog(QDialog):
 class ChatWindow(QDialog):
     completed = pyqtSignal(str, str)
 
-    def __init__(self, archive, member=None):
+    def __init__(self, archive, member=None, open_team=None):
         super().__init__()
         self.archive = archive
         self.member = member
@@ -134,6 +134,12 @@ class ChatWindow(QDialog):
         memory.clicked.connect(self.open_memory)
         actions.addWidget(memory)
         actions.addStretch()
+        self.team_button = None
+        if open_team is not None:
+            self.team_button = QPushButton("协作…")
+            self.team_button.setToolTip("打开群聊，并把正在输入的任务带过去。")
+            self.team_button.clicked.connect(lambda: open_team(self.input.toPlainText()))
+            actions.addWidget(self.team_button)
         self.send_button = QPushButton("发送")
         self.send_button.setObjectName("primary")
         self.send_button.clicked.connect(self.send)
@@ -200,6 +206,8 @@ class ChatWindow(QDialog):
         self.taken = taken
         self.input.setEnabled(not taken)
         self.send_button.setEnabled(not taken and not self.busy)
+        if self.team_button:
+            self.team_button.setEnabled(not taken)
         if taken:
             self.notice.setText("当前由外部对话伴学。结束后会回到日常对话。")
             self.hide()
@@ -298,6 +306,7 @@ class Desktop(QObject):
         self.main_bubble_timer.setInterval(12_000)
         self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
         self.engine.practice.idle_chat.connect(self.show_chat)
+        self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
         self.engine.practice.panel.closed.connect(app.quit)
@@ -310,7 +319,7 @@ class Desktop(QObject):
         self.menu = QMenu()
         self.menu.addAction("管理面板", self.show_manager)
         self.menu.addAction("日常对话", self.show_chat)
-        self.menu.addAction("外观管理", self.engine.practice.panel.open_appearance)
+        self.menu.addAction("桌宠外观", self.show_appearance)
         self.menu.addAction("退出桌面学伴", self.app.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
@@ -325,6 +334,14 @@ class Desktop(QObject):
             self.manager = ManagerWindow(self.team, self)
         self.manager.refresh()
         show_centered(self.manager)
+
+    def show_appearance(self):
+        self.show_manager()
+        self.manager.open_appearance()
+
+    def show_team(self, draft=""):
+        self.show_manager()
+        self.manager.open_group(draft)
 
     def model_settings(self):
         self.agent_settings.sync()
@@ -341,7 +358,7 @@ class Desktop(QObject):
         if member is None:
             return
         if key not in self.member_chats:
-            self.member_chats[key] = ChatWindow(self.member_archive(key), member)
+            self.member_chats[key] = ChatWindow(self.member_archive(key), member, self.show_team if key == PRIMARY else None)
         chat = self.member_chats[key]
         chat.set_member(member)
         if key == PRIMARY:
@@ -370,7 +387,7 @@ class Desktop(QObject):
                 self.pets[member.key] = pet
                 if not self.team.blocked:
                     pet.show()
-            self.pets[member.key].update_member(member)
+            self.pets[member.key].update_member(member, self.team.store.palette(member.key))
             self.pets[member.key].suspend(self.team.blocked)
 
     def show_team_line(self, key, name, body):
@@ -431,7 +448,10 @@ class Desktop(QObject):
             if not isinstance(owner, str) or not 1 <= len(owner) <= 64:
                 raise ValueError
             if request.get("method") == "show_desktop":
-                self.show_manager()
+                if request.get("page") == "appearance":
+                    self.show_appearance()
+                else:
+                    self.show_manager()
                 result = {"shown": True}
             else:
                 result = self.engine.respond(request, owner)
@@ -442,7 +462,7 @@ class Desktop(QObject):
             socket.disconnectFromServer()
 
 
-def main():
+def main(*, initial_page=None):
     app = QApplication(sys.argv[:1])
     app.setWindowIcon(QIcon(str(APP_ICON)))
     app.setQuitOnLastWindowClosed(False)
@@ -453,14 +473,17 @@ def main():
         if "--background" not in sys.argv:
             socket = connect()
             if socket:
-                roundtrip(socket, {"owner": "desktop", "request": {"method": "show_desktop"}})
+                roundtrip(socket, {"owner": "desktop", "request": {"method": "show_desktop", "page": initial_page}})
         return 0
     desktop = Desktop(app)
     QLocalServer.removeServer(CHANNEL)
     if not desktop.listener.listen(CHANNEL):
         return 1
     if "--background" not in sys.argv:
-        desktop.show_manager()
+        if initial_page == "appearance":
+            desktop.show_appearance()
+        else:
+            desktop.show_manager()
     try:
         return app.exec()
     finally:

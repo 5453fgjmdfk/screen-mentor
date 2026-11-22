@@ -6,7 +6,9 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
 
-from appearance import AppearanceDialog, BUILT_INS, PeekFrames, SkinLibrary, paint_peek
+from dataclasses import replace
+
+from appearance import BUILT_INS, PeekFrames, SkinLibrary, paint_peek, palette_for
 from skin_assets import STATES
 
 SNAP_DISTANCE = 22
@@ -401,8 +403,8 @@ class CompanionPanel(QWidget):
         self.add_drag_handle(self.sprite)
         self.library = SkinLibrary()
         self.skin_key = skin_key
+        self.skin_palette = ""
         self.skin = None
-        self.appearance_dialog = None
         self.refresh_skin()
         self.skin_timer = QTimer(self)
         self.skin_timer.setInterval(1500)
@@ -413,7 +415,9 @@ class CompanionPanel(QWidget):
         if self.skin_key is None:
             skin = self.library.current()
         else:
-            skin = next((item for item in self.library.all() if item.key == self.skin_key), BUILT_INS[0])
+            skin = self.library.resolve(self.skin_key, saved_palette=False)
+            if self.skin_palette:
+                skin = replace(skin, palette=palette_for(self.skin_palette))
         if skin == self.skin:
             return
         previous_skin = self.skin
@@ -440,18 +444,6 @@ class CompanionPanel(QWidget):
             self.state = None
             self.set_pose(pose)
         self.peek.set_skin(skin)
-
-    def open_appearance(self):
-        if self.appearance_dialog is None:
-            dialog = AppearanceDialog(self if self.isVisible() else None, self.library, self.library.current())
-            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            dialog.accepted.connect(self.refresh_skin)
-            dialog.finished.connect(self.forget_appearance)
-            self.appearance_dialog = dialog
-        self.appearance_dialog.show_centered()
-
-    def forget_appearance(self):
-        self.appearance_dialog = None
 
     def set_pose(self, state):
         if self.state == state:

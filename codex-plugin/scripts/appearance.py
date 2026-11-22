@@ -9,12 +9,13 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 from PyQt6.QtCore import QElapsedTimer, QRect, QRectF, QSettings, QSignalBlocker, QSize, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QIcon, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
+    QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
 )
 
+from resident_agent import PROFILE
 from skin_assets import ASSET_FILES, FILE_LIMIT, MIB, ROLES, STATES, CropDialog, asset_bytes, check_image, require_roles
 
 
@@ -225,11 +226,11 @@ def read_manifest(raw):
 
 class SkinLibrary:
     def __init__(self, root=None):
-        self.root = root or Path.home() / ".codex" / "screen-mentor" / "appearance"
+        self.root = root or PROFILE / "appearance"
         self.installed = self.root / "skins"
         self.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
 
-    def all(self):
+    def all(self, *, saved_palettes=True):
         skins = list(BUILT_INS)
         for path in sorted(self.installed.glob("skin-*")):
             try:
@@ -242,7 +243,7 @@ class SkinLibrary:
             except (OSError, ValueError):
                 continue
             skins.append(Skin(path.name, name, path, palette))
-        return [self.with_saved_palette(skin) for skin in skins]
+        return [self.with_saved_palette(skin) for skin in skins] if saved_palettes else skins
 
     def with_saved_palette(self, skin):
         choice = self.settings.value(f"palettes/{skin.key}", "", type=str)
@@ -254,7 +255,10 @@ class SkinLibrary:
     def current(self):
         self.settings.sync()
         key = self.settings.value("skin", BUILT_INS[0].key, type=str)
-        return next((skin for skin in self.all() if skin.key == key), BUILT_INS[0])
+        return self.resolve(key)
+
+    def resolve(self, key, *, saved_palette=True):
+        return next((skin for skin in self.all(saved_palettes=saved_palette) if skin.key == key), BUILT_INS[0])
 
     def select(self, skin):
         self.settings.setValue(f"palettes/{skin.key}", palette_key(skin.palette))
@@ -470,44 +474,26 @@ class NewSkinDialog(QDialog):
         self.message.setStyleSheet("color:#ffbcaf;")
 
 
-class AppearanceDialog(QDialog):
-    def __init__(self, parent, library, current):
-        super().__init__(parent, Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
+class AppearanceEditor(QWidget):
+    def __init__(self, library, current, apply_skin):
+        super().__init__()
         self.library = library
         self.selected = current
+        self.apply_skin = apply_skin
         self.preview_movie = None
-        self.setWindowTitle("伴学外观")
-        self.setMinimumWidth(565)
-        self.setStyleSheet(
-            "QDialog{background:#191724;} QWidget{color:#f1ecff;font:13px 'Microsoft YaHei UI';}"
-            "QLabel#title{font-size:21px;font-weight:600;} QLabel#note{color:#bdb4d2;}"
-            "QLabel#error{color:#ffbcaf;} QListWidget{background:#211e30;border:1px solid #453957;"
-            "border-radius:10px;padding:5px;outline:0;}"
-            "QListWidget::item{padding:9px;border-radius:6px;}"
-            "QListWidget::item:selected{background:#433453;color:#fff;}"
-            "QPushButton{background:#2b243b;border:1px solid #4c3d64;border-radius:8px;padding:7px 13px;}"
-            "QPushButton:hover,QPushButton:focus{border-color:#b49bd8;}"
-            "QPushButton#apply{background:#c1aae9;color:#241834;font-weight:600;}"
-            "QComboBox{background:#2b243b;border:1px solid #4c3d64;border-radius:6px;padding:4px 9px;}"
-            "QComboBox QAbstractItemView{background:#2b243b;selection-background-color:#604978;}"
-            "QLineEdit{background:#211e30;border:1px solid #453957;border-radius:6px;padding:5px;}"
-        )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 19, 22, 19)
-        layout.setSpacing(12)
-        title = QLabel("伴学外观")
-        title.setObjectName("title")
-        layout.addWidget(title)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
         panes = QHBoxLayout()
         panes.setSpacing(14)
-        layout.addLayout(panes)
+        layout.addLayout(panes, 1)
         library_panel = QVBoxLayout()
         panes.addLayout(library_panel, 2)
         library_panel.addWidget(QLabel("本地外观方案"))
         self.presets = QListWidget()
         self.presets.setAccessibleName("本地外观方案")
         self.presets.setMinimumWidth(163)
-        library_panel.addWidget(self.presets)
+        library_panel.addWidget(self.presets, 1)
         save_preset = QPushButton("保存为方案…")
         save_preset.clicked.connect(self.save_preset)
         library_panel.addWidget(save_preset)
@@ -520,7 +506,7 @@ class AppearanceDialog(QDialog):
         preview_layout.setSpacing(4)
         self.sample = QLabel("在核对下一步操作。")
         self.sample.setObjectName("skinSample")
-        preview_layout.addWidget(self.sample, alignment=Qt.AlignmentFlag.AlignHCenter)
+        preview_layout.addWidget(self.sample, alignment=Qt.AlignmentFlag.AlignCenter)
         self.sprite = QLabel()
         self.sprite.setFixedSize(105, 105)
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -542,9 +528,6 @@ class AppearanceDialog(QDialog):
         assets.addWidget(QLabel("角色素材"))
         self.materials = QComboBox()
         self.materials.setAccessibleName("角色素材")
-        for skin in library.all():
-            if skin.path != ART or skin.key == BUILT_INS[0].key:
-                self.add_material(skin)
         assets.addWidget(self.materials, 1)
         colors = QHBoxLayout()
         layout.addLayout(colors)
@@ -559,39 +542,48 @@ class AppearanceDialog(QDialog):
         colors.addWidget(rgb)
         colors.addStretch()
         self.message = QLabel()
-        self.message.setObjectName("error")
+        self.message.setObjectName("notice")
         self.message.setWordWrap(True)
         self.message.hide()
         layout.addWidget(self.message)
         buttons = QHBoxLayout()
-        assets.addLayout(buttons)
+        layout.addLayout(buttons)
         create = QPushButton("制作皮肤…")
         create.clicked.connect(self.create_skin)
         buttons.addWidget(create)
         import_button = QPushButton("导入皮肤…")
         import_button.clicked.connect(self.import_skin)
         buttons.addWidget(import_button)
-        footer = QHBoxLayout()
-        layout.addLayout(footer)
         reset = QPushButton("恢复默认")
         reset.clicked.connect(self.reset_default)
-        footer.addWidget(reset)
-        footer.addStretch()
-        cancel = QPushButton("取消")
-        cancel.clicked.connect(self.reject)
-        footer.addWidget(cancel)
-        apply = QPushButton("应用")
-        apply.setObjectName("apply")
-        apply.setDefault(True)
+        buttons.addWidget(reset)
+        buttons.addStretch()
+        apply = QPushButton("应用到桌宠")
+        apply.setObjectName("primary")
         apply.clicked.connect(self.save_selection)
-        footer.addWidget(apply)
-        self.finished.connect(self.stop_preview)
+        buttons.addWidget(apply)
         self.presets.currentItemChanged.connect(self.choose_preset)
         self.presets.itemClicked.connect(self.choose_preset)
         self.materials.currentIndexChanged.connect(self.choose_material)
         self.colors.currentIndexChanged.connect(self.choose_palette)
+        self.load(current)
+
+    def load(self, skin):
+        with QSignalBlocker(self.materials):
+            self.materials.clear()
+            for material in self.library.all():
+                if material.path != ART or material.key == BUILT_INS[0].key:
+                    self.add_material(material)
+        self.set_preview(skin)
         self.reload_presets()
-        self.set_preview(current)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.start_preview()
+
+    def hideEvent(self, event):
+        self.stop_preview()
+        super().hideEvent(event)
 
     def reload_presets(self, select_name=None):
         with QSignalBlocker(self.presets):
@@ -630,12 +622,18 @@ class AppearanceDialog(QDialog):
                     break
         self.set_palette(skin.palette)
         self.stop_preview()
-        self.preview_movie = skin.movie("idle", self, self.sprite.size())
+        if self.isVisible():
+            self.start_preview()
+        self.message.hide()
+
+    def start_preview(self):
+        if self.preview_movie is not None:
+            return
+        self.preview_movie = self.selected.movie("idle", self, self.sprite.size())
         self.sprite.setMovie(self.preview_movie)
         self.preview_movie.start()
         for portrait in (self.side, self.bottom):
-            portrait.set_skin(skin)
-        self.message.hide()
+            portrait.set_skin(self.selected)
 
     def stop_preview(self):
         self.side.stop()
@@ -709,31 +707,16 @@ class AppearanceDialog(QDialog):
 
     def save_selection(self):
         try:
-            self.library.select(self.selected)
+            self.apply_skin(self.selected)
         except ValueError as error:
             self.message.setText(str(error))
             self.message.show()
             return
-        self.accept()
-
-    def show_centered(self):
-        self.adjustSize()
-        screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
-        self.move(screen.availableGeometry().center() - self.rect().center())
-        self.show()
-        self.raise_()
-        self.activateWindow()
+        self.message.setText("已应用到选中的桌宠。")
+        self.message.show()
 
 
 if __name__ == "__main__":
-    import sys
+    from desktop import main
 
-    from capture import enable_dpi_awareness
-
-    enable_dpi_awareness()
-    app = QApplication(sys.argv[:1])
-    app.setWindowIcon(QIcon(str(APP_ICON)))
-    library = SkinLibrary()
-    dialog = AppearanceDialog(None, library, library.current())
-    dialog.show_centered()
-    sys.exit(app.exec())
+    raise SystemExit(main(initial_page="appearance"))
