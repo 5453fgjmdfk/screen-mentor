@@ -2,12 +2,15 @@
 from dataclasses import replace
 
 from PIL import Image
-from PyQt6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QCursor, QFont, QFontMetrics, QGuiApplication, QLinearGradient, QPainter,
     QImage, QPainterPath, QPainterPathStroker, QPen, QTransform,
 )
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QLabel, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QHBoxLayout, QLabel, QListWidget, QPushButton, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QWidget,
+)
 
 from appearance import BUILT_INS, PeekFrames, SkinLibrary, paint_peek, palette_for
 from skin_assets import STATES
@@ -34,9 +37,43 @@ def fit_position(position, size, area):
     )
 
 
+class RowSelectionDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        row = QStyleOptionViewItem(option)
+        row.state &= ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, row, index)
+
+
+class PopupRows(QObject):
+    def __init__(self, view):
+        super().__init__(view)
+        self.view = view
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.style_popup)
+        view.installEventFilter(self)
+        self.update_timer.start(0)
+
+    def eventFilter(self, view, event):
+        if event.type() in (QEvent.Type.Show, QEvent.Type.StyleChange):
+            self.update_timer.start(0)
+        return False
+
+    def style_popup(self):
+        if not isinstance(self.view.itemDelegate(), RowSelectionDelegate):
+            self.view.setItemDelegate(RowSelectionDelegate(self.view))
+
+
+def style_row_views(window):
+    for view in window.findChildren(QListWidget):
+        view.setItemDelegate(RowSelectionDelegate(view))
+    for combo in window.findChildren(QComboBox):
+        combo.popup_rows = PopupRows(combo.view())
+
+
 class CompanionAction(QPushButton):
     labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止", "appearance": "外观",
-              "chat": "日常对话", "manager": "打开管理面板", "quit": "退出桌面学伴"}
+              "chat": "日常对话", "manager": "打开管理面板", "hide": "隐藏桌宠"}
 
     def __init__(self, action):
         super().__init__()
@@ -101,26 +138,13 @@ class CompanionAction(QPushButton):
             inside.addRoundedRect(QRectF(1.7, 3.2, 2.8, 6.5), .55, .55)
             inside.addRoundedRect(QRectF(6.1, 3.2, 5.2, 6.5), .55, .55)
             mark = outer.subtracted(inside)
-        elif self.action == "quit":
-            door = QPainterPath()
-            door.moveTo(5.2, .9)
-            door.lineTo(1, .9)
-            door.lineTo(1, 11.1)
-            door.lineTo(5.2, 11.1)
-            door.moveTo(5, 6)
-            door.lineTo(12, 6)
-            door.moveTo(9.5, 3.6)
-            door.lineTo(12, 6)
-            door.lineTo(9.5, 8.4)
-            stroke = QPainterPathStroker()
-            stroke.setWidth(1.6)
-            stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
-            stroke.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            mark = stroke.createStroke(door).simplified()
+        elif self.action == "hide":
+            mark.addRoundedRect(QRectF(0, 4.3, 12, 3.4), 1.7, 1.7)
         else:
             mark.addRoundedRect(QRectF(0, 0, 12, 12), 1.6, 1.6)
-        scale = 12 / mark.boundingRect().height()
-        mark = QTransform.fromScale(scale, scale).map(mark)
+        if self.action != "hide":
+            scale = 12 / mark.boundingRect().height()
+            mark = QTransform.fromScale(scale, scale).map(mark)
         center = mark.boundingRect().center()
         mark.translate(self.width() / 2 - center.x(), self.height() / 2 - center.y())
         return mark
@@ -469,6 +493,9 @@ class CompanionPanel(QWidget):
         self.drag_start = None
         self.edge_dragging = False
         self.lift_widgets = []
+        self.suspended = False
+        self.dock_position = None
+        self.snapping_enabled = True
         self.model_frame = None
         self.model_pixels = QRect()
         self.peek = EdgePeek()
@@ -544,11 +571,38 @@ class CompanionPanel(QWidget):
             self.set_pose(pose)
         self.peek.set_skin(skin)
 
-    def add_desktop_actions(self, manager, quit_desktop):
-        for action, callback in (("manager", manager), ("quit", quit_desktop)):
+    def add_desktop_actions(self, manager, hide_desktop):
+        for action, callback in (("manager", manager), ("hide", hide_desktop)):
             control = CompanionAction(action)
             control.clicked.connect(callback)
             self.controls.layout().addWidget(control)
+
+    def suspend(self, suspend):
+        if self.suspended == suspend:
+            return
+        self.suspended = suspend
+        if suspend:
+            self.cancel_lift()
+            if self.peek.isVisible():
+                anchor = self.peek.pos() + QPoint(self.peek.width() // 2, self.peek.height() // 2)
+                self.dock_position = (self.peek.edge, anchor, self.peek.area)
+                self.peek.hide()
+            self.controls.hide()
+            self.hide()
+            return
+        if self.dock_position is not None and self.snapping_enabled:
+            self.peek.dock(*self.dock_position)
+        else:
+            if self.dock_position is not None:
+                area = self.dock_position[2]
+                self.move(fit_position(self.pos(), self.size(), area))
+            self.show()
+        self.dock_position = None
+
+    def set_snapping(self, enabled):
+        self.snapping_enabled = enabled
+        if not enabled and self.peek.isVisible() and not self.edge_dragging:
+            self.restore_from_edge(None)
 
     def set_pose(self, state):
         self.peek.thinking = state == "thinking"
@@ -700,6 +754,8 @@ class CompanionPanel(QWidget):
         self.move(fit_position(position, self.size(), area))
 
     def snap_to_edge(self, area):
+        if not self.snapping_enabled:
+            return False
         bounds = self.model_bounds().translated(self.pos())
         distances = {
             Qt.Edge.LeftEdge: abs(bounds.left() - area.left()),

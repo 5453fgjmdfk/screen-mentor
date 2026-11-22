@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 import native
-from companion import CompanionAction, CompanionPanel
+from companion import CompanionAction, CompanionPanel, style_row_views
 from window_reader import WindowReader
 
 
@@ -396,7 +396,8 @@ class Practice(QObject):
         serial = self.session_serial
         image = self.last_image
         dialog = QDialog(self.panel, Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
-        dialog.setStyleSheet("QDialog{background:#251d3b;} QPlainTextEdit,QListWidget{background:#342851;}")
+        dialog.setStyleSheet("QWidget{outline:0;} QDialog{background:#251d3b;}"
+                             "QPlainTextEdit,QListWidget{background:#342851;}")
         dialog.setWindowTitle("反馈到当前对话")
         dialog.setMinimumWidth(400)
         layout = QVBoxLayout(dialog)
@@ -410,6 +411,7 @@ class Practice(QObject):
         attachments.setIconSize(QSize(36, 36))
         attachments.hide()
         layout.addWidget(attachments)
+        style_row_views(dialog)
         image_actions = QHBoxLayout()
         paste = QPushButton("粘贴图片")
         remove = QPushButton("移除选中图片")

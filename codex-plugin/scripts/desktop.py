@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 
 from appearance import APP_ICON, SkinLibrary
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
-from companion import fit_position
+from companion import fit_position, style_row_views
 from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
 from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
 from scheduled import TaskScheduler
@@ -31,6 +31,7 @@ from team import PRIMARY, Member, TeamCoordinator, TeamStore
 
 
 STYLE = """
+QWidget { outline: 0; }
 QDialog { background: #191724; }
 QLabel, QPlainTextEdit, QLineEdit, QListWidget, QPushButton {
     color: #f2edff;
@@ -74,6 +75,7 @@ class MemoryDialog(QDialog):
         done.clicked.connect(self.accept)
         actions.addWidget(done)
         self.items.currentRowChanged.connect(self.show_item)
+        style_row_views(self)
         self.refresh()
 
     def refresh(self):
@@ -385,6 +387,8 @@ class Desktop(QObject):
         self.exiting = False
         self.pets = {}
         self.preferences = QSettings(str(PROFILE / "desktop.ini"), QSettings.Format.IniFormat)
+        self.pets_visible = self.preferences.value("pets_on_startup", True, type=bool)
+        self.engine.practice.panel.suspend(not self.pets_visible)
         self.agent_settings = QSettings(str(PROFILE / "agent.ini"), QSettings.Format.IniFormat)
         self.team = TeamCoordinator(TeamStore(PROFILE / "team.sqlite3"), PROFILE / "team.ini",
                                     self.model_settings, self.quiet_ready, self)
@@ -397,7 +401,7 @@ class Desktop(QObject):
         self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
         self.engine.practice.idle_chat.connect(lambda: self.show_quick_chat(PRIMARY))
         self.engine.practice.panel.clicked.connect(lambda: self.show_quick_chat(PRIMARY))
-        self.engine.practice.panel.add_desktop_actions(self.show_manager, self.quit)
+        self.engine.practice.panel.add_desktop_actions(self.show_manager, self.hide_pets)
         self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
@@ -410,12 +414,16 @@ class Desktop(QObject):
         self.tray.setToolTip("屏幕伴学")
         self.menu = QMenu()
         self.menu.addAction("管理面板", self.show_manager)
+        self.pets_action = self.menu.addAction("", self.toggle_pets)
+        self.update_pets_action()
         self.menu.addAction("日常对话", self.show_chat)
         self.menu.addAction("桌宠外观", lambda: self.show_appearance())
         self.menu.addAction("退出桌面学伴", self.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
         self.tray.show()
+        self.attach_pet_menu(self.engine.practice.panel)
+        self.apply_pet_preferences()
         self.sync_pets()
 
     def show_chat(self):
@@ -452,6 +460,43 @@ class Desktop(QObject):
             QTimer.singleShot(0, self.quit)
         else:
             self.hide_to_tray()
+
+    def attach_pet_menu(self, panel):
+        for widget in (panel, panel.peek):
+            widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(partial(self.popup_pet_menu, widget))
+
+    def popup_pet_menu(self, widget, point):
+        self.menu.popup(widget.mapToGlobal(point))
+
+    def update_pets_action(self):
+        self.pets_action.setText("隐藏桌宠" if self.pets_visible else "显示桌宠")
+
+    def hide_pets(self):
+        self.set_pets_visible(False)
+
+    def toggle_pets(self):
+        self.set_pets_visible(not self.pets_visible)
+
+    def set_pets_visible(self, visible):
+        self.pets_visible = visible
+        self.engine.practice.panel.suspend(not visible)
+        for pet in self.pets.values():
+            pet.suspend(not visible or self.team.blocked)
+        if not visible and self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
+            self.quick_chat.close()
+        self.update_pets_action()
+        if self.manager is not None:
+            self.manager.update_pet_visibility()
+
+    def apply_pet_preferences(self):
+        interval = max(4, min(30, self.preferences.value("bubble_seconds", 12, type=int))) * 1000
+        self.main_bubble_timer.setInterval(interval)
+        enabled = self.preferences.value("snap_enabled", True, type=bool)
+        self.engine.practice.panel.set_snapping(enabled)
+        for pet in self.pets.values():
+            pet.set_snapping(enabled)
+            pet.bubble_timer.setInterval(interval)
 
     def workspace_directory(self):
         directory = self.preferences.value("workspace_directory", "", type=str)
@@ -591,10 +636,13 @@ class Desktop(QObject):
             if member.key not in self.pets:
                 pet = TeamPet(member, self, next(slots))
                 self.pets[member.key] = pet
-                if not self.team.blocked:
+                self.attach_pet_menu(pet)
+                pet.set_snapping(self.preferences.value("snap_enabled", True, type=bool))
+                pet.bubble_timer.setInterval(self.main_bubble_timer.interval())
+                if not self.team.blocked and self.pets_visible:
                     pet.show()
             self.pets[member.key].update_member(member, self.team.store.palette(member.key))
-            self.pets[member.key].suspend(self.team.blocked)
+            self.pets[member.key].suspend(self.team.blocked or not self.pets_visible)
 
     def show_team_line(self, key, name, body):
         if self.team.blocked or self.team.token is None or self.team.token.is_set() or key in self.chat_bubbles:
@@ -658,7 +706,7 @@ class Desktop(QObject):
             return
         self.team.set_blocked(False)
         for pet in self.pets.values():
-            pet.suspend(False)
+            pet.suspend(not self.pets_visible)
         for chat in self.member_chats.values():
             chat.set_taken(False)
 

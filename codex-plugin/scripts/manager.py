@@ -6,16 +6,17 @@ import re
 import sqlite3
 from uuid import uuid4
 
-from PyQt6.QtCore import QByteArray, QDateTime, QEvent, QPoint, QSignalBlocker, QSize, QTimer, QUrl, Qt
-from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImageReader, QPixmap
+from PyQt6.QtCore import QByteArray, QDateTime, QEvent, QPoint, QSettings, QSignalBlocker, QSize, QTimer, QUrl, Qt
+from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImageReader, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout,
+    QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QSystemTrayIcon,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
-from companion import CompanionAction, CompanionPanel, fit_position
+from companion import CompanionAction, CompanionPanel, fit_position, style_row_views
 from resident_agent import MAX_INPUT, excerpt, model_url
 from scheduled import FREQUENCIES, MODES, ScheduledTask
 from team import (
@@ -24,6 +25,7 @@ from team import (
 
 
 PANEL_STYLE = """
+QWidget {outline:0;}
 QDialog, QWidget#panel {background:#1a232b;color:#e5edf1;}
 QLabel, QLineEdit, QPlainTextEdit, QListWidget, QPushButton, QCheckBox, QComboBox, QSpinBox, QDateTimeEdit {
     color:#e5edf1;font:13px 'Microsoft YaHei UI';
@@ -40,9 +42,16 @@ QListWidget, QPlainTextEdit, QLineEdit, QComboBox, QSpinBox, QDateTimeEdit {
 QListWidget#nav {background:transparent;border:0;}
 QListWidget#nav::item {padding:6px 8px;}
 QListWidget::item {padding:8px;border-radius:7px;}
+QAbstractItemView {outline:0;}
 QListWidget::item:selected {background:#365260;color:#f3f8fa;}
+QListWidget::item:hover:!selected {background:#2b3e4a;}
+QComboBox QAbstractItemView {background:#1d2933;selection-background-color:#365260;selection-color:#f3f8fa;}
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDateTimeEdit:focus, QListWidget:focus {
+    border-color:#648496;
+}
 QPushButton {background:#2b3e4a;border:1px solid #455e6d;border-radius:8px;padding:7px 12px;}
-QPushButton:hover, QPushButton:focus {border-color:#9abacb;}
+QPushButton:hover {border-color:#9abacb;}
+QPushButton:focus {border-color:#648496;}
 QPushButton:disabled {color:#8596a0;border-color:#374b56;}
 QPushButton#primary {background:#a1c1d0;color:#1c2b34;font-weight:600;}
 QTabWidget::pane {border:1px solid #354752;border-radius:8px;}
@@ -76,6 +85,7 @@ def panel_style(theme, color):
         "#3f5360": palette.border, "#416272": palette.border, "#365260": palette.border,
         "#f3f8fa": palette_for(palette.border).text, "#2b3e4a": palette.surface, "#455e6d": palette.border,
         "#9abacb": palette.highlight, "#8596a0": palette.border, "#374b56": palette.border,
+        "#648496": palette.border,
         "#a1c1d0": palette.highlight, "#1c2b34": palette_for(palette.highlight).text,
     }
     return re.sub(r"#[0-9a-f]{6}\b", lambda match: shades.get(match[0], match[0]), PANEL_STYLE)
@@ -119,8 +129,6 @@ class TeamPet(CompanionPanel):
         super().__init__(skin_key=member.skin, sprite_size=102)
         self.member = member
         self.slot = slot
-        self.suspended = False
-        self.dock_position = None
         self.setWindowTitle(member.name)
         self.sprite.setAccessibleName(member.name)
         layout = QVBoxLayout(self)
@@ -142,7 +150,7 @@ class TeamPet(CompanionPanel):
         appearance = CompanionAction("appearance")
         appearance.clicked.connect(lambda: desktop.show_appearance(self.member.key))
         self.controls.layout().addWidget(appearance)
-        self.add_desktop_actions(desktop.show_manager, desktop.quit)
+        self.add_desktop_actions(desktop.show_manager, desktop.hide_pets)
         layout.addWidget(self.controls, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.bubble_timer = QTimer(self)
         self.bubble_timer.setSingleShot(True)
@@ -184,22 +192,10 @@ class TeamPet(CompanionPanel):
                 self.bubble_timer.start()
 
     def suspend(self, suspend):
-        if self.suspended == suspend:
-            return
-        self.suspended = suspend
-        if suspend:
-            self.cancel_lift()
+        if suspend and not self.suspended:
             self.bubble_timer.stop()
             self.say("")
-            if self.peek.isVisible():
-                self.dock_position = (self.peek.edge, self.peek.geometry().center(), self.peek.area)
-                self.peek.hide()
-            self.hide()
-        elif self.dock_position is not None:
-            self.peek.dock(*self.dock_position)
-            self.dock_position = None
-        else:
-            self.show()
+        super().suspend(suspend)
 
 
 class MemberDialog(QDialog):
@@ -264,6 +260,7 @@ class MemberDialog(QDialog):
         actions.addWidget(button("取消", self.reject))
         actions.addWidget(button("保存", self.save, primary=True))
         form.addRow(actions)
+        style_row_views(self)
 
     def choose_portrait(self):
         filename, _ = QFileDialog.getOpenFileName(self, "选择透明桌宠形象", self.directory, "PNG 图片 (*.png)")
@@ -336,6 +333,7 @@ class ScheduledTaskDialog(QDialog):
         actions.addWidget(button("取消", self.reject))
         actions.addWidget(button("保存任务", self.save, primary=True))
         form.addRow(actions)
+        style_row_views(self)
 
     def save(self):
         when = self.when.dateTime().toPyDateTime().replace(second=0, microsecond=0, tzinfo=None)
@@ -368,6 +366,7 @@ class CasualRoomDialog(QDialog):
         self.follow = QCheckBox("跟随当前可见桌宠")
         self.follow.setChecked(room.follow_visible)
         self.members = QListWidget()
+        self.members.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.members.setAccessibleName("房间成员")
         self.members.setFixedHeight(112)
         self.lead = QComboBox()
@@ -378,9 +377,8 @@ class CasualRoomDialog(QDialog):
             self.lead.addItem(member.name, member.key)
             item = QListWidgetItem(member.name + ("" if member.active else "（已停用）"))
             item.setData(Qt.ItemDataRole.UserRole, member.key)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if member.key in selected else Qt.CheckState.Unchecked)
             self.members.addItem(item)
+            item.setSelected(member.key in selected)
         self.lead.setCurrentIndex(max(0, self.lead.findData(room.lead)))
         self.mode = QComboBox()
         for mode, name in ROOM_MODES.items():
@@ -416,6 +414,7 @@ class CasualRoomDialog(QDialog):
         self.mode.currentIndexChanged.connect(self.update_fields)
         self.automatic.toggled.connect(self.update_fields)
         self.update_fields()
+        style_row_views(self)
 
     def update_fields(self):
         self.members.setEnabled(not self.follow.isChecked())
@@ -423,9 +422,7 @@ class CasualRoomDialog(QDialog):
         self.interval.setEnabled(self.automatic.isChecked())
 
     def save(self):
-        selected = tuple(item.data(Qt.ItemDataRole.UserRole)
-                         for item in (self.members.item(i) for i in range(self.members.count()))
-                         if item.checkState() == Qt.CheckState.Checked)
+        selected = tuple(item.data(Qt.ItemDataRole.UserRole) for item in self.members.selectedItems())
         room = replace(self.room, name=self.name.text().strip(), guidance=self.guidance.toPlainText().strip(),
                        topics=self.topics.toPlainText().strip(), members=selected, follow_visible=self.follow.isChecked(),
                        mode=self.mode.currentData(), lead=self.lead.currentData(), automatic=self.automatic.isChecked(),
@@ -471,8 +468,6 @@ class ManagerWindow(QDialog):
         self.nav.setAccessibleName("管理面板导航")
         nav_layout.addWidget(self.nav, 1)
         self.nav.addItems(["桌面", "会话", "群聊", "成员", "外观", "模型", "闲聊", "定时任务", "设置"])
-        nav_layout.addWidget(button("收起到托盘", self.desktop.hide_to_tray))
-        nav_layout.addWidget(button("退出桌面学伴", self.desktop.quit))
         self.pages = QStackedWidget()
         layout.addWidget(self.pages, 1)
         self.pages.addWidget(self.home_page())
@@ -484,6 +479,7 @@ class ManagerWindow(QDialog):
         self.pages.addWidget(self.schedule_page())
         self.tasks_index = self.pages.addWidget(self.tasks_page())
         self.settings_index = self.pages.addWidget(self.settings_page())
+        style_row_views(self)
         self.nav.currentRowChanged.connect(self.switch_page)
         self.team.changed.connect(self.refresh)
         self.team.line.connect(self.add_line)
@@ -552,6 +548,8 @@ class ManagerWindow(QDialog):
         actions = QHBoxLayout()
         contents.addLayout(actions)
         actions.addWidget(button("日常对话", self.desktop.show_chat, primary=True))
+        self.pets_toggle = button("", self.desktop.toggle_pets)
+        actions.addWidget(self.pets_toggle)
         self.exit_practice = button("结束伴学", self.desktop.engine.practice.close)
         actions.addWidget(self.exit_practice)
         actions.addStretch()
@@ -575,15 +573,19 @@ class ManagerWindow(QDialog):
         body.addWidget(self.history, 1)
         roster = QVBoxLayout()
         roster.addWidget(label("参与成员", "section"))
-        roster.addWidget(label(f"群聊每轮最多 {MAX_SPEAKERS} 位。\n并行协作由主学伴带队，最多 {MAX_WORKERS} 位子成员。", "quiet"))
+        self.group_count = label("", "quiet")
+        self.group_count.setMaximumWidth(182)
+        roster.addWidget(self.group_count)
         self.participants = QListWidget()
-        self.participants.setAccessibleName("勾选参与成员")
-        self.participants.setFixedWidth(156)
+        self.participants.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.participants.setAccessibleName("选择参与成员")
+        self.participants.setFixedWidth(182)
         roster.addWidget(self.participants, 1)
         body.addLayout(roster)
+        self.group_roster = ()
         self.prompt = QPlainTextEdit()
         self.prompt.setFixedHeight(69)
-        self.prompt.setPlaceholderText("发给勾选的成员。也可以用 @成员名称 指定回复。")
+        self.prompt.setPlaceholderText("点击成员行来选择发言者，或用 @成员名 点名。")
         layout.addWidget(self.prompt)
         actions = QHBoxLayout()
         layout.addLayout(actions)
@@ -592,10 +594,15 @@ class ManagerWindow(QDialog):
         self.stop_button = button("停止", self.team.stop)
         self.task_button = button("接力讨论", lambda: self.start("task"))
         self.parallel_button = button("并行协作", lambda: self.start("parallel"))
-        self.parallel_button.setToolTip("主学伴负责拆分与汇总，勾选的子成员同时处理各自任务。")
+        self.parallel_button.setToolTip("主学伴负责拆分与汇总，选中的子成员同时处理各自任务。")
         self.send_button = button("发送", lambda: self.start("chat"), primary=True)
         for action in (self.stop_button, self.task_button, self.parallel_button, self.send_button):
             actions.addWidget(action)
+        self.participants.itemSelectionChanged.connect(self.group_input_changed)
+        self.prompt.textChanged.connect(self.group_input_changed)
+        self.send_button.setToolTip("发送（Ctrl+Enter）")
+        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.prompt)
+        shortcut.activated.connect(self.send_button.click)
         return page
 
     def chat_page(self):
@@ -803,22 +810,36 @@ class ManagerWindow(QDialog):
         layout.addWidget(self.settings_tabs, 1)
         appearance = self.settings_section("外观")
         general = self.settings_section("通用")
+        pets = self.settings_section("桌宠")
         workspace = self.settings_section("工作空间")
         self.theme = QComboBox()
         for key, (name, _) in PANEL_THEMES.items():
             self.theme.addItem(name, key)
         self.theme.setCurrentIndex(max(0, self.theme.findData(preferences.value("theme", "slate", type=str))))
         appearance.addRow("颜色主题", self.theme)
-        self.theme_color = QLineEdit(preferences.value("theme_color", "#1a232b", type=str))
+        self.custom_color = preferences.value("theme_color", "#1a232b", type=str)
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", self.custom_color):
+            self.custom_color = "#1a232b"
+        self.theme_color = QLineEdit()
         self.theme_color.setMaxLength(7)
         self.theme_color.setPlaceholderText("#RRGGBB")
         self.pick_color = button("选颜色…", self.pick_theme_color)
+        self.theme_swatch = QFrame()
+        self.theme_swatch.setObjectName("themeSwatch")
+        self.theme_swatch.setFixedSize(32, 30)
+        self.theme_swatch.setAccessibleName("当前主题颜色")
         color_row = QHBoxLayout()
+        color_row.addWidget(self.theme_swatch)
         color_row.addWidget(self.theme_color, 1)
         color_row.addWidget(self.pick_color)
-        appearance.addRow("自定义颜色", color_row)
-        self.theme.currentIndexChanged.connect(self.update_theme_fields)
-        self.update_theme_fields()
+        appearance.addRow("主色", color_row)
+        appearance.addRow(label("选择预设、输入 HEX 色值或打开选色器，面板配色会立即更新并保存。", "quiet"))
+        self.theme_status = label("", "notice")
+        appearance.addRow(self.theme_status)
+        self.theme.currentIndexChanged.connect(self.apply_theme_choice)
+        self.theme_color.textEdited.connect(self.customize_theme)
+        self.theme_color.editingFinished.connect(self.finish_color_edit)
+        self.show_theme_color(self.theme.currentData())
 
         self.close_action = QComboBox()
         self.close_action.addItem("收起到系统托盘", "tray")
@@ -827,6 +848,18 @@ class ManagerWindow(QDialog):
             preferences.value("close_action", "tray", type=str))))
         general.addRow("关闭面板时", self.close_action)
         general.addRow(label("收起后桌宠与定时任务继续运行。退出时会结束当前伴学和后台工作。", "quiet"))
+
+        self.pets_on_startup = QCheckBox("启动时显示桌宠")
+        self.pets_on_startup.setChecked(preferences.value("pets_on_startup", True, type=bool))
+        self.snap_enabled = QCheckBox("拖到屏幕两侧或底部时进入探头状态")
+        self.snap_enabled.setChecked(preferences.value("snap_enabled", True, type=bool))
+        self.bubble_seconds = QSpinBox()
+        self.bubble_seconds.setRange(4, 30)
+        self.bubble_seconds.setValue(preferences.value("bubble_seconds", 12, type=int))
+        self.bubble_seconds.setSuffix(" 秒")
+        pets.addRow(self.pets_on_startup)
+        pets.addRow(self.snap_enabled)
+        pets.addRow("回复气泡停留", self.bubble_seconds)
 
         self.workspace_folder = QLineEdit(preferences.value("workspace_directory", "", type=str))
         self.workspace_folder.setPlaceholderText("选择导入皮肤和素材时优先打开的目录")
@@ -844,7 +877,10 @@ class ManagerWindow(QDialog):
         workspace.addRow(self.remember_geometry)
         self.settings_notice = label("", "notice")
         layout.addWidget(self.settings_notice)
-        layout.addWidget(button("保存设置", self.save_preferences, primary=True), alignment=Qt.AlignmentFlag.AlignRight)
+        self.settings_save = button("保存设置", self.save_preferences, primary=True)
+        layout.addWidget(self.settings_save, alignment=Qt.AlignmentFlag.AlignRight)
+        self.settings_save.hide()
+        self.settings_tabs.currentChanged.connect(self.show_settings_actions)
         return page
 
     def settings_section(self, name):
@@ -855,16 +891,58 @@ class ManagerWindow(QDialog):
         self.settings_tabs.addTab(panel, name)
         return form
 
-    def update_theme_fields(self):
-        custom = self.theme.currentData() == "custom"
-        self.theme_color.setEnabled(custom)
-        self.pick_color.setEnabled(custom)
+    def show_settings_actions(self, index):
+        self.settings_save.setVisible(index != 0)
+        self.settings_notice.clear()
+
+    def show_theme_color(self, theme):
+        color = self.custom_color if theme == "custom" else PANEL_THEMES[theme][1]
+        self.theme_color.setText(color)
+        self.update_swatch(color)
+        return color
+
+    def update_swatch(self, color):
+        border = palette_for(color).border
+        self.theme_swatch.setStyleSheet(f"QFrame#themeSwatch{{background:{color};border:1px solid {border};border-radius:6px;}}")
+
+    def apply_theme_choice(self):
+        theme = self.theme.currentData()
+        color = self.show_theme_color(theme)
+        self.apply_theme(theme, color)
+
+    def customize_theme(self, value):
+        value = value.strip()
+        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+            self.theme_status.clear()
+            return
+        color = "#" + value.lstrip("#").lower()
+        self.custom_color = color
+        with QSignalBlocker(self.theme):
+            self.theme.setCurrentIndex(self.theme.findData("custom"))
+        self.update_swatch(color)
+        self.apply_theme("custom", color)
+
+    def finish_color_edit(self):
+        if re.fullmatch(r"#?[0-9a-fA-F]{6}", self.theme_color.text().strip()):
+            self.show_theme_color(self.theme.currentData())
+        else:
+            self.theme_status.setText("请输入 6 位 HEX 色值，例如 #2B3A50。")
+
+    def apply_theme(self, theme, color):
+        preferences = self.desktop.preferences
+        self.setStyleSheet(panel_style(theme, color))
+        preferences.setValue("theme", theme)
+        preferences.setValue("theme_color", self.custom_color)
+        preferences.sync()
+        self.theme_status.setText("主题已应用。" if preferences.status() == QSettings.Status.NoError
+                                  else "主题已预览，无法写入设置。")
 
     def pick_theme_color(self):
         initial = QColor(self.theme_color.text())
         color = QColorDialog.getColor(initial if initial.isValid() else QColor("#1a232b"), self, "管理面板颜色")
         if color.isValid():
             self.theme_color.setText(color.name())
+            self.customize_theme(color.name())
 
     def choose_workspace(self):
         folder = QFileDialog.getExistingDirectory(self, "选择工作目录", self.workspace_folder.text())
@@ -883,23 +961,20 @@ class ManagerWindow(QDialog):
         if folder and (not Path(folder).is_absolute() or not Path(folder).is_dir()):
             self.settings_notice.setText("请选择存在的工作目录，或将此项留空。")
             return
-        theme = self.theme.currentData()
-        color = self.theme_color.text().strip()
-        if theme == "custom" and not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
-            self.settings_notice.setText("自定义颜色格式为 #RRGGBB，例如 #2B3A50。")
-            return
         preferences = self.desktop.preferences
-        preferences.setValue("theme", theme)
-        preferences.setValue("theme_color", color)
         preferences.setValue("close_action", self.close_action.currentData())
+        preferences.setValue("pets_on_startup", self.pets_on_startup.isChecked())
+        preferences.setValue("snap_enabled", self.snap_enabled.isChecked())
+        preferences.setValue("bubble_seconds", self.bubble_seconds.value())
         preferences.setValue("workspace_directory", folder)
         preferences.setValue("startup_page", self.startup_page_field.currentText())
         preferences.setValue("remember_geometry", self.remember_geometry.isChecked())
         if not self.remember_geometry.isChecked():
             preferences.remove("manager_geometry")
         preferences.sync()
-        self.setStyleSheet(panel_style(theme, color))
-        self.settings_notice.setText("设置已保存。")
+        self.desktop.apply_pet_preferences()
+        self.settings_notice.setText("设置已保存。" if preferences.status() == QSettings.Status.NoError
+                                     else "无法写入设置，请检查本机存储权限。")
 
     def schedule_page(self):
         page, layout = self.page("桌面闲聊")
@@ -932,6 +1007,7 @@ class ManagerWindow(QDialog):
         actions.addWidget(self.casual_notice, 1)
         self.send_casual = button("发送", self.send_room_post, primary=True)
         actions.addWidget(self.send_casual)
+        self.room_post.textChanged.connect(self.update_room_actions)
         self.rooms.currentIndexChanged.connect(self.refresh_casual)
         return page
 
@@ -975,9 +1051,13 @@ class ManagerWindow(QDialog):
         scrollbar = self.room_history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
         self.casual_notice.setText(self.room_notices.get(room.key, ""))
-        for control in (self.try_chat, self.send_casual):
-            control.setEnabled(not self.team.running and not self.team.blocked)
+        self.update_room_actions()
         self.stop_casual.setEnabled(self.team.active_room == room.key and self.team.running)
+
+    def update_room_actions(self):
+        ready = self.rooms.currentData() is not None and not self.team.running and not self.team.blocked
+        self.try_chat.setEnabled(ready)
+        self.send_casual.setEnabled(ready and bool(self.room_post.text().strip()))
 
     def show_room_notice(self, key, text):
         self.room_notices[key] = text
@@ -1111,7 +1191,26 @@ class ManagerWindow(QDialog):
     def selected(self):
         return [self.participants.item(index).data(Qt.ItemDataRole.UserRole)
                 for index in range(self.participants.count())
-                if self.participants.item(index).checkState() == Qt.CheckState.Checked]
+                if self.participants.item(index).isSelected()]
+
+    def group_input_changed(self):
+        if not self.team.running:
+            size = len(self.prompt.toPlainText().strip())
+            self.group_notice.setText(f"消息最多 {MAX_INPUT} 字。" if size > MAX_INPUT else "")
+        self.update_group_actions()
+
+    def update_group_actions(self):
+        prompt = self.prompt.toPlainText().strip()
+        selected = self.selected()
+        count = len(selected)
+        addressed = self.team.mentions(prompt, self.group_roster) or selected
+        child_count = sum(key != PRIMARY for key in selected)
+        self.group_count.setText(f"已选 {count} 位 · 每轮最多 {MAX_SPEAKERS} 位")
+        ready = not self.team.blocked and not self.team.running and bool(prompt) and len(prompt) <= MAX_INPUT
+        self.send_button.setEnabled(ready and 1 <= len(addressed) <= MAX_SPEAKERS)
+        self.task_button.setEnabled(ready and 2 <= count <= MAX_SPEAKERS)
+        self.parallel_button.setEnabled(ready and 1 <= child_count <= MAX_WORKERS)
+        self.stop_button.setEnabled(self.team.running)
 
     def start(self, kind):
         try:
@@ -1127,8 +1226,10 @@ class ManagerWindow(QDialog):
         checked = set(self.selected())
         first_load = not self.participants.count()
         self.members.clear()
-        self.participants.clear()
         members = self.team.store.members()
+        self.group_roster = [member for member in members if member.active]
+        selection_signals = QSignalBlocker(self.participants)
+        self.participants.clear()
         keys = {member.skin for member in members if member.key != PRIMARY}
         icons = {skin.key: portrait_icon(skin) for skin in self.skin_library.all(saved_palettes=False) if skin.key in keys}
         icons[PRIMARY] = portrait_icon(self.skin_library.current())
@@ -1144,9 +1245,10 @@ class ManagerWindow(QDialog):
             if member.active:
                 entry = QListWidgetItem(member.name)
                 entry.setData(Qt.ItemDataRole.UserRole, member.key)
-                entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                entry.setCheckState(Qt.CheckState.Checked if first_load or member.key in checked else Qt.CheckState.Unchecked)
                 self.participants.addItem(entry)
+                entry.setSelected(self.participants.count() <= MAX_SPEAKERS if first_load else member.key in checked)
+        selection_signals.unblock()
+        self.update_group_actions()
         if self.members.currentRow() < 0:
             self.members.setCurrentRow(0)
         for combo in (self.appearance_member, self.chat_member, self.model_target):
@@ -1200,14 +1302,18 @@ class ManagerWindow(QDialog):
     def refresh(self):
         active = self.team.blocked
         self.mode.setText("当前对话正在伴学" if active else "桌面学伴待命")
-        count = sum(member.visible and member.active for member in self.team.store.members())
-        room = self.team.automatic_room()
-        schedule = f"{room.name} · 每 {room.minutes} 分钟" if room else "定时闲聊关闭"
-        self.info.setText(f"{count} 位伙伴显示在桌面 · {schedule}")
+        self.update_pet_visibility()
         self.member_hint.setText(f"最多保存 {MAX_MEMBERS} 位成员。私聊和长期记忆分别保存。")
         self.exit_practice.setEnabled(active)
-        for control in (self.send_button, self.task_button, self.parallel_button):
-            control.setEnabled(not active and not self.team.running)
-        self.stop_button.setEnabled(self.team.running)
+        self.update_group_actions()
         self.refresh_history()
         self.refresh_casual()
+
+    def update_pet_visibility(self):
+        visible = self.desktop.pets_visible
+        self.pets_toggle.setText("隐藏桌宠" if visible else "显示桌宠")
+        count = 1 if self.team.blocked else sum(member.visible and member.active for member in self.team.store.members())
+        room = self.team.automatic_room()
+        schedule = f"{room.name} · 每 {room.minutes} 分钟" if room else "定时闲聊关闭"
+        status = f"{count} 位学伴显示在桌面" if visible else "桌宠已隐藏"
+        self.info.setText(f"{status} · {schedule}")
