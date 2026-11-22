@@ -21,6 +21,9 @@ MIN_INTERVAL = 15
 MAX_INTERVAL = 240
 MAX_TOPICS = 30
 MAX_TOPIC_LENGTH = 120
+DEFAULT_ROOM = "desktop"
+ROOM_MODES = {"rotate": "双人轮换", "everyone": "全组依次发言", "lead": "主持人先发言"}
+MENTION_START = r"(?<![A-Za-z0-9_.+%-])@"
 TOPICS = (
     "聊聊你们各自觉得练习新软件时最舒服的节奏。",
     "用几句话聊聊今天想学的小知识。",
@@ -38,6 +41,20 @@ class Member:
     skin: str = "default"
     visible: bool = False
     active: bool = True
+
+
+@dataclass(frozen=True)
+class CasualRoom:
+    key: str
+    name: str = ""
+    guidance: str = ""
+    topics: str = ""
+    members: tuple[str, ...] = ()
+    follow_visible: bool = False
+    mode: str = "rotate"
+    lead: str = PRIMARY
+    automatic: bool = False
+    minutes: int = 45
 
 
 class TeamStore:
@@ -60,6 +77,14 @@ class TeamStore:
                 );
                 CREATE TABLE IF NOT EXISTS parallel_round (
                     id TEXT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS casual_room (
+                    key TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, guidance TEXT NOT NULL,
+                    topics TEXT NOT NULL, members TEXT NOT NULL, follow_visible INTEGER NOT NULL,
+                    mode TEXT NOT NULL, lead TEXT NOT NULL, automatic INTEGER NOT NULL, minutes INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS casual_round (
+                    round_id TEXT PRIMARY KEY, room_key TEXT NOT NULL
                 );
             """)
             db.execute("INSERT OR IGNORE INTO member VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -99,12 +124,14 @@ class TeamStore:
             except sqlite3.IntegrityError:
                 raise ValueError("这个名称已被使用。") from None
 
-    def add_line(self, round_id, kind, speaker, body, member_key=None):
+    def add_line(self, round_id, kind, speaker, body, member_key=None, *, casual_key=None):
         with closing(self.connect()) as db, db:
             if kind == "parallel":
                 # Older versions display these rounds as ordinary collaboration.
                 db.execute("INSERT OR IGNORE INTO parallel_round(id) VALUES (?)", (round_id,))
                 kind = "task"
+            if casual_key:
+                db.execute("INSERT INTO casual_round(round_id, room_key) VALUES (?, ?)", (round_id, casual_key))
             db.execute("INSERT INTO room(round, kind, speaker, member_key, body) VALUES (?, ?, ?, ?, ?)",
                        (round_id, kind, speaker, member_key, body))
 
@@ -119,7 +146,30 @@ class TeamStore:
                 raise ValueError("找不到选中的桌宠。")
             db.execute("INSERT OR REPLACE INTO member_appearance(member_key, palette) VALUES (?, ?)", (key, palette))
 
-    def lines(self, limit=80, *, kinds=(), round_id=None):
+    def rooms(self):
+        with closing(self.connect()) as db:
+            return [CasualRoom(row["key"], row["name"], row["guidance"], row["topics"], tuple(json.loads(row["members"])),
+                               bool(row["follow_visible"]), row["mode"], row["lead"], bool(row["automatic"]), row["minutes"])
+                    for row in db.execute("SELECT * FROM casual_room ORDER BY rowid")]
+
+    def save_room(self, room, *, initialize=False):
+        with closing(self.connect()) as db, db:
+            if initialize and db.execute("SELECT 1 FROM casual_room WHERE key=?", (room.key,)).fetchone():
+                return
+            if room.automatic:
+                db.execute("UPDATE casual_room SET automatic=0 WHERE key <> ?", (room.key,))
+            try:
+                db.execute("""
+                    INSERT INTO casual_room VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET name=excluded.name, guidance=excluded.guidance, topics=excluded.topics,
+                        members=excluded.members, follow_visible=excluded.follow_visible, mode=excluded.mode,
+                        lead=excluded.lead, automatic=excluded.automatic, minutes=excluded.minutes
+                """, (room.key, room.name, room.guidance, room.topics, json.dumps(room.members), room.follow_visible,
+                      room.mode, room.lead, room.automatic, room.minutes))
+            except sqlite3.IntegrityError:
+                raise ValueError("已有同名闲聊房间。") from None
+
+    def lines(self, limit=80, *, kinds=(), round_id=None, casual_key=None):
         query = """
             SELECT room.*, CASE WHEN parallel_round.id IS NULL THEN room.kind ELSE 'parallel' END AS display_kind
             FROM room LEFT JOIN parallel_round ON room.round = parallel_round.id
@@ -133,6 +183,10 @@ class TeamStore:
         if round_id:
             where.append("room.round = ?")
             params.append(round_id)
+        if casual_key:
+            query += " LEFT JOIN casual_round ON room.round = casual_round.round_id "
+            where.append("room.kind = 'casual' AND COALESCE(casual_round.room_key, ?) = ?")
+            params.extend((DEFAULT_ROOM, casual_key))
         if where:
             query += " WHERE " + " AND ".join(where)
         with closing(self.connect()) as db:
@@ -144,6 +198,7 @@ class TeamCoordinator(QObject):
     changed = pyqtSignal()
     line = pyqtSignal(str, str, str)
     notice = pyqtSignal(str)
+    room_notice = pyqtSignal(str, str)
     finished = pyqtSignal(str)
 
     def __init__(self, store, settings_path, model_settings, quiet_ready, parent=None):
@@ -154,7 +209,15 @@ class TeamCoordinator(QObject):
         self.quiet_ready = quiet_ready
         self.blocked = False
         self.token = None
-        self.topic_index = 0
+        self.turns = {}
+        self.topics_played = {}
+        self.active_room = ""
+        legacy_minutes = self.settings.value("interval", 45, type=int)
+        self.store.save_room(CasualRoom(
+            DEFAULT_ROOM, "桌面闲聊", topics=self.settings.value("casual_topics", "", type=str),
+            follow_visible=True, automatic=self.settings.value("enabled", False, type=bool),
+            minutes=max(MIN_INTERVAL, min(MAX_INTERVAL, legacy_minutes)),
+        ), initialize=True)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.finished.connect(self.finish)
@@ -164,25 +227,34 @@ class TeamCoordinator(QObject):
     def running(self):
         return self.token is not None
 
-    def schedule(self):
-        interval = self.settings.value("interval", 45, type=int)
-        return self.settings.value("enabled", False, type=bool), max(MIN_INTERVAL, min(MAX_INTERVAL, interval))
+    def automatic_room(self):
+        return next((room for room in self.store.rooms() if room.automatic), None)
 
     def configure_timer(self):
-        enabled, minutes = self.schedule()
-        if enabled and not self.blocked:
-            self.timer.start(minutes * 60_000)
+        room = self.automatic_room()
+        if room and not self.blocked:
+            self.timer.start(room.minutes * 60_000)
         else:
             self.timer.stop()
 
-    def set_schedule(self, enabled, minutes):
-        self.settings.setValue("enabled", enabled)
-        self.settings.setValue("interval", max(MIN_INTERVAL, min(MAX_INTERVAL, minutes)))
-        self.settings.sync()
+    def save_room(self, room):
+        if not room.name or len(room.name) > 32 or not room.name.isprintable():
+            raise ValueError("请填写 1–32 字的房间名称。")
+        if len(room.guidance) > 400:
+            raise ValueError("房间提示最多 400 字。")
+        if room.mode not in ROOM_MODES or not MIN_INTERVAL <= room.minutes <= MAX_INTERVAL:
+            raise ValueError("请选择有效的发言方式和闲聊间隔。")
+        self.parse_topics(room.topics)
+        if not room.follow_visible and len(room.members) < 2:
+            raise ValueError("请选择至少两位成员。")
+        if room.mode == "lead" and not room.follow_visible and room.lead not in room.members:
+            raise ValueError("主持人需要加入本房间。")
+        previous = next((entry for entry in self.store.rooms() if entry.key == room.key), None)
+        self.store.save_room(room)
+        if previous is None or previous.topics != room.topics:
+            self.topics_played.pop(room.key, None)
         self.configure_timer()
-
-    def custom_topics(self):
-        return self.settings.value("casual_topics", "", type=str)
+        self.changed.emit()
 
     @staticmethod
     def parse_topics(text):
@@ -190,13 +262,6 @@ class TeamCoordinator(QObject):
         if len(topics) > MAX_TOPICS or any(len(topic) > MAX_TOPIC_LENGTH for topic in topics):
             raise ValueError(f"最多填写 {MAX_TOPICS} 条，每条不超过 {MAX_TOPIC_LENGTH} 字。")
         return topics
-
-    def set_topics(self, text):
-        value = "\n".join(self.parse_topics(text))
-        if value != self.custom_topics():
-            self.settings.setValue("casual_topics", value)
-            self.settings.sync()
-            self.topic_index = 0
 
     def set_blocked(self, blocked):
         if self.blocked == blocked:
@@ -210,26 +275,64 @@ class TeamCoordinator(QObject):
     def tick(self):
         if self.blocked or self.running or not self.quiet_ready():
             return
+        room = None
         try:
-            self.casual()
+            room = self.automatic_room()
+            if room:
+                self.casual(room)
         except (ValueError, sqlite3.Error) as error:
-            self.notice.emit(str(error))
+            if room:
+                self.room_notice.emit(room.key, str(error))
+            else:
+                self.notice.emit(str(error))
 
-    def casual(self, topics=None):
+    @staticmethod
+    def mentions(prompt, roster):
+        by_name = {member.name: member.key for member in roster}
+        names = "|".join(re.escape(name) for name in sorted(by_name, key=len, reverse=True))
+        if not names:
+            return []
+        hits = re.findall(MENTION_START + r"(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])", prompt)
+        return list(dict.fromkeys(by_name[name] for name in hits))
+
+    def room_members(self, room):
+        roster = self.store.members()
+        return [member for member in roster if member.active
+                and (member.visible if room.follow_visible else member.key in room.members)]
+
+    def casual(self, room, prompt=None):
         if not self.quiet_ready():
             raise ValueError("正在处理私聊，完成后再试。")
-        members = [member.key for member in self.store.members()
-                   if member.active and (member.visible or member.key == PRIMARY)]
+        members = [member.key for member in self.room_members(room)]
         if len(members) < 2:
-            raise ValueError("请先在「成员」中显示至少两位桌宠。")
-        offset = self.topic_index % len(members)
-        topics = self.parse_topics(self.custom_topics()) if topics is None else topics
-        topics = topics or TOPICS
-        topic = topics[self.topic_index % len(topics)]
-        self.start("casual", topic, [members[offset], members[(offset + 1) % len(members)]])
-        self.topic_index += 1
+            raise ValueError("本房间需要至少两位可参与的成员，请检查房间设置。")
+        offset = self.turns.get(room.key, 0) % len(members)
+        order = members[offset:] + members[:offset]
+        topic_step = self.topics_played.get(room.key, 0)
+        topics = self.parse_topics(room.topics) or TOPICS
+        topic = prompt if prompt is not None else topics[topic_step % len(topics)]
+        targeted = self.mentions(topic, self.store.members()) if prompt is not None else []
+        broadcast = prompt is not None and re.search(MENTION_START + r"(?:all|everyone)(?!\w)", topic, flags=re.IGNORECASE)
+        if broadcast:
+            selected = order[:MAX_SPEAKERS]
+        elif targeted:
+            if any(key not in members for key in targeted):
+                raise ValueError("点名的学伴不在本房间，或已停用。")
+            selected = targeted[:MAX_SPEAKERS]
+        elif room.mode == "everyone":
+            selected = order[:MAX_SPEAKERS]
+        elif room.mode == "lead":
+            if room.lead not in members:
+                raise ValueError("本房间的主持人暂时不可参与，请检查成员设置。")
+            selected = [room.lead, next(key for key in order if key != room.lead)]
+        else:
+            selected = order[:2]
+        self.start("casual", topic, selected, room=room, human_post=prompt is not None)
+        self.turns[room.key] = self.turns.get(room.key, 0) + 1
+        if prompt is None:
+            self.topics_played[room.key] = topic_step + 1
 
-    def start(self, kind, prompt, selected, *, scheduled=None):
+    def start(self, kind, prompt, selected, *, scheduled=None, room=None, human_post=False):
         if self.blocked:
             raise ValueError("当前正在屏幕伴学。结束后可以继续群聊。")
         if self.running:
@@ -239,10 +342,7 @@ class TeamCoordinator(QObject):
             raise ValueError(f"请输入 1–{MAX_INPUT} 个字。")
         roster = [member for member in self.store.members() if member.active]
         if kind == "chat" and not scheduled:
-            by_name = {member.name: member.key for member in roster}
-            names = "|".join(re.escape(name) for name in sorted(by_name, key=len, reverse=True))
-            mentions = re.findall(r"@(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])", prompt) if names else []
-            selected = list(dict.fromkeys(by_name[name] for name in mentions)) or selected
+            selected = self.mentions(prompt, roster) or selected
         by_key = {member.key: member for member in roster}
         members = [by_key[key] for key in selected if key in by_key][:MAX_SPEAKERS]
         if kind == "parallel":
@@ -251,7 +351,7 @@ class TeamCoordinator(QObject):
                 raise ValueError("请勾选至少一位子成员，主学伴会自动加入。")
             members = [by_key[PRIMARY], *workers]
         else:
-            minimum = 1 if kind == "chat" else 2
+            minimum = 1 if kind in {"chat", "casual"} else 2
             if len(members) < minimum:
                 raise ValueError(f"请勾选至少 {minimum} 位参与成员。")
         endpoint, model, key = self.model_settings()
@@ -261,29 +361,42 @@ class TeamCoordinator(QObject):
             round_id, name = scheduled
             speaker = f"定时 · {name}"
             history = []
+        elif room:
+            round_id = uuid4().hex
+            speaker = "你" if human_post else "闲聊话题"
+            history = self.store.lines(7, casual_key=room.key)
         else:
             round_id = uuid4().hex
-            speaker = "闲聊话题" if kind == "casual" else "你"
-            history = self.store.lines(7, kinds=("casual",) if kind == "casual" else ("chat", "task"))
-        self.store.add_line(round_id, kind, speaker, prompt)
+            speaker = "你"
+            history = self.store.lines(7, kinds=("chat", "task"))
+        self.store.add_line(round_id, kind, speaker, prompt, casual_key=room.key if room else None)
         token = Event()
         self.token = token
+        self.active_room = room.key if room else ""
         self.changed.emit()
-        self.notice.emit("主学伴正在拆分任务…" if kind == "parallel" else "成员正在交流…")
-        Thread(target=self.run, args=(token, round_id, kind, prompt, members, history, (endpoint, model, key)),
+        self.report("主学伴正在拆分任务…" if kind == "parallel" else "成员正在交流…")
+        Thread(target=self.run, args=(token, round_id, kind, prompt, members, history, (endpoint, model, key),
+                                    room.guidance if room else ""),
                daemon=True).start()
+
+    def report(self, message):
+        if self.active_room:
+            self.room_notice.emit(self.active_room, message)
+        else:
+            self.notice.emit(message)
 
     def stop(self):
         if self.token is not None and not self.token.is_set():
             self.token.set()
-            self.notice.emit("正在停止，已发出的请求结束后可开启新一轮。")
+            self.report("正在停止，已发出的请求结束后可开启新一轮。")
 
     def finish(self, message):
         self.token = None
+        self.report(message)
+        self.active_room = ""
         self.changed.emit()
-        self.notice.emit(message)
 
-    def run(self, token, round_id, kind, prompt, members, history, config):
+    def run(self, token, round_id, kind, prompt, members, history, config, guidance):
         replies = []
         result = "本轮已结束。"
         transcript = "\n".join(f"{row['speaker']}：{excerpt(row['body'], 500)}" for row in history)
@@ -299,7 +412,9 @@ class TeamCoordinator(QObject):
                     instruction = ("综合前面的意见，给出一份可执行的结论，并标出仍待验证的地方。"
                                    if index == len(members) - 1 else "从自己的分工给出建议或核对已有步骤。")
                 elif kind == "casual":
-                    instruction = "接着上一位成员的话自然闲聊。输出适合桌面气泡的 60 个字以内。"
+                    instruction = "围绕本轮话题接话。输出适合桌面气泡的 60 个字以内。"
+                    if guidance:
+                        instruction += f" 房间提示：{guidance}"
                 else:
                     instruction = "回应用户或前一位成员，补充自己的观点。"
                 thread = "\n".join(f"{name}：{excerpt(body, 800)}" for name, body in replies)

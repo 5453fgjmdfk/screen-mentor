@@ -36,7 +36,7 @@ def fit_position(position, size, area):
 
 class CompanionAction(QPushButton):
     labels = {"pause": "暂停", "resume": "继续", "help": "答疑", "stop": "停止", "appearance": "外观",
-              "chat": "日常对话"}
+              "chat": "日常对话", "manager": "打开管理面板", "quit": "退出桌面学伴"}
 
     def __init__(self, action):
         super().__init__()
@@ -94,6 +94,29 @@ class CompanionAction(QPushButton):
             mark.lineTo(1.3, 5.6)
             mark.lineTo(.2, 2.2)
             mark.closeSubpath()
+        elif self.action == "manager":
+            outer = QPainterPath()
+            outer.addRoundedRect(QRectF(0, .6, 13, 10.8), 1.7, 1.7)
+            inside = QPainterPath()
+            inside.addRoundedRect(QRectF(1.7, 3.2, 2.8, 6.5), .55, .55)
+            inside.addRoundedRect(QRectF(6.1, 3.2, 5.2, 6.5), .55, .55)
+            mark = outer.subtracted(inside)
+        elif self.action == "quit":
+            door = QPainterPath()
+            door.moveTo(5.2, .9)
+            door.lineTo(1, .9)
+            door.lineTo(1, 11.1)
+            door.lineTo(5.2, 11.1)
+            door.moveTo(5, 6)
+            door.lineTo(12, 6)
+            door.moveTo(9.5, 3.6)
+            door.lineTo(12, 6)
+            door.lineTo(9.5, 8.4)
+            stroke = QPainterPathStroker()
+            stroke.setWidth(1.6)
+            stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
+            stroke.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            mark = stroke.createStroke(door).simplified()
         else:
             mark.addRoundedRect(QRectF(0, 0, 12, 12), 1.6, 1.6)
         scale = 12 / mark.boundingRect().height()
@@ -449,6 +472,12 @@ class CompanionPanel(QWidget):
             self.state = None
             self.set_pose(pose)
         self.peek.set_skin(skin)
+
+    def add_desktop_actions(self, manager, quit_desktop):
+        for action, callback in (("manager", manager), ("quit", quit_desktop)):
+            control = CompanionAction(action)
+            control.clicked.connect(callback)
+            self.controls.layout().addWidget(control)
 
     def set_pose(self, state):
         self.peek.thinking = state == "thinking"

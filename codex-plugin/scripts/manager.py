@@ -13,9 +13,11 @@ from PyQt6.QtWidgets import (
 
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position
-from resident_agent import excerpt
+from resident_agent import MAX_INPUT, excerpt
 from scheduled import FREQUENCIES, MODES, ScheduledTask
-from team import MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, Member, PRIMARY
+from team import (
+    MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, CasualRoom, Member, PRIMARY, ROOM_MODES,
+)
 
 
 PANEL_STYLE = """
@@ -68,7 +70,7 @@ def show_centered(dialog):
 
 
 class TeamPet(CompanionPanel):
-    def __init__(self, member, open_chat, open_appearance, slot):
+    def __init__(self, member, desktop, slot):
         super().__init__(skin_key=member.skin, sprite_size=102)
         self.member = member
         self.slot = slot
@@ -89,12 +91,13 @@ class TeamPet(CompanionPanel):
         layout.addWidget(bubble)
         layout.addWidget(self.sprite, alignment=Qt.AlignmentFlag.AlignHCenter)
         chat = CompanionAction("chat")
-        chat.clicked.connect(lambda: open_chat(self.member.key))
-        self.clicked.connect(lambda: open_chat(self.member.key))
+        chat.clicked.connect(lambda: desktop.show_quick_chat(self.member.key))
+        self.clicked.connect(lambda: desktop.show_quick_chat(self.member.key))
         self.controls.layout().addWidget(chat)
         appearance = CompanionAction("appearance")
-        appearance.clicked.connect(lambda: open_appearance(self.member.key))
+        appearance.clicked.connect(lambda: desktop.show_appearance(self.member.key))
         self.controls.layout().addWidget(appearance)
+        self.add_desktop_actions(desktop.show_manager, desktop.quit)
         layout.addWidget(self.controls, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.bubble_timer = QTimer(self)
         self.bubble_timer.setSingleShot(True)
@@ -263,11 +266,100 @@ class ScheduledTaskDialog(QDialog):
         self.accept()
 
 
+class CasualRoomDialog(QDialog):
+    def __init__(self, parent, team, room, *, new=False):
+        super().__init__(parent)
+        self.team = team
+        self.room = room
+        self.setWindowTitle("新建闲聊房间" if new else "闲聊房间设置")
+        self.setMinimumWidth(560)
+        form = QFormLayout(self)
+        self.name = QLineEdit(room.name)
+        self.name.setMaxLength(32)
+        self.guidance = QPlainTextEdit(room.guidance)
+        self.guidance.setPlaceholderText("例如：围绕电路学习交流，答复简短，遇到分歧先解释理由。")
+        self.guidance.setFixedHeight(58)
+        self.follow = QCheckBox("跟随当前可见桌宠")
+        self.follow.setChecked(room.follow_visible)
+        self.members = QListWidget()
+        self.members.setAccessibleName("房间成员")
+        self.members.setFixedHeight(112)
+        self.lead = QComboBox()
+        selected = room.members
+        if room.follow_visible and not selected:
+            selected = tuple(member.key for member in team.room_members(room))
+        for member in team.store.members():
+            self.lead.addItem(member.name, member.key)
+            item = QListWidgetItem(member.name + ("" if member.active else "（已停用）"))
+            item.setData(Qt.ItemDataRole.UserRole, member.key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if member.key in selected else Qt.CheckState.Unchecked)
+            self.members.addItem(item)
+        self.lead.setCurrentIndex(max(0, self.lead.findData(room.lead)))
+        self.mode = QComboBox()
+        for mode, name in ROOM_MODES.items():
+            self.mode.addItem(name, mode)
+        self.mode.setCurrentIndex(self.mode.findData(room.mode))
+        self.topics = QPlainTextEdit(room.topics)
+        self.topics.setPlaceholderText("每行一个话题，留空时使用内置话题。")
+        self.topics.setFixedHeight(72)
+        self.automatic = QCheckBox("把本房间设为定时闲聊房间")
+        self.automatic.setToolTip("同一时间只启用一个定时闲聊房间。")
+        self.automatic.setChecked(room.automatic)
+        self.interval = QSpinBox()
+        self.interval.setRange(MIN_INTERVAL, MAX_INTERVAL)
+        self.interval.setSuffix(" 分钟")
+        self.interval.setValue(room.minutes)
+        form.addRow("房间名称", self.name)
+        form.addRow("房间提示", self.guidance)
+        form.addRow(self.follow)
+        form.addRow("参与成员", self.members)
+        form.addRow("默认发言", self.mode)
+        form.addRow("主持人", self.lead)
+        form.addRow("闲聊话题", self.topics)
+        form.addRow(self.automatic)
+        form.addRow("自动间隔", self.interval)
+        self.notice = label("", "notice")
+        form.addRow(self.notice)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("取消", self.reject))
+        actions.addWidget(button("保存房间", self.save, primary=True))
+        form.addRow(actions)
+        self.follow.toggled.connect(self.update_fields)
+        self.mode.currentIndexChanged.connect(self.update_fields)
+        self.automatic.toggled.connect(self.update_fields)
+        self.update_fields()
+
+    def update_fields(self):
+        self.members.setEnabled(not self.follow.isChecked())
+        self.lead.setEnabled(self.mode.currentData() == "lead")
+        self.interval.setEnabled(self.automatic.isChecked())
+
+    def save(self):
+        selected = tuple(item.data(Qt.ItemDataRole.UserRole)
+                         for item in (self.members.item(i) for i in range(self.members.count()))
+                         if item.checkState() == Qt.CheckState.Checked)
+        room = replace(self.room, name=self.name.text().strip(), guidance=self.guidance.toPlainText().strip(),
+                       topics=self.topics.toPlainText().strip(), members=selected, follow_visible=self.follow.isChecked(),
+                       mode=self.mode.currentData(), lead=self.lead.currentData(), automatic=self.automatic.isChecked(),
+                       minutes=self.interval.value())
+        try:
+            self.team.save_room(room)
+        except (ValueError, sqlite3.Error) as error:
+            self.notice.setText(str(error))
+            return
+        self.accept()
+
+
 class ManagerWindow(QDialog):
     def __init__(self, team, desktop):
         super().__init__()
         self.team = team
         self.desktop = desktop
+        self.room_notices = {}
+        self.room_drafts = {}
+        self.displayed_room = ""
         self.setWindowTitle("屏幕伴学 · 管理面板")
         self.setStyleSheet(PANEL_STYLE)
         self.resize(840, 570)
@@ -304,9 +396,11 @@ class ManagerWindow(QDialog):
         self.team.changed.connect(self.refresh)
         self.team.line.connect(self.add_line)
         self.team.notice.connect(self.show_notice)
+        self.team.room_notice.connect(self.show_room_notice)
         self.desktop.scheduler.changed.connect(self.load_tasks)
         self.desktop.scheduler.notice.connect(self.tasks_notice.setText)
         self.reload_members()
+        self.reload_rooms()
         self.load_tasks()
         self.refresh()
 
@@ -516,49 +610,105 @@ class ManagerWindow(QDialog):
 
     def schedule_page(self):
         page, layout = self.page("桌面闲聊")
-        layout.addWidget(label("开启后，桌面上可见的两位伙伴会定期各说一句。伴学或已有对话运行时会跳过。", "quiet"))
-        enabled, interval = self.team.schedule()
-        form = QFormLayout()
-        layout.addLayout(form)
-        self.casual_enabled = QCheckBox("启用定期闲聊")
-        self.casual_enabled.setChecked(enabled)
-        form.addRow(self.casual_enabled)
-        self.casual_interval = QSpinBox()
-        self.casual_interval.setRange(MIN_INTERVAL, MAX_INTERVAL)
-        self.casual_interval.setSuffix(" 分钟")
-        self.casual_interval.setValue(interval)
-        form.addRow("间隔", self.casual_interval)
-        layout.addWidget(label("闲聊话题", "section"))
-        self.casual_topics = QPlainTextEdit(self.team.custom_topics())
-        self.casual_topics.setAccessibleName("自定义闲聊话题")
-        self.casual_topics.setPlaceholderText("每行一个话题，留空使用内置话题。\n例如：新手怎么练习读电路图？")
-        layout.addWidget(self.casual_topics, 1)
+        header = QHBoxLayout()
+        self.rooms = QComboBox()
+        self.rooms.setAccessibleName("选择闲聊房间")
+        header.addWidget(self.rooms, 1)
+        header.addWidget(button("房间设置", self.edit_room))
+        header.addWidget(button("新建房间", lambda: self.edit_room(new=True)))
+        layout.addLayout(header)
+        self.room_members = label("", "quiet")
+        layout.addWidget(self.room_members)
+        self.room_history = QPlainTextEdit()
+        self.room_history.setReadOnly(True)
+        self.room_history.setAccessibleName("当前闲聊房间记录")
+        self.room_history.setPlaceholderText("发条消息，或点「聊一次」让学伴开启下一个话题。")
+        layout.addWidget(self.room_history, 1)
+        self.room_post = QLineEdit()
+        self.room_post.setMaxLength(MAX_INPUT)
+        self.room_post.setPlaceholderText("在房间里发消息，也可以用 @成员名 或 @all")
+        self.room_post.returnPressed.connect(self.send_room_post)
+        layout.addWidget(self.room_post)
         actions = QHBoxLayout()
         layout.addLayout(actions)
         self.try_chat = button("聊一次", self.try_casual)
         actions.addWidget(self.try_chat)
-        actions.addWidget(button("保存闲聊设置", self.save_schedule, primary=True))
-        actions.addStretch()
+        self.stop_casual = button("停止闲聊", self.team.stop)
+        actions.addWidget(self.stop_casual)
         self.casual_notice = label("", "notice")
-        layout.addWidget(self.casual_notice)
+        actions.addWidget(self.casual_notice, 1)
+        self.send_casual = button("发送", self.send_room_post, primary=True)
+        actions.addWidget(self.send_casual)
+        self.rooms.currentIndexChanged.connect(self.refresh_casual)
         return page
 
-    def save_schedule(self):
-        try:
-            self.team.set_topics(self.casual_topics.toPlainText())
-        except ValueError as error:
-            self.casual_notice.setText(str(error))
+    def reload_rooms(self, key=None):
+        current = self.rooms.currentData()
+        key = key or (current.key if current else None)
+        with QSignalBlocker(self.rooms):
+            self.rooms.clear()
+            for room in self.team.store.rooms():
+                self.rooms.addItem(room.name, room)
+                if room.key == key:
+                    self.rooms.setCurrentIndex(self.rooms.count() - 1)
+        self.refresh_casual()
+
+    def edit_room(self, *, new=False):
+        room = self.rooms.currentData()
+        if new:
+            members = tuple(member.key for member in self.team.store.members() if member.active)[:2]
+            room = CasualRoom(uuid4().hex, members=members)
+        if room is None:
             return
-        self.team.set_schedule(self.casual_enabled.isChecked(), self.casual_interval.value())
-        self.casual_notice.setText("话题已保存，定时闲聊已开启。" if self.casual_enabled.isChecked()
-                                   else "话题已保存，可随时点「聊一次」。")
-        self.refresh()
+        dialog = CasualRoomDialog(self, self.team, room, new=new)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.reload_rooms(room.key)
+        dialog.deleteLater()
+
+    def refresh_casual(self):
+        room = self.rooms.currentData()
+        if room is None:
+            return
+        if self.displayed_room != room.key:
+            if self.displayed_room:
+                self.room_drafts[self.displayed_room] = self.room_post.text()
+            self.room_post.setText(self.room_drafts.get(room.key, ""))
+            self.displayed_room = room.key
+        members = "、".join(member.name for member in self.team.room_members(room))
+        schedule = f" · 每 {room.minutes} 分钟" if room.automatic else ""
+        self.room_members.setText(f"{members or '暂无可用成员'} · {ROOM_MODES[room.mode]}{schedule}")
+        rows = self.team.store.lines(casual_key=room.key)
+        self.room_history.setPlainText("\n\n".join(f"{row['speaker']}\n{row['body']}" for row in rows))
+        scrollbar = self.room_history.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.casual_notice.setText(self.room_notices.get(room.key, ""))
+        for control in (self.try_chat, self.send_casual):
+            control.setEnabled(not self.team.running and not self.team.blocked)
+        self.stop_casual.setEnabled(self.team.active_room == room.key and self.team.running)
+
+    def show_room_notice(self, key, text):
+        self.room_notices[key] = text
+        current = self.rooms.currentData()
+        if current and current.key == key:
+            self.casual_notice.setText(text)
 
     def try_casual(self):
+        self.run_casual()
+
+    def send_room_post(self):
+        if self.run_casual(self.room_post.text()):
+            self.room_post.clear()
+
+    def run_casual(self, prompt=None):
+        room = self.rooms.currentData()
+        if room is None:
+            return False
         try:
-            self.team.casual(self.team.parse_topics(self.casual_topics.toPlainText()))
+            self.team.casual(room, prompt)
         except (ValueError, sqlite3.Error) as error:
-            self.casual_notice.setText(str(error))
+            self.show_room_notice(room.key, str(error))
+            return False
+        return True
 
     def tasks_page(self):
         page, layout = self.page("定时任务")
@@ -729,17 +879,19 @@ class ManagerWindow(QDialog):
 
     def show_notice(self, message):
         self.group_notice.setText(message)
-        self.casual_notice.setText(message)
 
     def add_line(self, key, name, body):
-        self.refresh_history()
+        if self.team.active_room:
+            self.refresh_casual()
+        else:
+            self.refresh_history()
         task = self.current_task()
         if task and task.last_round and task.last_round == self.desktop.scheduler.active_round:
             self.show_task_result()
 
     def refresh_history(self):
         kinds = {"task": "接力", "parallel": "并行协作", "chat": "群聊", "casual": "闲聊"}
-        rows = self.team.store.lines()
+        rows = self.team.store.lines(kinds=("chat", "task"))
         self.history.setPlainText("\n\n".join(
             f"{row['speaker']} · {kinds[row['display_kind']]}\n{row['body']}" for row in rows))
         scrollbar = self.history.verticalScrollBar()
@@ -749,12 +901,13 @@ class ManagerWindow(QDialog):
         active = self.team.blocked
         self.mode.setText("当前对话正在伴学" if active else "桌面学伴待命")
         count = sum(member.visible and member.active for member in self.team.store.members())
-        enabled, minutes = self.team.schedule()
-        schedule = f"闲聊间隔 {minutes} 分钟" if enabled else "闲聊关闭"
+        room = self.team.automatic_room()
+        schedule = f"{room.name} · 每 {room.minutes} 分钟" if room else "定时闲聊关闭"
         self.info.setText(f"{count} 位伙伴显示在桌面 · {schedule}")
         self.member_hint.setText(f"最多保存 {MAX_MEMBERS} 位成员。私聊和长期记忆分别保存。")
         self.exit_practice.setEnabled(active)
-        for control in (self.send_button, self.task_button, self.parallel_button, self.try_chat):
+        for control in (self.send_button, self.task_button, self.parallel_button):
             control.setEnabled(not active and not self.team.running)
         self.stop_button.setEnabled(self.team.running)
         self.refresh_history()
+        self.refresh_casual()

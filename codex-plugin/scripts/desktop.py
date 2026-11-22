@@ -395,6 +395,7 @@ class Desktop(QObject):
         self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
         self.engine.practice.idle_chat.connect(lambda: self.show_quick_chat(PRIMARY))
         self.engine.practice.panel.clicked.connect(lambda: self.show_quick_chat(PRIMARY))
+        self.engine.practice.panel.add_desktop_actions(self.show_manager, self.quit)
         self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
         self.engine.practice.session_ended.connect(self.after_session)
@@ -521,7 +522,7 @@ class Desktop(QObject):
         slots = iter(slot for slot in range(len(members) + len(occupied)) if slot not in occupied)
         for member in members:
             if member.key not in self.pets:
-                pet = TeamPet(member, self.show_quick_chat, self.show_appearance, next(slots))
+                pet = TeamPet(member, self, next(slots))
                 self.pets[member.key] = pet
                 if not self.team.blocked:
                     pet.show()
