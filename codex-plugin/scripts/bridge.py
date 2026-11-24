@@ -12,7 +12,7 @@ from uuid import uuid4
 from PyQt6.QtCore import QCoreApplication
 from PyQt6.QtNetwork import QLocalSocket
 
-from protocol import MODERN_VERSION, discovery, requested_version, validated_arguments
+from protocol import MODERN_VERSION, discovery, requested_version
 from resident_agent import PROFILE
 
 
@@ -33,6 +33,8 @@ def roundtrip(socket, message, *, cancelled=None):
         payload = json.dumps(message, ensure_ascii=False).encode() + b"\n"
         if len(payload) > MAX_REQUEST:
             raise ValueError("工具请求超出大小限制。")
+        if cancelled is not None and cancelled.is_set():
+            return None
         socket.write(payload)
         socket.flush()
         deadline = time.monotonic() + 50
@@ -51,6 +53,8 @@ def ensure_desktop(*, cancelled=None):
     socket = connect()
     if socket:
         return socket
+    if cancelled is not None and cancelled.is_set():
+        return None
     python = Path(sys.executable).with_name("pythonw.exe")
     desktop = Path(__file__).with_name("desktop.py")
     subprocess.Popen([str(python), "-B", str(desktop), "--background"], cwd=desktop.parent,
@@ -68,9 +72,10 @@ def ensure_desktop(*, cancelled=None):
 
 
 def handle_call(request, owner, cancelled):
+    if cancelled.is_set():
+        return None
     params = request["params"]
     if params.get("name") == "wait_for_practice_change":
-        validated_arguments("wait_for_practice_change", params.get("arguments", {}))
         socket = connect()
         if socket is None:
             return {"jsonrpc": "2.0", "id": request["id"], "result": {

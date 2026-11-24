@@ -20,7 +20,7 @@ from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 import native
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
-from protocol import DEFAULT_POLL_SECONDS, PROGRESS_PHASES, validated_arguments
+from protocol import DEFAULT_POLL_SECONDS, PROGRESS_PHASES, tool_error, validated_arguments
 from target import tighten
 from window_reader import WindowReader
 
@@ -580,7 +580,7 @@ class MentorServer(QObject):
                 blocks = [text_content({"cleared": True})]
             return {"content": blocks}
         except (native.WindowError, ValueError) as exc:
-            return {"isError": True, "content": [text_content(str(exc))]}
+            return tool_error(str(exc))
 
     def respond(self, request, owner, *, disconnected=lambda: False):
         if (not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request

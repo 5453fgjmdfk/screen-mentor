@@ -4,9 +4,13 @@ from datetime import datetime
 from pathlib import Path
 import re
 import sqlite3
+from threading import Thread
 from uuid import uuid4
 
-from PyQt6.QtCore import QByteArray, QDateTime, QEvent, QPoint, QSettings, QSignalBlocker, QSize, QTimer, QUrl, Qt
+from PyQt6.QtCore import (
+    QByteArray, QDateTime, QEvent, QIODevice, QPoint, QSaveFile, QSettings, QSignalBlocker, QSize, QTimer, QUrl, Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QImageReader, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDateTimeEdit, QDialog, QFileDialog, QFormLayout,
@@ -18,7 +22,8 @@ from PyQt6.QtWidgets import (
 from agent_config import CLIENTS, configuration
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position, style_row_views
-from resident_agent import MAX_INPUT, excerpt, model_url
+from diagnostics import support_report
+from resident_agent import MAX_INPUT, ask_model, excerpt, model_url
 from scheduled import FREQUENCIES, MODES, ScheduledTask
 from team import (
     MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, CasualRoom, Member, PRIMARY, ROOM_MODES,
@@ -437,6 +442,9 @@ class CasualRoomDialog(QDialog):
 
 
 class ManagerWindow(QDialog):
+    model_test_completed = pyqtSignal(str)
+    diagnostics_completed = pyqtSignal(str)
+
     def __init__(self, team, desktop):
         super().__init__()
         self.team = team
@@ -506,6 +514,8 @@ class ManagerWindow(QDialog):
         return page, layout
 
     def switch_page(self, index):
+        if self.pages.currentIndex() == self.model_index and index != self.model_index:
+            self.invalidate_model_test()
         self.pages.setCurrentIndex(index)
         if index == self.chat_index:
             self.select_chat()
@@ -519,6 +529,7 @@ class ManagerWindow(QDialog):
             preferences.sync()
 
     def closeEvent(self, event):
+        self.invalidate_model_test()
         if self.desktop.exiting:
             super().closeEvent(event)
         else:
@@ -527,10 +538,11 @@ class ManagerWindow(QDialog):
 
     def changeEvent(self, event):
         super().changeEvent(event)
-        if (event.type() == QEvent.Type.WindowStateChange and self.isMinimized()
-                and self.desktop.preferences.value("close_action", "tray", type=str) == "tray"
-                and QSystemTrayIcon.isSystemTrayAvailable()):
-            QTimer.singleShot(0, self.minimize_to_tray)
+        if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
+            self.invalidate_model_test()
+            if (self.desktop.preferences.value("close_action", "tray", type=str) == "tray"
+                    and QSystemTrayIcon.isSystemTrayAvailable()):
+                QTimer.singleShot(0, self.minimize_to_tray)
 
     def minimize_to_tray(self):
         if self.isMinimized() and self.isVisible() and not self.desktop.exiting:
@@ -613,6 +625,9 @@ class ManagerWindow(QDialog):
         self.chat_member = QComboBox()
         self.chat_member.setAccessibleName("选择对话的学伴")
         row.addWidget(self.chat_member, 1)
+        export = button("导出私聊", self.export_chat)
+        export.setToolTip("将当前学伴的已保存私聊导出为 Markdown。")
+        row.addWidget(export)
         layout.addLayout(row)
         self.private_chats = QStackedWidget()
         layout.addWidget(self.private_chats, 1)
@@ -639,6 +654,44 @@ class ManagerWindow(QDialog):
             pane = self.private_chat(key)
             if pane is not None:
                 self.private_chats.setCurrentWidget(pane)
+
+    def export_chat(self):
+        pane = self.private_chats.currentWidget()
+        if pane is None:
+            return
+        try:
+            rows = pane.archive.transcript(limit=None)
+        except sqlite3.Error:
+            pane.notice.setText("无法读取私聊记录，请检查本机档案。")
+            return
+        if not rows:
+            pane.notice.setText("还没有可导出的私聊消息。")
+            return
+
+        name = pane.member.name
+        filename_name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        today = QDateTime.currentDateTime().toString("yyyy-MM-dd")
+        suggested = Path(self.desktop.workspace_directory()) / f"学伴私聊-{filename_name}-{today}.md"
+        dialog = QFileDialog(self, "导出私聊", str(suggested), "Markdown (*.md)")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("md")
+        filename = dialog.selectedFiles()[0] if dialog.exec() == QDialog.DialogCode.Accepted else ""
+        dialog.deleteLater()
+        if not filename:
+            return
+
+        sections = [f"# 屏幕伴学 · 与{name}的私聊\n\n"]
+        for row in rows:
+            speaker = "你" if row["role"] == "user" else name
+            timestamp = f" · {row['created']} UTC" if row["created"] else ""
+            sections.append(f"## {speaker}{timestamp}\n\n{row['body']}\n\n")
+        content = "".join(sections).encode("utf-8")
+        output = QSaveFile(filename)
+        if (output.open(QIODevice.OpenModeFlag.WriteOnly)
+                and output.write(content) == len(content) and output.commit()):
+            pane.notice.setText(f"已导出 {len(rows)} 条私聊消息。")
+        else:
+            pane.notice.setText("无法保存 Markdown，请检查文件路径和写入权限。")
 
     def open_model(self, key=""):
         self.model_target.setCurrentIndex(max(0, self.model_target.findData(key)))
@@ -745,9 +798,20 @@ class ManagerWindow(QDialog):
         layout.addWidget(self.model_help)
         self.model_notice = label("", "notice")
         layout.addWidget(self.model_notice)
+        self.model_test_current = False
+        self.model_test_completed.connect(self.finish_model_test)
         self.model_target.currentIndexChanged.connect(self.load_model)
         self.own_connection.toggled.connect(self.update_model_form)
-        layout.addWidget(button("保存模型设置", self.save_model, primary=True), alignment=Qt.AlignmentFlag.AlignRight)
+        for field in self.model_fields.values():
+            field.textChanged.connect(self.invalidate_model_test)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.model_test_button = button("测试连接", self.test_model)
+        self.model_test_button.setAutoDefault(False)
+        self.model_test_button.setToolTip("用当前表单设置发送一条固定的测试消息。")
+        actions.addWidget(self.model_test_button)
+        actions.addWidget(button("保存模型设置", self.save_model, primary=True))
+        layout.addLayout(actions)
         layout.addStretch()
         return page
 
@@ -767,10 +831,10 @@ class ManagerWindow(QDialog):
             values = {"endpoint": endpoint, "model": model, "key_name": key_name}
         for key, field in self.model_fields.items():
             field.setText(values.get(key, ""))
-        self.model_notice.clear()
         self.update_model_form()
 
     def update_model_form(self):
+        self.invalidate_model_test()
         personal = bool(self.model_target.currentData())
         independent = personal and self.own_connection.isChecked()
         self.model_form.setRowVisible(self.own_connection, personal)
@@ -786,29 +850,93 @@ class ManagerWindow(QDialog):
             hint = "这组设置用于沿用默认接口的学伴。可在上方选择成员，为它单独配置其他接口或模型。"
         self.model_help.setText(hint)
 
-    def save_model(self):
+    def edited_model_settings(self):
         fields = {key: field.text().strip() for key, field in self.model_fields.items()}
         member = self.selected_model_member()
+        if member:
+            if self.own_connection.isChecked():
+                if not fields["endpoint"]:
+                    raise ValueError("请填写此学伴的独立接口地址。")
+                member = replace(member, endpoint=fields["endpoint"], own_model=fields["own_model"],
+                                 key_name=fields["key_name"])
+            else:
+                member = replace(member, model=fields["model"], endpoint="", own_model="", key_name="")
+        return fields, member
+
+    def save_model(self):
         try:
+            fields, member = self.edited_model_settings()
             if member:
-                if self.own_connection.isChecked():
-                    if not fields["endpoint"]:
-                        raise ValueError("请填写此学伴的独立接口地址。")
-                    member = replace(member, endpoint=fields["endpoint"], own_model=fields["own_model"],
-                                     key_name=fields["key_name"])
-                else:
-                    member = replace(member, model=fields["model"], endpoint="", own_model="", key_name="")
                 self.desktop.save_member(member)
             else:
                 if fields["endpoint"]:
                     model_url(fields["endpoint"])
-                for name in ("endpoint", "model", "key_name"):
-                    self.desktop.agent_settings.setValue(name, fields[name])
-                self.desktop.agent_settings.sync()
+                settings = QSettings(self.desktop.agent_settings.fileName(), QSettings.Format.IniFormat)
+                settings.sync()
+                error_message = "无法保存模型设置，请检查本机目录的写入权限。"
+                if settings.status() != QSettings.Status.NoError:
+                    raise ValueError(error_message)
+                names = ("endpoint", "model", "key_name")
+                previous = {name: settings.value(name) for name in names}
+                for name in names:
+                    settings.setValue(name, fields[name])
+                settings.sync()
+                if settings.status() != QSettings.Status.NoError:
+                    # QSettings shares pending changes for this INI file across instances.
+                    for name, value in previous.items():
+                        if value is None:
+                            settings.remove(name)
+                        else:
+                            settings.setValue(name, value)
+                    settings.sync()
+                    raise ValueError(error_message)
         except ValueError as error:
             self.model_notice.setText(str(error))
             return
         self.model_notice.setText("模型设置已保存。")
+
+    def test_model(self):
+        if not self.model_test_button.isEnabled():
+            return
+        try:
+            fields, member = self.edited_model_settings()
+            settings = (fields["endpoint"], fields["model"], fields["key_name"])
+            if member:
+                settings = member.connection(self.desktop.model_settings())
+        except ValueError as error:
+            self.model_notice.setText(str(error))
+            return
+        self.model_test_current = True
+        self.model_test_button.setEnabled(False)
+        self.model_test_button.setText("测试中…")
+        self.model_notice.clear()
+        Thread(target=self.check_model_connection, args=(settings,), daemon=True).start()
+
+    def check_model_connection(self, settings):
+        try:
+            messages = [{"role": "user", "content": "请只回复 OK。"}]
+            answer, _, _ = ask_model(*settings, messages, max_tokens=64, timeout=12)
+            if not answer:
+                raise ValueError("连接已建立，但模型没有返回可用文本。")
+        except ValueError as error:
+            notice = str(error)
+        else:
+            notice = "连接成功，模型已返回测试回复。"
+        try:
+            self.model_test_completed.emit(notice)
+        except RuntimeError:
+            pass  # The dialog has been destroyed during shutdown.
+
+    def invalidate_model_test(self):
+        self.model_test_current = False
+        self.model_notice.clear()
+
+    def finish_model_test(self, notice):
+        self.model_test_button.setText("测试连接")
+        self.model_test_button.setEnabled(True)
+        if self.model_test_current:
+            self.model_notice.setText(notice)
+            self.model_test_current = False
 
     def settings_page(self):
         page, layout = self.page("设置")
@@ -820,6 +948,7 @@ class ManagerWindow(QDialog):
         pets = self.settings_section("桌宠")
         workspace = self.settings_section("工作空间")
         self.add_agent_settings(self.settings_section("Agent 接入"))
+        self.add_diagnostics_settings(self.settings_section("本机诊断"))
         self.theme = QComboBox()
         for key, (name, _) in PANEL_THEMES.items():
             self.theme.addItem(name, key)
@@ -924,6 +1053,51 @@ class ManagerWindow(QDialog):
         QGuiApplication.clipboard().setText(self.agent_config.toPlainText())
         self.agent_tip.setText("已复制。合并后重新加载客户端的 MCP 工具。")
 
+    def add_diagnostics_settings(self, form):
+        self.diagnostics_tab = self.settings_tabs.count() - 1
+        form.addRow(label("检查应用版本、存储和本机 MCP 状态。报告仅包含版本号和检查结果。", "quiet"))
+        self.diagnostics_report = QPlainTextEdit()
+        self.diagnostics_report.setReadOnly(True)
+        self.diagnostics_report.setAccessibleName("本机诊断报告")
+        form.addRow(self.diagnostics_report)
+        actions = QHBoxLayout()
+        self.diagnostics_check = button("运行检查", self.run_diagnostics, primary=True)
+        self.diagnostics_check.setAutoDefault(False)
+        self.diagnostics_copy = button("复制报告", self.copy_diagnostics)
+        self.diagnostics_copy.setEnabled(False)
+        actions.addWidget(self.diagnostics_check)
+        actions.addWidget(self.diagnostics_copy)
+        actions.addStretch()
+        form.addRow(actions)
+        self.diagnostics_tip = label("", "notice")
+        form.addRow(self.diagnostics_tip)
+        self.diagnostics_completed.connect(self.show_diagnostics)
+
+    def run_diagnostics(self):
+        self.diagnostics_check.setEnabled(False)
+        self.diagnostics_copy.setEnabled(False)
+        self.diagnostics_report.clear()
+        self.diagnostics_tip.setText("正在检查…")
+        arguments = (self.desktop.archive.path, self.team.store.path, self.desktop.listener.isListening())
+        Thread(target=self.collect_diagnostics, args=arguments, daemon=True).start()
+
+    def collect_diagnostics(self, archive_path, team_path, listening):
+        report = support_report(archive_path, team_path, listening)
+        try:
+            self.diagnostics_completed.emit(report)
+        except RuntimeError:
+            pass  # The dialog has been destroyed during shutdown.
+
+    def show_diagnostics(self, report):
+        self.diagnostics_report.setPlainText(report)
+        self.diagnostics_check.setEnabled(True)
+        self.diagnostics_copy.setEnabled(True)
+        self.diagnostics_tip.setText("检查完成。")
+
+    def copy_diagnostics(self):
+        QGuiApplication.clipboard().setText(self.diagnostics_report.toPlainText())
+        self.diagnostics_tip.setText("已复制诊断报告。")
+
     def settings_section(self, name):
         panel = QWidget()
         form = QFormLayout(panel)
@@ -933,7 +1107,7 @@ class ManagerWindow(QDialog):
         return form
 
     def show_settings_actions(self, index):
-        self.settings_save.setVisible(index not in (0, self.agent_tab))
+        self.settings_save.setVisible(index not in (0, self.agent_tab, self.diagnostics_tab))
         self.settings_notice.clear()
 
     def show_theme_color(self, theme):

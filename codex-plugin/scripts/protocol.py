@@ -110,18 +110,36 @@ def requested_version(request):
     return meta.get(VERSION_KEY) if isinstance(meta, dict) else None
 
 
+def tool_error(message):
+    return {"isError": True, "content": [{"type": "text", "text": message}]}
+
+
 def discovery(request):
     method = request.get("method")
     params = request.get("params", {})
     response = {"jsonrpc": "2.0", "id": request["id"]}
     modern = requested_version(request)
-    if not isinstance(params, dict):
+    if not isinstance(method, str):
+        response["error"] = {"code": -32600, "message": "Invalid request"}
+    elif not isinstance(params, dict):
         response["error"] = {"code": -32602, "message": "Invalid params"}
     elif modern is not None and modern != MODERN_VERSION and modern not in LEGACY_VERSIONS:
         response["error"] = {"code": -32022, "message": "Unsupported protocol version",
                              "data": {"supported": [MODERN_VERSION, *LEGACY_VERSIONS], "requested": modern}}
     elif method == "tools/call":
-        return None
+        name = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            response["error"] = {"code": -32602, "message": "Invalid tool call params"}
+        elif name not in TOOL_SCHEMAS:
+            response["error"] = {"code": -32602, "message": "未知的工具。"}
+        else:
+            try:
+                validated_arguments(name, arguments)
+            except ValueError as exc:
+                response["result"] = tool_error(str(exc))
+            else:
+                return None
     elif method in {"initialize", "server/discover"}:
         info = {"name": "screen-mentor", "version": VERSION}
         capabilities = {"tools": {}, "prompts": {}}
@@ -153,7 +171,7 @@ def discovery(request):
 
 
 def validated_arguments(name, arguments):
-    schema = TOOL_SCHEMAS.get(name)
+    schema = TOOL_SCHEMAS.get(name) if isinstance(name, str) else None
     if schema is None:
         raise ValueError("未知的工具。")
     fields = schema["properties"]

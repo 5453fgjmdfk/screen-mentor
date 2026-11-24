@@ -102,7 +102,11 @@ class WindowReader:
                 if process.poll() is None:
                     process.kill()
             finally:
-                process.stdin.close()
+                try:
+                    process.stdin.close()
+                except OSError:
+                    # Closing can flush a buffered request after the worker has exited.
+                    pass
                 try:
                     process.wait(timeout=.3)
                 except subprocess.TimeoutExpired:

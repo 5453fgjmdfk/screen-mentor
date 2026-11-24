@@ -56,8 +56,10 @@ class WindowScope:
 def changed(a, b):
     if a is None or b is None or a[:2] != b[:2]:
         return a is not b
-    diff = ImageChops.difference(a[3], b[3])
-    return ImageStat.Stat(diff).mean[0] >= 1.6 or sum(diff.histogram()[45:]) >= 80
+    histogram = ImageChops.difference(a[3], b[3]).histogram()
+    return (max(ImageStat.Stat(histogram).mean) >= 1.6
+            or any(sum(histogram[offset + 45:offset + 256]) >= 80
+                   for offset in range(0, len(histogram), 256)))
 
 
 class FeedbackEditor(QPlainTextEdit):
@@ -251,9 +253,12 @@ class Practice(QObject):
                     if (self.shutdown.is_set() or generation != self.capture_generation
                             or not self.running.is_set() or scope.active() != hwnd):
                         continue
-                    preview = raw.copy()
-                    preview.thumbnail((1440, 1000), Image.Resampling.LANCZOS)
-                    key = preview.convert("L").resize((144, 90), Image.Resampling.BILINEAR)
+                    preview = raw
+                    scale = min(1440 / raw.width, 1000 / raw.height)
+                    if scale < 1:
+                        size = tuple(max(1, round(side * scale)) for side in raw.size)
+                        preview = raw.resize(size, Image.Resampling.LANCZOS, reducing_gap=2)
+                    key = preview.resize((144, 90), Image.Resampling.BILINEAR, reducing_gap=2)
                     self.sampled.emit(generation, (hwnd, bounds, preview, key, raw))
                 except native.WindowError as exc:
                     if self.shutdown.is_set():

@@ -114,6 +114,9 @@ class TeamStore:
                 CREATE TABLE IF NOT EXISTS casual_round (
                     round_id TEXT PRIMARY KEY, room_key TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS room_by_round ON room(round);
+                CREATE INDEX IF NOT EXISTS room_group_history ON room(id) WHERE kind IN ('chat', 'task');
+                CREATE INDEX IF NOT EXISTS casual_round_by_room ON casual_round(room_key);
             """)
             db.execute("INSERT OR IGNORE INTO member VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (PRIMARY, "学伴", "把下一步说清楚，鼓励用户亲手操作。", "", "default", 1, 1))
@@ -235,11 +238,14 @@ class TeamStore:
     def lines(self, limit=80, *, kinds=(), round_id=None, casual_key=None):
         query = """
             SELECT room.*, CASE WHEN parallel_round.id IS NULL THEN room.kind ELSE 'parallel' END AS display_kind
-            FROM room LEFT JOIN parallel_round ON room.round = parallel_round.id
+            FROM {source} LEFT JOIN parallel_round ON room.round = parallel_round.id
         """
         where = []
         params = []
-        if kinds:
+        if kinds == ("chat", "task"):
+            # Keep the predicate identical to the partial index for the group history.
+            where.append("room.kind IN ('chat', 'task')")
+        elif kinds:
             placeholders = ", ".join("?" for _ in kinds)
             where.append(f"kind IN ({placeholders})")
             params.extend(kinds)
@@ -248,12 +254,24 @@ class TeamStore:
             params.append(round_id)
         if casual_key:
             query += " LEFT JOIN casual_round ON room.round = casual_round.round_id "
-            where.append("room.kind = 'casual' AND COALESCE(casual_round.room_key, ?) = ?")
-            params.extend((DEFAULT_ROOM, casual_key))
+            where.append("room.kind = 'casual'")
+            if casual_key == DEFAULT_ROOM:
+                where.append("COALESCE(casual_round.room_key, ?) = ?")
+                params.extend((DEFAULT_ROOM, casual_key))
+            else:
+                where.append("casual_round.room_key = ?")
+                params.append(casual_key)
         if where:
             query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY room.id DESC LIMIT ?"
         with closing(self.connect()) as db:
-            rows = db.execute(query + " ORDER BY room.id DESC LIMIT ?", (*params, limit))
+            if casual_key and casual_key != DEFAULT_ROOM and limit > 0:
+                # Active rooms can fill the page from a short tail scan, without sorting all their history.
+                recent = "(SELECT id FROM room ORDER BY id DESC LIMIT ?) AS recent JOIN room ON room.id = recent.id"
+                rows = db.execute(query.format(source=recent), (limit * 2, *params, limit)).fetchall()
+                if len(rows) == limit:
+                    return list(reversed(rows))
+            rows = db.execute(query.format(source="room"), (*params, limit))
             return list(reversed(list(rows)))
 
 

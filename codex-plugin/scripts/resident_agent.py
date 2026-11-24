@@ -16,6 +16,8 @@ PROFILE = Path(os.environ.get("SCREEN_MENTOR_PROFILE") or Path.home() / ".codex"
 MAX_INPUT = 2500
 MAX_CONTEXT = 14_000  # Approximate by UTF-8 bytes, independent of the model tokenizer.
 MAX_RESPONSE = 2 * 1024 * 1024
+RECALL_MARKERS = ("回忆：", "回忆:")
+JSON_FENCES = {"```", "```json"}
 ANSWER_PREFIX = re.compile(r'"answer"\s*:\s*"')
 JSON_STRING_PREFIX = re.compile(r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*')
 ALPHABET = re.compile(r"[a-z0-9_]+|[\u3400-\u9fff]+")
@@ -109,7 +111,8 @@ class Archive:
     def transcript(self, limit=100):
         with closing(self.connect()) as db:
             return list(reversed(list(db.execute(
-                "SELECT * FROM record WHERE role IN ('user','assistant') ORDER BY id DESC LIMIT ?", (limit,)
+                "SELECT * FROM record WHERE role IN ('user','assistant') ORDER BY id DESC LIMIT ?",
+                (-1 if limit is None else limit,),
             ))))
 
     def search(self, query, *, exclude=(), limit=8):
@@ -121,8 +124,9 @@ class Archive:
             rows = db.execute("""
                 SELECT r.*, rank FROM recall JOIN record r ON r.id = recall.rowid
                 WHERE recall MATCH ? AND r.state NOT IN ('forgotten','candidate')
+                  AND NOT (r.role = 'user' AND substr(r.body, 1, 3) IN (?, ?))
                 ORDER BY rank, r.id DESC LIMIT ?
-            """, (expression, limit + len(exclude)))
+            """, (expression, *RECALL_MARKERS, limit + len(exclude)))
             return [row for row in rows if row["id"] not in exclude][:limit]
 
     def request_messages(self, prompt, other_queries=()):
@@ -174,15 +178,18 @@ class NoRedirect(HTTPRedirectHandler):
 def answer_preview(content):
     """Extract only the public answer, including an unfinished JSON string."""
     value = content.lstrip()
-    if value.startswith("`"):
+    if value in ("`", "``"):
+        return ""
+    if value.startswith("```"):
         header, newline, value = value.partition("\n")
         if not newline:
             return ""
-        if header.rstrip() not in {"```", "```json", "```JSON"}:
+        header = header.rstrip().lower()
+        if header not in JSON_FENCES:
             return content
         value = value.lstrip()
         if not value.startswith("{"):
-            return ""
+            return content if value and header == "```" else ""
     if not value.startswith("{"):
         return value
     match = ANSWER_PREFIX.search(value)
@@ -251,7 +258,8 @@ def model_url(endpoint):
     return url if url.endswith("/chat/completions") else url + "/chat/completions"
 
 
-def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=None, cancelled=lambda: False):
+def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=None, cancelled=lambda: False,
+              timeout=35):
     if not endpoint.strip() or not model.strip():
         raise ValueError("尚未配置模型。打开「模型」填写接口和模型名。")
     url = model_url(endpoint)
@@ -266,7 +274,7 @@ def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=No
         payload["stream"] = True
     request = Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
     try:
-        with build_opener(NoRedirect()).open(request, timeout=35) as response:
+        with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
             if publish is not None and response.headers.get_content_type() == "text/event-stream":
                 content = read_model_stream(response, publish, cancelled)
             else:
@@ -275,13 +283,16 @@ def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=No
         if not isinstance(content, str) or not content.strip():
             raise ValueError
     except HTTPError as error:
+        error.close()
         raise ValueError(f"模型接口返回 HTTP {error.code}，请核对地址、模型和权限。") from None
     except (URLError, OSError, HTTPException, ValueError, KeyError, IndexError, TypeError, AttributeError):
         raise ValueError("模型暂时没有返回可用回复，请检查接口和网络。") from None
     try:
         value = content.strip()
-        if value.startswith(("```json\n", "```JSON\n", "```\n")) and value.endswith("```"):
-            value = value.split("\n", 1)[1][:-3]
+        if value.endswith("```"):
+            header, newline, body = value.partition("\n")
+            if newline and header.rstrip().lower() in JSON_FENCES:
+                value = body[:-3]
         parsed = json.loads(value)
         answer = parsed["answer"]
         learn = parsed.get("learn") or ""

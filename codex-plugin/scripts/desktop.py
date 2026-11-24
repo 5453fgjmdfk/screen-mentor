@@ -27,7 +27,7 @@ from appearance import APP_ICON, SkinLibrary
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from companion import fit_position, style_row_views
 from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
-from resident_agent import Archive, MAX_INPUT, PROFILE, ask_model, excerpt
+from resident_agent import Archive, MAX_INPUT, PROFILE, RECALL_MARKERS, ask_model, excerpt
 from scheduled import TaskScheduler
 from server import MentorServer
 from team import PRIMARY, Member, TeamCoordinator, TeamStore
@@ -252,12 +252,24 @@ class ChatPane(QWidget):
                 self.refresh()
                 self.response.emit("done", reply)
             return True
-        if marker in {"回忆：", "回忆:"}:
+        if marker in RECALL_MARKERS:
             hits = self.archive.search(raw_value, exclude=(source,), limit=5)
-            answer = "\n\n".join(f"档案 #{row['id']} · {row['created'][:10]}\n{excerpt(row['body'], 1800)}"
-                                 for row in hits)
-            self.notice.setText(answer or "没有查到相关记录。可以换成更具体的关键词。")
-            self.response.emit("done", self.notice.text())
+            if hits:
+                answer = "\n\n".join(f"档案 #{row['id']} · {row['created'][:10]}\n{excerpt(row['body'], 1800)}"
+                                     for row in hits)
+                cursor = QTextCursor(self.history.document())
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                cursor.insertText("\n\n")
+                result_start = cursor.position()
+                cursor.insertText(f"回忆结果\n{answer}")
+                cursor.setPosition(result_start)
+                self.history.setTextCursor(cursor)
+                self.history.ensureCursorVisible()
+                notice = f"找到 {len(hits)} 条相关记录。"
+            else:
+                notice = "没有查到相关记录。可以换成更具体的关键词。"
+            self.notice.setText(notice)
+            self.response.emit("done", notice)
             return True
         self.settings.sync()
         endpoint, model, key = (self.settings.value(field, "", type=str)
@@ -326,6 +338,7 @@ class QuickChat(QFrame):
         self.setObjectName("card")
         self.setStyleSheet(PANEL_STYLE)
         self.pane = pane
+        self.show_history = open_history
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         row = QHBoxLayout()
@@ -333,7 +346,7 @@ class QuickChat(QFrame):
         name.setTextFormat(Qt.TextFormat.PlainText)
         row.addWidget(name, 1)
         history = QPushButton("打开会话")
-        history.clicked.connect(lambda: self.open_history(open_history))
+        history.clicked.connect(self.open_history)
         row.addWidget(history)
         layout.addLayout(row)
         entry = QHBoxLayout()
@@ -362,16 +375,19 @@ class QuickChat(QFrame):
         self.move(fit_position(position, self.size(), area))
 
     def send(self):
-        if self.pane.send_message(self.input.text()):
+        prompt = self.input.text().strip()
+        if self.pane.send_message(prompt):
             self.close()
-        elif self.pane.busy or self.input.text().strip():
+            if prompt.startswith(RECALL_MARKERS):
+                self.show_history()
+        elif self.pane.busy or prompt:
             self.status.setText("上一条消息还在回复。" if self.pane.busy else self.pane.notice.text())
             self.status.show()
 
-    def open_history(self, callback):
+    def open_history(self):
         draft = self.input.text()
         self.close()
-        callback()
+        self.show_history()
         if draft and not self.pane.input.toPlainText():
             self.pane.input.setPlainText(draft)
 
