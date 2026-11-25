@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate, QStyleOptionViewItem, QWidget,
 )
 
-from appearance import BUILT_INS, PeekFrames, SkinLibrary, paint_peek, palette_for
+from appearance import BUILT_INS, PeekFrames, SkinLibrary, dispose_movie, paint_peek, palette_for
 from skin_assets import STATES
 
 SNAP_DISTANCE = 1
@@ -579,6 +579,9 @@ class CompanionPanel(QWidget):
                     skin = replace(skin, palette=palette_for(self.skin_palette))
                 except ValueError:
                     pass
+        self.use_skin(skin, force=force)
+
+    def use_skin(self, skin, *, force=False):
         if not force and skin == self.skin:
             return
         previous_skin = self.skin
@@ -600,8 +603,7 @@ class CompanionPanel(QWidget):
             self.model_pixels_cache.clear()
             self.sprite.clear()
             for movie in self.anims.values():
-                movie.stop()
-                movie.deleteLater()
+                dispose_movie(movie)
             self.anims = {state: skin.movie(state, self, self.sprite.size()) for state in STATES}
             self.state = None
             self.set_pose(pose)

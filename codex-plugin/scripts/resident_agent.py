@@ -290,7 +290,7 @@ def read_model_stream(response, publish, cancelled):
         line = response.readline(MAX_RESPONSE - total + 1)
         if not line:
             consume_event()
-            if not finished and not chunks:
+            if not finished:
                 raise ModelError("模型流式回复提前结束。")
             break
         total += len(line)

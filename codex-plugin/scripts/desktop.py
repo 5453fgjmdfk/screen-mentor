@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
-from appearance import APP_ICON, SkinLibrary
+from appearance import APP_ICON, BUILT_INS, SkinLibrary
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from companion import fit_position, style_row_views
 from manager import PANEL_STYLE, ManagerWindow, TeamPet, panel_style, show_centered
@@ -879,7 +879,17 @@ class Desktop(QObject):
             self.manager.reload_rooms()
             self.manager.refresh()
 
-    def on_skin_deleted(self, skin_key):
+    def delete_skin(self, skin_key):
+        panels = (self.engine.practice.panel, *self.pets.values())
+        affected = [panel for panel in panels if panel.skin is not None and panel.skin.key == skin_key]
+        for panel in affected:
+            panel.use_skin(BUILT_INS[0])
+        try:
+            SkinLibrary().delete_skin(skin_key)
+        except ValueError:
+            for panel in affected:
+                panel.refresh_skin()
+            raise
         try:
             self.team.store.reset_skin(skin_key)
         except sqlite3.Error:

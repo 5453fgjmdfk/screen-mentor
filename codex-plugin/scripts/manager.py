@@ -830,7 +830,7 @@ class ManagerWindow(QDialog):
         layout.addLayout(row)
         self.skin_library = SkinLibrary()
         self.skin_editor = AppearanceEditor(self.skin_library, self.skin_library.current(), self.apply_appearance,
-                                            self.desktop.workspace_directory, self.desktop.on_skin_deleted)
+                                            self.desktop.workspace_directory, self.desktop.delete_skin)
         layout.addWidget(self.skin_editor, 1)
         self.appearance_member.currentIndexChanged.connect(self.load_appearance)
         return page

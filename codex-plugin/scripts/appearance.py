@@ -88,6 +88,13 @@ def open_movie(path, parent, size):
     return movie
 
 
+def dispose_movie(movie):
+    movie.stop()
+    # Stopping playback alone leaves the underlying GIF open on Windows.
+    movie.setFileName("")
+    movie.deleteLater()
+
+
 @dataclass(frozen=True)
 class Skin:
     key: str
@@ -169,8 +176,8 @@ class PeekFrames:
 
     def dispose(self):
         if self.movie is not None:
-            self.movie.stop()
-            self.movie.deleteLater()
+            dispose_movie(self.movie)
+            self.movie = None
 
     def current(self, elapsed=0):
         if self.movie is not None:
@@ -308,11 +315,14 @@ class SkinLibrary:
     def delete_skin(self, key):
         if not isinstance(key, str) or not re.fullmatch(r"skin-[0-9a-fA-F-]+", key):
             raise ValueError("内置皮肤不能删除。")
-        target = (self.installed / key).resolve()
-        if not target.is_dir() or target.parent != self.installed.resolve():
+        installed = self.installed.resolve()
+        target = installed / key
+        if not target.is_dir() or target.resolve() != target:
             raise ValueError("找不到要删除的自定义皮肤。")
+        retired = installed / f".removed-{uuid4().hex}"
         try:
-            shutil.rmtree(target)
+            # Move the whole directory out of the library before deleting any files.
+            target.rename(retired)
         except OSError:
             raise ValueError("无法删除皮肤文件，请确认文件未被占用。") from None
         self.settings.sync()
@@ -331,6 +341,7 @@ class SkinLibrary:
         finally:
             self.settings.endGroup()
         self.settings.sync()
+        shutil.rmtree(retired, ignore_errors=True)
 
     def select(self, skin):
         self.settings.setValue(f"palettes/{skin.key}", palette_key(skin.palette))
@@ -569,13 +580,13 @@ STATE_LABELS = (("idle", "待机"), ("reading", "读图"), ("thinking", "思考"
 
 
 class AppearanceEditor(QWidget):
-    def __init__(self, library, current, apply_skin, workspace_directory=lambda: "", on_skin_deleted=None):
+    def __init__(self, library, current, apply_skin, workspace_directory=lambda: "", remove_skin=None):
         super().__init__()
         self.library = library
         self.selected = current
         self.apply_skin = apply_skin
         self.workspace_directory = workspace_directory
-        self.on_skin_deleted = on_skin_deleted
+        self.remove_skin = remove_skin or library.delete_skin
         self.preview_movie = None
         self.preview_state = "idle"
         layout = QVBoxLayout(self)
@@ -757,8 +768,7 @@ class AppearanceEditor(QWidget):
             btn.setChecked(key == state)
         if self.preview_movie is not None:
             self.sprite.clear()
-            self.preview_movie.stop()
-            self.preview_movie.deleteLater()
+            dispose_movie(self.preview_movie)
             self.preview_movie = None
         if self.isVisible():
             self.preview_movie = self.selected.movie(self.preview_state, self, self.sprite.size())
@@ -793,8 +803,7 @@ class AppearanceEditor(QWidget):
         self.bottom.stop()
         if self.preview_movie is not None:
             self.sprite.clear()
-            self.preview_movie.stop()
-            self.preview_movie.deleteLater()
+            dispose_movie(self.preview_movie)
             self.preview_movie = None
 
     def choose_palette(self):
@@ -875,15 +884,13 @@ class AppearanceEditor(QWidget):
             return
         self.stop_preview()
         try:
-            self.library.delete_skin(skin.key)
+            self.remove_skin(skin.key)
         except ValueError as error:
             if self.isVisible():
                 self.start_preview()
             self.message.setText(str(error))
             self.message.show()
             return
-        if self.on_skin_deleted is not None:
-            self.on_skin_deleted(skin.key)
         self.load(BUILT_INS[0])
         self.message.setText(f"已删除皮肤「{skin.name}」。")
         self.message.show()

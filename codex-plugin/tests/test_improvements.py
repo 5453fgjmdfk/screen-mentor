@@ -59,6 +59,23 @@ class AgentAndArchiveImprovementTests(unittest.TestCase):
         self.assertEqual((answer, learn, recall), ("你好世界", "", ""))
         self.assertEqual(published[-1], "你好世界")
 
+    def test_interrupted_stream_rejects_partial_answer(self):
+        chunk = json.dumps({"choices": [{"delta": {"content": "尚未说完"}}]})
+        payload = f"data: {chunk}\n\n".encode("utf-8")
+        published = []
+        with patch("resident_agent.build_opener") as opener:
+            opener.return_value.open.return_value = FakeStreamResponse(payload)
+            with self.assertRaisesRegex(ValueError, "提前结束"):
+                ask_model("https://example.com/v1", "test-model", "", [], publish=published.append)
+        self.assertEqual(published, ["尚未说完"])
+
+    def test_stream_accepts_done_without_final_blank_line(self):
+        payload = b'data: {"choices":[{"delta":{"content":"Complete"}}]}\n\ndata: [DONE]'
+        with patch("resident_agent.build_opener") as opener:
+            opener.return_value.open.return_value = FakeStreamResponse(payload)
+            self.assertEqual(ask_model("https://example.com/v1", "test-model", "", [], publish=lambda _: None),
+                             ("Complete", "", ""))
+
     def test_think_tags_hidden_during_streaming_and_stripped_on_parse(self):
         self.assertEqual(answer_preview("<think>正在推理中…"), "")
         self.assertEqual(answer_preview('<think>推理完成</think>\n{"answer":"最终结论"}'), "最终结论")
@@ -136,6 +153,15 @@ class TeamAndSchedulerTests(unittest.TestCase):
         self.assertEqual(TeamCoordinator.mentions("请问 @alice 怎么看", roster), ["alice"])
         self.assertTrue(TeamCoordinator.is_broadcast("@all 大家讨论一下"))
         self.assertTrue(TeamCoordinator.is_broadcast("请 @Everyone 看看"))
+
+    def test_mentions_keep_exact_names_and_skip_regex_only_matches(self):
+        self.store.save_member(Member("review-i", "I", "检查"))
+        self.store.save_member(Member("alice", "Alice", "设计"))
+        roster = self.store.members()
+        self.assertEqual(TeamCoordinator.mentions("@\u0131 请 @alice 检查", roster), ["alice"])
+        self.assertEqual(TeamCoordinator.mentions("@i 请 @I 检查", roster), ["review-i"])
+        same_casefold = [Member("upper", "Alice", "设计"), Member("lower", "alice", "检查")]
+        self.assertEqual(TeamCoordinator.mentions("@Alice @alice", same_casefold), ["upper", "lower"])
 
     def test_parallel_run_parses_fenced_json_plan(self):
         token = Event()
@@ -367,6 +393,51 @@ class DesktopAndManagerFeatureTests(unittest.TestCase):
 
         self.desktop.reset_pet_positions()
         self.assertEqual(self.desktop.preferences.value(f"pet_layouts/{PRIMARY}", "", type=str), "")
+
+    def test_delete_active_skin_and_keep_files_on_rename_failure(self):
+        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QMessageBox
+        from appearance import ART, BUILT_INS, SkinLibrary
+
+        library = SkinLibrary()
+        source = ART / "whale-maid"
+        assets = {name: (source / name).read_bytes() for name in ("idle.gif", "side.gif", "bottom.gif")}
+        skin = library.create("Testing pet", assets)
+        library.select(skin)
+        library.save_preset("Active testing pet", skin)
+        panel = self.desktop.engine.practice.panel
+        panel.refresh_skin()
+        helper = self.desktop.save_member(Member("skin-helper", "皮肤测试员", "测试", skin=skin.key, visible=True))
+        other = self.desktop.pets[helper.key]
+        area = self.app.primaryScreen().availableGeometry()
+        other.peek.dock(Qt.Edge.LeftEdge, area.center(), area)
+        other.hide()
+
+        self.desktop.show_appearance()
+        editor = self.desktop.manager.skin_editor
+        self.app.processEvents()
+        self.assertTrue(panel.sprite.movie().isValid())
+        self.assertTrue(other.peek.frames[False].movie.isValid())
+        self.assertIsNotNone(editor.preview_movie)
+        self.assertTrue(editor.preview_movie.isValid())
+        original = {file.name: file.read_bytes() for file in skin.path.iterdir()}
+        with patch("appearance.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            with patch.object(Path, "rename", side_effect=PermissionError("file in use")):
+                editor.delete_skin()
+            self.assertEqual({file.name: file.read_bytes() for file in skin.path.iterdir()}, original)
+            self.assertEqual(library.current().key, skin.key)
+            self.assertIn("Active testing pet", [name for name, _ in library.presets()])
+            self.assertEqual(panel.skin.key, skin.key)
+            self.assertEqual(other.skin.key, skin.key)
+            self.assertTrue(editor.preview_movie.isValid())
+
+            editor.delete_skin()
+        self.assertFalse(skin.path.exists())
+        self.assertFalse(list(library.installed.glob(".removed-*")))
+        self.assertEqual(library.current().key, BUILT_INS[0].key)
+        self.assertEqual(panel.skin.key, BUILT_INS[0].key)
+        self.assertEqual(other.skin.key, BUILT_INS[0].key)
+        self.assertNotIn("Active testing pet", [name for name, _ in library.presets()])
 
     def test_default_model_rejects_raw_api_key_in_key_name(self):
         manager = self.desktop.get_manager()

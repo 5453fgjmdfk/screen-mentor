@@ -417,13 +417,17 @@ class TeamCoordinator(QObject):
 
     @staticmethod
     def mentions(prompt, roster):
-        by_name = {member.name.casefold(): member.key for member in roster}
-        names = "|".join(re.escape(member.name) for member in sorted(roster, key=lambda m: len(m.name), reverse=True))
+        by_name = {member.name: member.key for member in roster}
+        folded = {}
+        for name, key in by_name.items():
+            folded.setdefault(name.casefold(), key)
+        names = "|".join(re.escape(name) for name in sorted(by_name, key=len, reverse=True))
         if not names:
             return []
         hits = re.findall(MENTION_START + r"(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])",
                           prompt, flags=re.IGNORECASE)
-        return list(dict.fromkeys(by_name[name.casefold()] for name in hits))
+        keys = (by_name.get(name) or folded.get(name.casefold()) for name in hits)
+        return list(dict.fromkeys(key for key in keys if key is not None))
 
     def room_members(self, room):
         roster = self.store.members()
