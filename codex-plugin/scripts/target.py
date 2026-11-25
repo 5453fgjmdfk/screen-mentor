@@ -32,7 +32,7 @@ def tighten(frame, image_size, rect):
             if required_sign and direction != required_sign:
                 continue
             strength = abs(contrast)
-            candidate = strength - 7 * abs(i - origin) / radius
+            candidate = strength - 7 * abs(i - origin) / max(1.0, radius)
             if strength >= 13 and candidate > score:
                 best, sign, score = i, direction, candidate
         return best, sign

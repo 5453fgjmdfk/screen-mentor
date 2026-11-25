@@ -35,10 +35,10 @@ if (-not $DesktopOnly -and -not $CodexExe) {
 if (-not (Test-Path -LiteralPath $runtimePython)) {
     $pythonArguments = @()
     if (-not $PythonExe) {
-        $launcher = Get-Command py.exe -ErrorAction SilentlyContinue
+        $pythonLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
         $python = Get-Command python.exe -ErrorAction SilentlyContinue
-        if ($launcher) {
-            $PythonExe = $launcher.Source
+        if ($pythonLauncher) {
+            $PythonExe = $pythonLauncher.Source
             $pythonArguments = @('-3')
         } elseif ($python) {
             $PythonExe = $python.Source
@@ -82,7 +82,7 @@ $files = @(
     'scripts/companion.py', 'scripts/appearance.py', 'scripts/skin_assets.py', 'scripts/window_reader.py',
     'scripts/desktop.py', 'scripts/bridge.py', 'scripts/protocol.py', 'scripts/resident_agent.py',
     'scripts/agent_config.py',
-    'scripts/manager.py', 'scripts/team.py', 'scripts/scheduled.py',
+    'scripts/manager.py', 'scripts/team.py', 'scripts/scheduled.py', 'scripts/diagnostics.py',
     'assets/app-icon.ico', 'assets/app-icon.png', 'assets/companion/idle.gif', 'assets/companion/reading.gif',
     'assets/companion/ready.gif', 'assets/companion/thinking.gif', 'assets/companion/peek-poses.png',
     'assets/companion/peek-blink.png', 'assets/companion/SOURCE.md',

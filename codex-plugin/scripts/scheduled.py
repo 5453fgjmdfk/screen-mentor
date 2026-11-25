@@ -11,7 +11,7 @@ from resident_agent import MAX_INPUT
 from team import PRIMARY
 
 
-FREQUENCIES = {0: "仅一次", 1: "每天", 7: "每周"}
+FREQUENCIES = {0: "仅一次", 1: "每天", 3: "每 3 天", 7: "每周", 14: "每两周", 30: "每 30 天"}
 MODES = {"chat": "主学伴", "parallel": "并行协作"}
 
 
@@ -91,6 +91,7 @@ class TaskScheduler(QObject):
     def claim(self, now):
         """Advance the schedule before starting the model requests, once per local due time."""
         with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("""
                 SELECT * FROM scheduled_task WHERE enabled = 1 AND next_at <= ? ORDER BY next_at, rowid LIMIT 1
             """, (timestamp(now),)).fetchone()
@@ -107,6 +108,30 @@ class TaskScheduler(QObject):
                 WHERE key=? AND enabled=1 AND next_at=?
             """, (bool(task.repeat_days), timestamp(next_at), round_id, "运行中…", task.key, row["next_at"]))
             return (task, round_id) if saved.rowcount else None
+
+    def run_now(self, key):
+        if self.team.blocked:
+            raise ValueError("当前正在屏幕伴学。结束后可以执行定时任务。")
+        if self.team.running or not self.team.quiet_ready():
+            raise ValueError("当前已有对话正在进行，请完成后再试。")
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM scheduled_task WHERE key = ?", (key,)).fetchone()
+            if row is None:
+                raise ValueError("找不到选中的定时任务。")
+            task = self.from_row(row)
+            round_id = uuid4().hex
+            db.execute("UPDATE scheduled_task SET last_round=?, last_status=? WHERE key=?",
+                       (round_id, "运行中…", task.key))
+        self.active_round = round_id
+        try:
+            choices = [member.key for member in self.team.store.members() if member.active]
+            selected = [PRIMARY] if task.mode == "chat" else choices
+            self.team.start(task.mode, task.prompt, selected, scheduled=(self.active_round, task.name))
+        except (ValueError, sqlite3.Error) as error:
+            self.completed(f"执行失败。{error}")
+            raise ValueError(str(error)) from error
+        self.changed.emit()
 
     def check(self, now=None):
         if self.team.blocked or self.team.running or not self.team.quiet_ready():

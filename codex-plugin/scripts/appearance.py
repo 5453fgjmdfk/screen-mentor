@@ -5,6 +5,7 @@ from io import BytesIO
 from math import pi, sin
 from pathlib import Path
 import re
+import shutil
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
@@ -14,7 +15,7 @@ from PyQt6.QtCore import QElapsedTimer, QRect, QRectF, QSettings, QSignalBlocker
 from PyQt6.QtGui import QColor, QImageReader, QLinearGradient, QMovie, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
 from resident_agent import PROFILE
@@ -85,6 +86,13 @@ def open_movie(path, parent, size):
     if movie.frameCount() > 1:
         movie.finished.connect(movie.start)
     return movie
+
+
+def dispose_movie(movie):
+    movie.stop()
+    # Stopping playback alone leaves the underlying GIF open on Windows.
+    movie.setFileName("")
+    movie.deleteLater()
 
 
 @dataclass(frozen=True)
@@ -168,8 +176,8 @@ class PeekFrames:
 
     def dispose(self):
         if self.movie is not None:
-            self.movie.stop()
-            self.movie.deleteLater()
+            dispose_movie(self.movie)
+            self.movie = None
 
     def current(self, elapsed=0):
         if self.movie is not None:
@@ -238,19 +246,27 @@ class SkinLibrary:
         self.installed = self.root / "skins"
         self.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
 
+    def _load_installed(self, path):
+        if not path.is_dir():
+            return None
+        try:
+            if not require_roles({item.name for item in path.iterdir() if item.is_file()}):
+                return None
+            manifest = path / "skin.json"
+            if manifest.stat().st_size > 4096:
+                return None
+            name, palette = read_manifest(manifest.read_bytes())
+        except (OSError, ValueError):
+            return None
+        return Skin(path.name, name, path, palette)
+
     def all(self, *, saved_palettes=True):
         skins = list(BUILT_INS)
-        for path in sorted(self.installed.glob("skin-*")):
-            try:
-                if not require_roles({item.name for item in path.iterdir() if item.is_file()}):
-                    continue
-                manifest = path / "skin.json"
-                if manifest.stat().st_size > 4096:
-                    continue
-                name, palette = read_manifest(manifest.read_bytes())
-            except (OSError, ValueError):
-                continue
-            skins.append(Skin(path.name, name, path, palette))
+        if self.installed.is_dir():
+            for path in sorted(self.installed.glob("skin-*")):
+                skin = self._load_installed(path)
+                if skin is not None:
+                    skins.append(skin)
         return [self.with_saved_palette(skin) for skin in skins] if saved_palettes else skins
 
     def with_saved_palette(self, skin):
@@ -266,7 +282,66 @@ class SkinLibrary:
         return self.resolve(key)
 
     def resolve(self, key, *, saved_palette=True):
-        return next((skin for skin in self.all(saved_palettes=saved_palette) if skin.key == key), BUILT_INS[0])
+        skin = next((item for item in BUILT_INS if item.key == key), None)
+        if skin is None and isinstance(key, str) and re.fullmatch(r"skin-[0-9a-fA-F-]+", key):
+            skin = self._load_installed(self.installed / key)
+        if skin is None:
+            skin = BUILT_INS[0]
+        return self.with_saved_palette(skin) if saved_palette else skin
+
+    def delete_preset(self, name):
+        if any(skin.name == name for skin in BUILT_INS):
+            raise ValueError("内置外观方案不能删除。")
+        self.settings.sync()
+        removed = False
+        self.settings.beginGroup("presets")
+        try:
+            for key in list(self.settings.childKeys()):
+                try:
+                    entry_name, _, _ = json.loads(self.settings.value(key, "", type=str))
+                except (TypeError, ValueError):
+                    continue
+                if entry_name == name:
+                    self.settings.remove(key)
+                    removed = True
+        finally:
+            self.settings.endGroup()
+        if not removed:
+            raise ValueError("找不到要删除的外观方案。")
+        self.settings.sync()
+        if self.settings.status() != QSettings.Status.NoError:
+            raise ValueError("无法更新外观方案，请检查目录的写入权限。")
+
+    def delete_skin(self, key):
+        if not isinstance(key, str) or not re.fullmatch(r"skin-[0-9a-fA-F-]+", key):
+            raise ValueError("内置皮肤不能删除。")
+        installed = self.installed.resolve()
+        target = installed / key
+        if not target.is_dir() or target.resolve() != target:
+            raise ValueError("找不到要删除的自定义皮肤。")
+        retired = installed / f".removed-{uuid4().hex}"
+        try:
+            # Move the whole directory out of the library before deleting any files.
+            target.rename(retired)
+        except OSError:
+            raise ValueError("无法删除皮肤文件，请确认文件未被占用。") from None
+        self.settings.sync()
+        self.settings.remove(f"palettes/{key}")
+        if self.settings.value("skin", "", type=str) == key:
+            self.settings.setValue("skin", BUILT_INS[0].key)
+        self.settings.beginGroup("presets")
+        try:
+            for preset_key in list(self.settings.childKeys()):
+                try:
+                    _, skin_key, _ = json.loads(self.settings.value(preset_key, "", type=str))
+                except (TypeError, ValueError):
+                    continue
+                if skin_key == key:
+                    self.settings.remove(preset_key)
+        finally:
+            self.settings.endGroup()
+        self.settings.sync()
+        shutil.rmtree(retired, ignore_errors=True)
 
     def select(self, skin):
         self.settings.setValue(f"palettes/{skin.key}", palette_key(skin.palette))
@@ -423,16 +498,19 @@ class NewSkinDialog(QDialog):
         self.name.setMaxLength(32)
         self.name.setToolTip("名称为 1–32 个可见字符，会显示在角色素材列表里。")
         form.addRow("皮肤名称", self.name)
-        for role, label, hint in (
-            ("idle", "站姿动画", "建议单帧 192 × 192 px，人物居中。站姿 GIF 可直接导入。"),
-            ("side", "侧边探头", "建议单帧 144 × 192 px，扶边的手贴近画面左侧。右侧会自动镜像。"),
-            ("bottom", "底部探头", "建议单帧 192 × 156 px，双手贴近画面底边。"),
+        for role, label, hint, optional in (
+            ("idle", "站姿动画", "建议单帧 192 × 192 px，人物居中。站姿 GIF 可直接导入。", False),
+            ("side", "侧边探头", "建议单帧 144 × 192 px，扶边的手贴近画面左侧。右侧会自动镜像。", False),
+            ("bottom", "底部探头", "建议单帧 192 × 156 px，双手贴近画面底边。", False),
+            ("reading", "读图动画（可选）", "观察练习画面时播放。留空时沿用站姿动画。", True),
+            ("thinking", "思考动画（可选）", "等待回复或核对步骤时播放。留空时沿用站姿动画。", True),
+            ("ready", "就绪动画（可选）", "回复完成或指引就绪时播放。留空时沿用站姿动画。", True),
         ):
             row = QWidget()
             controls = QHBoxLayout(row)
             controls.setContentsMargins(0, 0, 0, 0)
-            note = QLabel("未选择")
-            note.setMinimumWidth(90)
+            note = QLabel("可选 · 沿用站姿" if optional else "未选择")
+            note.setMinimumWidth(104)
             controls.addWidget(note, 1)
             button = QPushButton("导入 GIF…")
             button.clicked.connect(lambda checked, key=role, current=note: self.choose(key, current, crop=False))
@@ -482,7 +560,8 @@ class NewSkinDialog(QDialog):
         self.sources[role] = (filename, raw)
         note.setText(note.fontMetrics().elidedText(path.name, Qt.TextElideMode.ElideMiddle, 118))
         self.message.setStyleSheet("")
-        self.message.setText("素材已就绪。" if self.sources.keys() == set(ROLES) else "继续选择其余素材。")
+        self.message.setText("必选素材已就绪，可直接制作或继续补充可选动作。"
+                             if set(ROLES) <= self.sources.keys() else "继续选择其余必选素材。")
 
     def save(self):
         try:
@@ -497,14 +576,19 @@ class NewSkinDialog(QDialog):
         self.message.setStyleSheet("color:#ffbcaf;")
 
 
+STATE_LABELS = (("idle", "待机"), ("reading", "读图"), ("thinking", "思考"), ("ready", "就绪"))
+
+
 class AppearanceEditor(QWidget):
-    def __init__(self, library, current, apply_skin, workspace_directory=lambda: ""):
+    def __init__(self, library, current, apply_skin, workspace_directory=lambda: "", remove_skin=None):
         super().__init__()
         self.library = library
         self.selected = current
         self.apply_skin = apply_skin
         self.workspace_directory = workspace_directory
+        self.remove_skin = remove_skin or library.delete_skin
         self.preview_movie = None
+        self.preview_state = "idle"
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -518,9 +602,16 @@ class AppearanceEditor(QWidget):
         self.presets.setAccessibleName("本地外观方案")
         self.presets.setMinimumWidth(163)
         library_panel.addWidget(self.presets, 1)
+        preset_actions = QHBoxLayout()
         save_preset = QPushButton("保存为方案…")
         save_preset.clicked.connect(self.save_preset)
-        library_panel.addWidget(save_preset)
+        preset_actions.addWidget(save_preset, 1)
+        self.delete_preset_button = QPushButton("删除")
+        self.delete_preset_button.setToolTip("删除选中的自定义外观方案")
+        self.delete_preset_button.setEnabled(False)
+        self.delete_preset_button.clicked.connect(self.delete_preset)
+        preset_actions.addWidget(self.delete_preset_button)
+        library_panel.addLayout(preset_actions)
         preview = QFrame()
         preview.setObjectName("skinPreview")
         preview.setMinimumWidth(290)
@@ -535,6 +626,20 @@ class AppearanceEditor(QWidget):
         self.sprite.setFixedSize(105, 105)
         self.sprite.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.sprite, alignment=Qt.AlignmentFlag.AlignHCenter)
+        state_row = QHBoxLayout()
+        state_row.setSpacing(4)
+        state_row.addStretch()
+        self.state_buttons = {}
+        for state_key, state_label in STATE_LABELS:
+            btn = QPushButton(state_label)
+            btn.setCheckable(True)
+            btn.setChecked(state_key == "idle")
+            btn.setToolTip(f"预览「{state_label}」动作")
+            btn.clicked.connect(lambda checked, key=state_key: self.choose_preview_state(key))
+            state_row.addWidget(btn)
+            self.state_buttons[state_key] = btn
+        state_row.addStretch()
+        preview_layout.addLayout(state_row)
         positions = QHBoxLayout()
         preview_layout.addLayout(positions)
         self.side = PreviewPortrait(False)
@@ -553,6 +658,11 @@ class AppearanceEditor(QWidget):
         self.materials = QComboBox()
         self.materials.setAccessibleName("角色素材")
         assets.addWidget(self.materials, 1)
+        self.delete_skin_button = QPushButton("删除皮肤")
+        self.delete_skin_button.setToolTip("删除当前选中的自定义皮肤（内置皮肤不可删除）")
+        self.delete_skin_button.setEnabled(False)
+        self.delete_skin_button.clicked.connect(self.delete_skin)
+        assets.addWidget(self.delete_skin_button)
         colors = QHBoxLayout()
         layout.addLayout(colors)
         colors.addWidget(QLabel("气泡配色"))
@@ -588,6 +698,7 @@ class AppearanceEditor(QWidget):
         buttons.addWidget(apply)
         self.presets.currentItemChanged.connect(self.choose_preset)
         self.presets.itemClicked.connect(self.choose_preset)
+        self.presets.itemSelectionChanged.connect(self.update_delete_buttons)
         self.materials.currentIndexChanged.connect(self.choose_material)
         self.colors.currentIndexChanged.connect(self.choose_palette)
         self.load(current)
@@ -622,6 +733,16 @@ class AppearanceEditor(QWidget):
             if self.presets.currentRow() < 0:
                 self.presets.setCurrentRow(0)
                 self.presets.clearSelection()
+        self.update_delete_buttons()
+
+    def update_delete_buttons(self):
+        item = self.presets.currentItem()
+        selected_custom_preset = bool(
+            item is not None and item.isSelected()
+            and not any(skin.name == item.text() for skin in BUILT_INS)
+        )
+        self.delete_preset_button.setEnabled(selected_custom_preset)
+        self.delete_skin_button.setEnabled(self.selected.key.startswith("skin-"))
 
     def add_material(self, skin):
         self.materials.addItem("窗边小龙（内置）" if skin.path == ART else skin.name, skin)
@@ -632,10 +753,27 @@ class AppearanceEditor(QWidget):
             skin = item.data(Qt.ItemDataRole.UserRole)
             if skin != self.selected:
                 self.set_preview(skin)
+        self.update_delete_buttons()
 
     def choose_material(self):
         self.presets.clearSelection()
-        self.set_preview(self.materials.currentData())
+        material = self.materials.currentData()
+        if material is not None:
+            self.set_preview(material)
+        self.update_delete_buttons()
+
+    def choose_preview_state(self, state):
+        self.preview_state = state
+        for key, btn in self.state_buttons.items():
+            btn.setChecked(key == state)
+        if self.preview_movie is not None:
+            self.sprite.clear()
+            dispose_movie(self.preview_movie)
+            self.preview_movie = None
+        if self.isVisible():
+            self.preview_movie = self.selected.movie(self.preview_state, self, self.sprite.size())
+            self.sprite.setMovie(self.preview_movie)
+            self.preview_movie.start()
 
     def set_preview(self, skin):
         self.selected = skin
@@ -649,11 +787,12 @@ class AppearanceEditor(QWidget):
         if self.isVisible():
             self.start_preview()
         self.message.hide()
+        self.update_delete_buttons()
 
     def start_preview(self):
         if self.preview_movie is not None:
             return
-        self.preview_movie = self.selected.movie("idle", self, self.sprite.size())
+        self.preview_movie = self.selected.movie(self.preview_state, self, self.sprite.size())
         self.sprite.setMovie(self.preview_movie)
         self.preview_movie.start()
         for portrait in (self.side, self.bottom):
@@ -664,8 +803,7 @@ class AppearanceEditor(QWidget):
         self.bottom.stop()
         if self.preview_movie is not None:
             self.sprite.clear()
-            self.preview_movie.stop()
-            self.preview_movie.deleteLater()
+            dispose_movie(self.preview_movie)
             self.preview_movie = None
 
     def choose_palette(self):
@@ -709,7 +847,53 @@ class AppearanceEditor(QWidget):
             self.message.show()
             return
         self.reload_presets(name.strip())
-        self.message.hide()
+        self.message.setText("方案已保存。")
+        self.message.show()
+
+    def delete_preset(self):
+        item = self.presets.currentItem()
+        if item is None or not item.isSelected():
+            return
+        name = item.text()
+        reply = QMessageBox.question(self, "删除外观方案", f"删除本地外观方案「{name}」？",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.library.delete_preset(name)
+        except ValueError as error:
+            self.message.setText(str(error))
+            self.message.show()
+            return
+        self.reload_presets()
+        self.message.setText(f"已删除方案「{name}」。")
+        self.message.show()
+
+    def delete_skin(self):
+        skin = self.selected
+        if not skin.key.startswith("skin-"):
+            return
+        reply = QMessageBox.question(
+            self, "删除自定义皮肤",
+            f"删除自定义皮肤「{skin.name}」？使用该皮肤的桌宠将恢复为默认皮肤。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.stop_preview()
+        try:
+            self.remove_skin(skin.key)
+        except ValueError as error:
+            if self.isVisible():
+                self.start_preview()
+            self.message.setText(str(error))
+            self.message.show()
+            return
+        self.load(BUILT_INS[0])
+        self.message.setText(f"已删除皮肤「{skin.name}」。")
+        self.message.show()
 
     def import_skin(self):
         filename, _ = QFileDialog.getOpenFileName(self, "导入伴学皮肤", self.workspace_directory(), "皮肤包 (*.zip)")
@@ -722,11 +906,15 @@ class AppearanceEditor(QWidget):
             self.message.show()
             return
         self.materials.setCurrentIndex(self.add_material(skin))
+        self.message.setText(f"已导入皮肤「{skin.name}」，点「应用到桌宠」即可生效。")
+        self.message.show()
 
     def create_skin(self):
         form = NewSkinDialog(self, self.library, self.workspace_directory())
         if form.exec() == QDialog.DialogCode.Accepted:
             self.materials.setCurrentIndex(self.add_material(form.skin))
+            self.message.setText(f"已制作皮肤「{form.skin.name}」，点「应用到桌宠」即可生效。")
+            self.message.show()
         form.deleteLater()
 
     def save_selection(self):

@@ -20,7 +20,7 @@ from PyQt6.QtCore import QEventLoop, QObject, QTimer, pyqtSignal
 import native
 from overlay import GuideOverlay
 from practice import CHAT_LEASE_SECONDS, Practice, WindowScope
-from protocol import DEFAULT_POLL_SECONDS, PROGRESS_PHASES, validated_arguments
+from protocol import DEFAULT_POLL_SECONDS, PROGRESS_PHASES, tool_error, validated_arguments
 from target import tighten
 from window_reader import WindowReader
 
@@ -97,7 +97,7 @@ class MentorServer(QObject):
 
     def check_action(self):
         mouse = native.primary_mouse()
-        if not self.action or not mouse:
+        if not self.action or not mouse or self.practice.scope is None or self.guide_window is None:
             return
         down, x, y = mouse
         if down == self.mouse_down:
@@ -140,7 +140,7 @@ class MentorServer(QObject):
         if not same_window:
             self.hide_guide()
             self.practice.force = True
-        elif self.displayed_frame is not None and self.practice.scope.active() != hwnd:
+        elif self.displayed_frame is not None and (self.practice.scope is None or self.practice.scope.active() != hwnd):
             self.conceal_guide()
 
     def conceal_guide(self):
@@ -321,11 +321,21 @@ class MentorServer(QObject):
 
     @staticmethod
     def region_changed(first, second, box):
+        first_image, second_image = first[2], second[2]
+        if first_image.size != second_image.size:
+            return True
+        iw, ih = first_image.size
         x, y, width, height = box
-        crop = (int(x), int(y), math.ceil(x + width), math.ceil(y + height))
-        before = first[2].crop(crop).convert("L")
-        after = second[2].crop(crop).convert("L")
-        return ImageStat.Stat(ImageChops.difference(before, after)).mean[0] >= 16
+        left = max(0, min(iw, int(x)))
+        top = max(0, min(ih, int(y)))
+        right = max(left, min(iw, math.ceil(x + width)))
+        bottom = max(top, min(ih, math.ceil(y + height)))
+        if right <= left or bottom <= top:
+            return False
+        crop = (left, top, right, bottom)
+        before = first_image.crop(crop)
+        after = second_image.crop(crop)
+        return max(ImageStat.Stat(ImageChops.difference(before, after)).mean) >= 16
 
     def wait_for_practice_change(self, practice_id, timeout_seconds=DEFAULT_POLL_SECONDS, *, disconnected):
         practice = self.practice
@@ -371,8 +381,11 @@ class MentorServer(QObject):
                             practice.set_progress("画面已收到，正在判断下一步")
                         return [text_content(event), *self.image_blocks(image)]
                 if time.monotonic() >= deadline:
+                    if practice.ending.is_set():
+                        break
                     state = "waiting" if practice.running.is_set() else "paused"
-                    reason = ("waiting_for_window" if practice.scope.active() is None else
+                    active = practice.scope.active() if practice.scope is not None else None
+                    reason = ("waiting_for_window" if active is None else
                               "capture_retry" if practice.capture_error else
                               "no_new_frame" if practice.current is None else "unchanged")
                     event = {"state": state, "reason": reason}
@@ -383,7 +396,10 @@ class MentorServer(QObject):
             return [text_content({"state": "ended"})]
         finally:
             timer.stop()
-            practice.wake.disconnect(loop.quit)
+            try:
+                practice.wake.disconnect(loop.quit)
+            except TypeError:
+                pass
             self.waiting = False
 
     def show_guide(self, snapshot_id, x, y, width, height, text, detail="", step=1, seconds=20,
@@ -580,7 +596,7 @@ class MentorServer(QObject):
                 blocks = [text_content({"cleared": True})]
             return {"content": blocks}
         except (native.WindowError, ValueError) as exc:
-            return {"isError": True, "content": [text_content(str(exc))]}
+            return tool_error(str(exc))
 
     def respond(self, request, owner, *, disconnected=lambda: False):
         if (not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request

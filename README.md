@@ -23,4 +23,16 @@ Windows 桌面学伴。可以独立聊天和记事，也可以在已有的 Codex
 
 公开包内置原创「窗边小龙」和同人皮肤「鲸鱼娘 · 海雾蓝」，也支持导入自备皮肤。项目代码、「窗边小龙」和应用图标采用 [MIT 许可证](LICENSE)。鲸鱼娘的角色图和动画采用 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans)。[鲸鱼娘素材署名与改动](codex-plugin/assets/companion/whale-maid/SOURCE.md)
 
+## 开发验证
+
+在项目根目录用 Windows PowerShell 创建测试环境并运行检查：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\codex-plugin\requirements.txt
+.\tools\verify-windows.ps1 -PythonExe .\.venv\Scripts\python.exe
+```
+
+检查覆盖 Python 编译、安装脚本语法、安装清单、插件版本和离屏回归测试。GitHub Actions 在 Windows 上使用 Python 3.11 和 3.14 运行同一套检查。
+
 [详细使用说明](codex-plugin/README.md) · [版本日志](codex-plugin/CHANGELOG.md)

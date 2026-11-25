@@ -95,9 +95,12 @@ def executable_for(pid):
     if not handle:
         return None
     try:
-        length = w.DWORD(32768)
-        path = c.create_unicode_buffer(length.value)
-        return path.value.casefold() if process_image(handle, 0, path, c.byref(length)) else None
+        for size in (2048, 32768):
+            length = w.DWORD(size)
+            path = c.create_unicode_buffer(size)
+            if process_image(handle, 0, path, c.byref(length)):
+                return path.value.casefold()
+        return None
     finally:
         close_handle(handle)
 
@@ -159,7 +162,7 @@ def read_window(hwnd: int, width: int, height: int) -> Image.Image:
         if not bitmap or not pixels:
             raise WindowError("无法为窗口截图分配空间。")
         previous = select_object(dc, bitmap)
-        if not previous or not print_window(hwnd, dc, 2):
+        if not previous or not (print_window(hwnd, dc, 2) or print_window(hwnd, dc, 0)):
             raise WindowError("该窗口暂时无法读取，请尝试普通窗口模式。")
         flush()
         image = Image.frombytes("RGB", (width, height), c.string_at(pixels, width * height * 4), "raw", "BGRX")
