@@ -17,7 +17,10 @@ MAX_INPUT = 2500
 MAX_CONTEXT = 14_000  # Approximate by UTF-8 bytes, independent of the model tokenizer.
 MAX_RESPONSE = 2 * 1024 * 1024
 RECALL_MARKERS = ("回忆：", "回忆:")
+REMEMBER_MARKERS = ("记住：", "记住:")
+KEY_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 JSON_FENCES = {"```", "```json"}
+THINK_BLOCK = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 ANSWER_PREFIX = re.compile(r'"answer"\s*:\s*"')
 JSON_STRING_PREFIX = re.compile(r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4}))*')
 ALPHABET = re.compile(r"[a-z0-9_]+|[\u3400-\u9fff]+")
@@ -100,7 +103,16 @@ class Archive:
         if state not in {"confirmed", "forgotten"}:
             raise ValueError("无效的记忆操作。")
         with closing(self.connect()) as db, db:
-            db.execute("UPDATE record SET state = ? WHERE id = ? AND role = 'memory'", (state, key))
+            if state == "confirmed":
+                db.execute("UPDATE record SET state = ? WHERE id = ? AND role = 'memory'", (state, key))
+            else:
+                db.execute("UPDATE record SET state = ? WHERE id = ? AND role IN ('memory', 'practice')", (state, key))
+
+    def clear_transcript(self):
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM recall WHERE rowid IN (SELECT id FROM record WHERE role IN ('user', 'assistant'))")
+            db.execute("DELETE FROM record WHERE role IN ('user', 'assistant')")
 
     def memories(self):
         with closing(self.connect()) as db:
@@ -125,8 +137,13 @@ class Archive:
                 SELECT r.*, rank FROM recall JOIN record r ON r.id = recall.rowid
                 WHERE recall MATCH ? AND r.state NOT IN ('forgotten','candidate')
                   AND NOT (r.role = 'user' AND substr(r.body, 1, 3) IN (?, ?))
+                  AND NOT (
+                      r.role = 'user'
+                      AND substr(r.body, 1, 3) IN (?, ?)
+                      AND EXISTS (SELECT 1 FROM record m WHERE m.source_id = r.id AND m.role = 'memory')
+                  )
                 ORDER BY rank, r.id DESC LIMIT ?
-            """, (expression, *RECALL_MARKERS, limit + len(exclude)))
+            """, (expression, *RECALL_MARKERS, *REMEMBER_MARKERS, limit + len(exclude)))
             return [row for row in rows if row["id"] not in exclude][:limit]
 
     def request_messages(self, prompt, other_queries=()):
@@ -159,7 +176,8 @@ class Archive:
             if row["body"] in seen:
                 continue
             body = excerpt(row["body"], min(budget - 64, 1000), terms(query))
-            sections.append(f"#{row['id']} {row['created'][:10]} {row['role']}：{body}")
+            created = (row["created"] or "")[:10]
+            sections.append(f"#{row['id']} {created} {row['role']}：{body}")
             budget -= len(sections[-1].encode("utf-8")) + 8
             seen.add(row["body"])
         messages = [{"role": "system", "content": SYSTEM}]
@@ -175,9 +193,41 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class ModelError(ValueError):
+    """Specific user-facing model call error that should not be masked."""
+
+
+def valid_key_name(key_name):
+    return not key_name or bool(KEY_NAME_PATTERN.fullmatch(key_name))
+
+
+def strip_think(content):
+    stripped = content.lstrip()
+    if stripped.lower().startswith("<think>"):
+        match = THINK_BLOCK.match(content)
+        return content[match.end():] if match else ""
+    return content
+
+
+def extract_json_object(content):
+    value = strip_think(content).strip()
+    if value.endswith("```"):
+        header, newline, body = value.partition("\n")
+        if newline and header.rstrip().lower() in JSON_FENCES:
+            value = body[:-3].strip()
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def answer_preview(content):
     """Extract only the public answer, including an unfinished JSON string."""
+    content = strip_think(content)
     value = content.lstrip()
+    if not value:
+        return ""
     if value in ("`", "``"):
         return ""
     if value.startswith("```"):
@@ -207,44 +257,55 @@ def read_model_stream(response, publish, cancelled):
     finished = False
     previous = ""
     deadline = monotonic() + 120
+
+    def consume_event():
+        nonlocal finished, previous
+        if not event:
+            return False
+        data = b"\n".join(event)
+        event.clear()
+        if data == b"[DONE]":
+            finished = True
+            return True
+        packet = json.loads(data)
+        if isinstance(packet, dict) and packet.get("error"):
+            raise ModelError("模型接口返回错误，请核对模型名、额度或服务状态。")
+        choices = packet.get("choices") or []
+        if not choices:
+            return False
+        choice = choices[0]
+        finished = finished or choice.get("finish_reason") is not None
+        delta = (choice.get("delta") or {}).get("content")
+        if isinstance(delta, str) and delta:
+            chunks.append(delta)
+            answer = answer_preview("".join(chunks))
+            if answer != previous:
+                publish(answer)
+                previous = answer
+        return False
+
     while not cancelled():
         if monotonic() >= deadline:
-            raise TimeoutError
+            raise ModelError("模型流式回复超时，请稍后重试。")
         line = response.readline(MAX_RESPONSE - total + 1)
         if not line:
-            if not finished:
-                raise ValueError("模型流式回复提前结束。")
+            consume_event()
+            if not finished and not chunks:
+                raise ModelError("模型流式回复提前结束。")
             break
         total += len(line)
         if total > MAX_RESPONSE:
-            raise ValueError("模型回复超出大小上限。")
+            raise ModelError("模型回复超出大小上限。")
         if line.startswith(b"data:"):
             event.append(line[5:].strip())
         elif not line.strip() and event:
-            data = b"\n".join(event)
-            event.clear()
-            if data == b"[DONE]":
+            if consume_event():
                 break
-            packet = json.loads(data)
-            if packet.get("error"):
-                raise ValueError
-            choices = packet.get("choices") or []
-            if not choices:
-                continue
-            choice = choices[0]
-            finished = finished or choice.get("finish_reason") is not None
-            delta = (choice.get("delta") or {}).get("content")
-            if isinstance(delta, str) and delta:
-                chunks.append(delta)
-                answer = answer_preview("".join(chunks))
-                if answer != previous:
-                    publish(answer)
-                    previous = answer
     return "".join(chunks)
 
 
 def model_url(endpoint):
-    url = endpoint.rstrip("/")
+    url = endpoint.strip().rstrip("/")
     try:
         target = urlsplit(url)
         port = target.port
@@ -260,8 +321,13 @@ def model_url(endpoint):
 
 def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=None, cancelled=lambda: False,
               timeout=35):
-    if not endpoint.strip() or not model.strip():
+    endpoint = endpoint.strip()
+    model = model.strip()
+    key_name = key_name.strip()
+    if not endpoint or not model:
         raise ValueError("尚未配置模型。打开「模型」填写接口和模型名。")
+    if not valid_key_name(key_name):
+        raise ValueError("请填环境变量名，例如 SCREEN_MENTOR_MODEL_KEY，不要直接填密钥。")
     url = model_url(endpoint)
     key = os.environ.get(key_name, "") if key_name else ""
     if key_name and not key:
@@ -277,28 +343,29 @@ def ask_model(endpoint, model, key_name, messages, *, max_tokens=900, publish=No
         with build_opener(NoRedirect()).open(request, timeout=timeout) as response:
             if publish is not None and response.headers.get_content_type() == "text/event-stream":
                 content = read_model_stream(response, publish, cancelled)
+                if cancelled():
+                    return "", "", ""
             else:
                 document = json.loads(response.read(MAX_RESPONSE))
+                if isinstance(document, dict) and document.get("error"):
+                    raise ModelError("模型接口返回错误，请核对模型名、额度或服务状态。")
                 content = document["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():
             raise ValueError
+    except ModelError:
+        raise
     except HTTPError as error:
         error.close()
         raise ValueError(f"模型接口返回 HTTP {error.code}，请核对地址、模型和权限。") from None
+    except TimeoutError:
+        raise ValueError("模型接口连接超时，请检查网络或稍后重试。") from None
     except (URLError, OSError, HTTPException, ValueError, KeyError, IndexError, TypeError, AttributeError):
         raise ValueError("模型暂时没有返回可用回复，请检查接口和网络。") from None
-    try:
-        value = content.strip()
-        if value.endswith("```"):
-            header, newline, body = value.partition("\n")
-            if newline and header.rstrip().lower() in JSON_FENCES:
-                value = body[:-3]
-        parsed = json.loads(value)
+    parsed = extract_json_object(content)
+    if parsed is not None and isinstance(parsed.get("answer"), str):
         answer = parsed["answer"]
         learn = parsed.get("learn") or ""
         recall = parsed.get("recall") or ""
-        if not isinstance(answer, str) or not isinstance(learn, str) or not isinstance(recall, str):
-            raise ValueError
-    except (ValueError, TypeError, KeyError):
-        return content.strip(), "", ""
-    return answer.strip(), learn.strip(), recall.strip()
+        if isinstance(learn, str) and isinstance(recall, str):
+            return answer.strip(), learn.strip(), recall.strip()
+    return strip_think(content).strip(), "", ""

@@ -37,11 +37,46 @@ def database_status(path, table):
         return "读取失败"
 
 
+def error_log_status(directory):
+    log_file = directory / "desktop-errors.log"
+    try:
+        if not log_file.is_file():
+            return "无异常记录"
+        with log_file.open("r", encoding="utf-8", errors="ignore") as handle:
+            count = sum(1 for line in handle if line.strip())
+        return f"已记录 {count} 条异常" if count else "无异常记录"
+    except OSError:
+        return "读取失败"
+
+
+def custom_skins_count(directory):
+    skins_dir = directory / "appearance" / "skins"
+    try:
+        if not skins_dir.is_dir():
+            return "0 个"
+        count = sum(1 for item in skins_dir.iterdir() if item.is_dir() and item.name.startswith("skin-"))
+        return f"{count} 个"
+    except OSError:
+        return "读取失败"
+
+
+def dependency_versions():
+    versions = []
+    for module_name, label in (("PIL", "Pillow"), ("mss", "mss")):
+        try:
+            module = __import__(module_name)
+            versions.append(f"{label} {getattr(module, '__version__', '未知')}")
+        except ImportError:
+            versions.append(f"{label} 缺失")
+    return " / ".join(versions)
+
+
 def support_report(archive_path, team_path, listening):
     system = sys.platform
     if sys.platform == "win32":
         version = sys.getwindowsversion().platform_version
         system = "Windows " + ".".join(map(str, version))
+    profile_dir = archive_path.parent
     return "\n".join((
         "屏幕伴学 · 本机诊断",
         f"应用版本：{VERSION}",
@@ -49,9 +84,12 @@ def support_report(archive_path, team_path, listening):
         f"Python：{platform.python_version()}",
         f"Qt：{qVersion()}",
         f"SQLite：{sqlite3.sqlite_version}",
+        f"依赖库：{dependency_versions()}",
         "",
-        f"数据目录：{profile_status(archive_path.parent)}",
+        f"数据目录：{profile_status(profile_dir)}",
         f"主档案数据库：{database_status(archive_path, 'record')}",
         f"团队与任务数据库：{database_status(team_path, 'member')}",
+        f"自定义皮肤：{custom_skins_count(profile_dir)}",
+        f"错误日志：{error_log_status(profile_dir)}",
         f"本机 MCP 监听：{'已启动' if listening else '未启动'}",
     ))

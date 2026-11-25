@@ -182,6 +182,9 @@ class EdgeThought(QWidget):
         font.setPixelSize(13)
         self.setFont(font)
         self.text = ""
+        self.visible_text = ""
+        self.edge = Qt.Edge.RightEdge
+        self.dot_axis = QPoint()
         self.body_size = QSize()
         self.skin_colors = BUILT_INS[0].palette
 
@@ -259,6 +262,7 @@ class EdgePeek(QWidget):
     restore_requested = pyqtSignal(object)
     lift_moved = pyqtSignal(QPoint)
     lift_released = pyqtSignal(QPoint)
+    dock_moved = pyqtSignal()
 
     def __init__(self):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -302,7 +306,11 @@ class EdgePeek(QWidget):
             self.setFixedSize(64, 84)
         self.move(self.edge_position(anchor - QPoint(self.width() // 2, self.height() // 2)))
         self.clock.start()
-        self.frames[edge == Qt.Edge.BottomEdge].start()
+        for frames in self.frames.values():
+            frames.stop()
+        active_frames = self.frames.get(edge == Qt.Edge.BottomEdge)
+        if active_frames is not None:
+            active_frames.start()
         self.show()
         self.animation.start()
         self.animate()
@@ -357,6 +365,7 @@ class EdgePeek(QWidget):
             self.restore_requested.emit(cursor)
         else:
             self.move(self.edge_position(self.press_position + delta))
+            self.dock_moved.emit()
 
     def inward(self, delta):
         return {
@@ -402,7 +411,9 @@ class EdgePeek(QWidget):
 
     def hideEvent(self, event):
         self.animation.stop()
-        self.frames[self.edge == Qt.Edge.BottomEdge].stop()
+        active_frames = self.frames.get(self.edge == Qt.Edge.BottomEdge)
+        if active_frames is not None:
+            active_frames.stop()
         self.thought.hide()
         self.reset_press()
         super().hideEvent(event)
@@ -414,8 +425,9 @@ class EdgePeek(QWidget):
         painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         bottom = self.edge == Qt.Edge.BottomEdge
         elapsed = self.clock.elapsed() / 1000
-        pose = self.frames[bottom].current(elapsed)
-        if pose.isNull():
+        active_frames = self.frames.get(bottom)
+        pose = active_frames.current(elapsed) if active_frames is not None else None
+        if pose is None or pose.isNull():
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(tinted(self.thought.skin_colors.background, 230))
             painter.drawRoundedRect(QRectF(self.rect()).adjusted(3, 3, -3, -3), 12, 12)
@@ -474,6 +486,7 @@ class PetSprite(QLabel):
 class CompanionPanel(QWidget):
     closed = pyqtSignal()
     clicked = pyqtSignal()
+    layout_changed = pyqtSignal()
 
     def __init__(self, *, skin_key=None, sprite_size=138):
         super().__init__(flags=Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -497,12 +510,13 @@ class CompanionPanel(QWidget):
         self.suspended = False
         self.dock_position = None
         self.snapping_enabled = True
-        self.model_frame = None
+        self.model_pixels_cache = {}
         self.model_pixels = QRect()
         self.peek = EdgePeek()
         self.peek.restore_requested.connect(self.restore_from_edge)
         self.peek.lift_moved.connect(self.pull_from_edge)
         self.peek.lift_released.connect(self.drop_from_edge)
+        self.peek.dock_moved.connect(self.layout_changed)
         self.destroyed.connect(self.peek.deleteLater)
         self.controls = QWidget()
         self.controls.setObjectName("companionControls")
@@ -532,20 +546,40 @@ class CompanionPanel(QWidget):
         self.skin_key = skin_key
         self.skin_palette = ""
         self.skin = None
-        self.refresh_skin()
+        self._settings_mtime = None
+        self.refresh_skin(force=True)
         self.skin_timer = QTimer(self)
-        self.skin_timer.setInterval(1500)
-        self.skin_timer.timeout.connect(self.refresh_skin)
-        self.skin_timer.start()
-
-    def refresh_skin(self):
+        self.skin_timer.setInterval(4000)
+        self.skin_timer.timeout.connect(self._poll_skin)
         if self.skin_key is None:
+            self.skin_timer.start()
+
+    def _poll_skin(self):
+        settings_file = self.library.root / "settings.ini"
+        try:
+            mtime = settings_file.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        if mtime != self._settings_mtime:
+            self._settings_mtime = mtime
+            self.refresh_skin()
+
+    def refresh_skin(self, *, force=False):
+        if self.skin_key is None:
+            settings_file = self.library.root / "settings.ini"
+            try:
+                self._settings_mtime = settings_file.stat().st_mtime_ns
+            except OSError:
+                self._settings_mtime = None
             skin = self.library.current()
         else:
             skin = self.library.resolve(self.skin_key, saved_palette=False)
             if self.skin_palette:
-                skin = replace(skin, palette=palette_for(self.skin_palette))
-        if skin == self.skin:
+                try:
+                    skin = replace(skin, palette=palette_for(self.skin_palette))
+                except ValueError:
+                    pass
+        if not force and skin == self.skin:
             return
         previous_skin = self.skin
         self.skin = skin
@@ -563,6 +597,7 @@ class CompanionPanel(QWidget):
         )
         if previous_skin is None or previous_skin.path != skin.path:
             pose = self.state or "idle"
+            self.model_pixels_cache.clear()
             self.sprite.clear()
             for movie in self.anims.values():
                 movie.stop()
@@ -571,6 +606,49 @@ class CompanionPanel(QWidget):
             self.state = None
             self.set_pose(pose)
         self.peek.set_skin(skin)
+
+    def set_pet_opacity(self, opacity):
+        value = max(0.35, min(1.0, float(opacity)))
+        self.setWindowOpacity(value)
+        self.peek.setWindowOpacity(value)
+        self.peek.thought.setWindowOpacity(value)
+
+    def layout_state(self):
+        if self.peek.isVisible() and self.peek.edge is not None:
+            edge_name = {Qt.Edge.LeftEdge: "left", Qt.Edge.RightEdge: "right", Qt.Edge.BottomEdge: "bottom"}.get(
+                self.peek.edge, "")
+            center = self.peek.geometry().center()
+            return {"edge": edge_name, "x": center.x(), "y": center.y()}
+        return {"edge": "", "x": self.x(), "y": self.y()}
+
+    def restore_layout(self, state):
+        if not isinstance(state, dict):
+            return False
+        try:
+            x, y = int(state["x"]), int(state["y"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        point = QPoint(x, y)
+        screen = QGuiApplication.screenAt(point) or self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return False
+        area = screen.availableGeometry()
+        edge = {"left": Qt.Edge.LeftEdge, "right": Qt.Edge.RightEdge, "bottom": Qt.Edge.BottomEdge}.get(
+            state.get("edge", ""))
+        if edge is not None and self.snapping_enabled:
+            self.move(fit_position(point, self.size(), area))
+            if self.suspended:
+                self.dock_position = (edge, point, area)
+            else:
+                self.peek.dock(edge, point, area)
+                self.controls.hide()
+                self.hide()
+            return True
+        if self.peek.isVisible():
+            self.peek.hide()
+        self.dock_position = None
+        self.move(fit_position(point, self.size(), area))
+        return True
 
     def add_desktop_actions(self, manager, hide_desktop):
         for action, callback in (("manager", manager), ("hide", hide_desktop)):
@@ -670,8 +748,9 @@ class CompanionPanel(QWidget):
         if kind == QEvent.Type.MouseMove and event.buttons() & Qt.MouseButton.LeftButton:
             cursor = event.globalPosition().toPoint()
             position = cursor - self.drag_offset
-            screen = QGuiApplication.screenAt(cursor) or self.screen()
-            self.move(self.fit_model(position, screen.availableGeometry()))
+            screen = QGuiApplication.screenAt(cursor) or self.screen() or QGuiApplication.primaryScreen()
+            if screen is not None:
+                self.move(self.fit_model(position, screen.availableGeometry()))
             return True
         released = kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton
         if released or kind == QEvent.Type.UngrabMouse:
@@ -683,8 +762,9 @@ class CompanionPanel(QWidget):
             self.drag_start = None
             handle.setCursor(Qt.CursorShape.OpenHandCursor)
             if released and dragged:
-                screen = QGuiApplication.screenAt(cursor) or self.screen()
-                self.place_on_release(position, screen.availableGeometry())
+                screen = QGuiApplication.screenAt(cursor) or self.screen() or QGuiApplication.primaryScreen()
+                if screen is not None:
+                    self.place_on_release(position, screen.availableGeometry())
             elif released and handle is self.sprite:
                 self.clicked.emit()
             return released
@@ -696,17 +776,21 @@ class CompanionPanel(QWidget):
         bounds = self.sprite.rect()
         if frame is not None and not frame.isNull():
             key = frame.cacheKey()
-            if key != self.model_frame:
-                self.model_frame = key
+            cached = self.model_pixels_cache.get(key)
+            if cached is None:
                 rgba = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
                 raw = rgba.constBits().asstring(rgba.sizeInBytes())
                 pixels = Image.frombytes("RGBA", (rgba.width(), rgba.height()), raw).getchannel("A").getbbox()
-                self.model_pixels = QRect()
+                cached = QRect()
                 if pixels:
                     left, top, right, bottom = pixels
                     ratio = frame.devicePixelRatio()
-                    self.model_pixels = QRectF(left / ratio, top / ratio, (right - left) / ratio,
-                                               (bottom - top) / ratio).toAlignedRect()
+                    cached = QRectF(left / ratio, top / ratio, (right - left) / ratio,
+                                    (bottom - top) / ratio).toAlignedRect()
+                if len(self.model_pixels_cache) >= 64:
+                    self.model_pixels_cache.clear()
+                self.model_pixels_cache[key] = cached
+            self.model_pixels = cached
             if not self.model_pixels.isEmpty():
                 origin = bounds.center() - QRect(QPoint(), frame.deviceIndependentSize().toSize()).center()
                 bounds = self.model_pixels.translated(origin)
@@ -748,8 +832,9 @@ class CompanionPanel(QWidget):
             self.adjustSize()
             self.sprite.pickup(self.peek.edge)
         self.lift_depth = max(self.lift_depth, self.distance_from_lift_edge(cursor))
-        screen = QGuiApplication.screenAt(cursor) or self.peek.screen()
-        self.move(self.fit_model(cursor - self.grab_point(), screen.availableGeometry()))
+        screen = QGuiApplication.screenAt(cursor) or self.peek.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            self.move(self.fit_model(cursor - self.grab_point(), screen.availableGeometry()))
         if not self.isVisible():
             self.show()
 
@@ -768,7 +853,10 @@ class CompanionPanel(QWidget):
     def drop_from_edge(self, cursor):
         if not self.edge_dragging:
             return
-        screen = QGuiApplication.screenAt(cursor) or self.screen()
+        screen = QGuiApplication.screenAt(cursor) or self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.cancel_lift()
+            return
         area = screen.availableGeometry()
         returned = self.lift_depth - self.distance_from_lift_edge(cursor) >= QApplication.startDragDistance()
         # A short pull can leave the full sprite touching the source edge. Require a return
@@ -782,6 +870,7 @@ class CompanionPanel(QWidget):
         self.move(self.fit_model(position, area))
         if not self.snap_to_edge(area, ignored_edge=ignored_edge):
             self.move(fit_position(position, self.size(), area))
+        self.layout_changed.emit()
 
     def snap_to_edge(self, area, *, ignored_edge=None):
         if not self.snapping_enabled:
@@ -804,7 +893,11 @@ class CompanionPanel(QWidget):
 
     def restore_from_edge(self, cursor):
         anchor = self.peek.geometry().center() if cursor is None else cursor
-        screen = QGuiApplication.screenAt(anchor) or self.peek.screen()
+        screen = QGuiApplication.screenAt(anchor) or self.peek.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.peek.hide()
+            self.show()
+            return
         area = screen.availableGeometry()
         self.adjustSize()
         sprite_center = self.sprite.mapTo(self, self.sprite.rect().center())
@@ -819,6 +912,7 @@ class CompanionPanel(QWidget):
         self.move(fit_position(position, self.size(), area))
         self.peek.hide()
         self.show()
+        self.layout_changed.emit()
 
     def hide_controls_if_outside(self):
         at = QCursor.pos()

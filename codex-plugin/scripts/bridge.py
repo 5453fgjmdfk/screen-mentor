@@ -56,6 +56,8 @@ def ensure_desktop(*, cancelled=None):
     if cancelled is not None and cancelled.is_set():
         return None
     python = Path(sys.executable).with_name("pythonw.exe")
+    if not python.is_file():
+        python = Path(sys.executable)
     desktop = Path(__file__).with_name("desktop.py")
     subprocess.Popen([str(python), "-B", str(desktop), "--background"], cwd=desktop.parent,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

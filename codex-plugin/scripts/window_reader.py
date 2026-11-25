@@ -48,12 +48,22 @@ class WindowReader:
         # Run the real interpreter so killing a timed-out capture also works with
         # Windows venvs whose python.exe is a process-launching redirector.
         environment = os.environ.copy()
-        environment["PYTHONPATH"] = sysconfig.get_path("purelib")
+        search_paths = [sysconfig.get_path("purelib"), sysconfig.get_path("platlib")]
+        here = Path(__file__).resolve()
+        repo_root = here.parents[2]
+        if (repo_root / "capture.py").is_file():
+            search_paths.append(str(repo_root))
+        existing = environment.get("PYTHONPATH")
+        if existing:
+            search_paths.extend(existing.split(os.pathsep))
+        environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(p for p in search_paths if p))
         interpreter = Path(sys._base_executable)
         if interpreter.name.casefold() == "pythonw.exe":
-            interpreter = interpreter.with_name("python.exe")
+            candidate = interpreter.with_name("python.exe")
+            if candidate.is_file():
+                interpreter = candidate
         self.process = subprocess.Popen(
-            [str(interpreter), "-B", str(Path(__file__).resolve())],
+            [str(interpreter), "-B", str(here)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW, env=environment,
         )

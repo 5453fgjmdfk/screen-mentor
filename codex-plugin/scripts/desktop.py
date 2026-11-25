@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 from threading import Event, Thread
 import traceback
 from uuid import uuid4
@@ -16,18 +17,18 @@ enable_dpi_awareness()
 
 from PyQt6 import sip
 from PyQt6.QtCore import QPoint, QLockFile, QObject, QSettings, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QTextCursor
+from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QTextCursor, QTextDocument
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMenu,
-    QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QApplication, QDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from appearance import APP_ICON, SkinLibrary
 from bridge import CHANNEL, MAX_REQUEST, connect, roundtrip
 from companion import fit_position, style_row_views
-from manager import PANEL_STYLE, ManagerWindow, TeamPet, show_centered
-from resident_agent import Archive, MAX_INPUT, PROFILE, RECALL_MARKERS, ask_model, excerpt
+from manager import PANEL_STYLE, ManagerWindow, TeamPet, panel_style, show_centered
+from resident_agent import Archive, MAX_INPUT, PROFILE, RECALL_MARKERS, REMEMBER_MARKERS, ask_model, excerpt
 from scheduled import TaskScheduler
 from server import MentorServer
 from team import PRIMARY, Member, TeamCoordinator, TeamStore
@@ -53,20 +54,40 @@ QLabel#notice { color: #cbb6fa; }
 
 
 class MemoryDialog(QDialog):
-    def __init__(self, parent, archive):
+    def __init__(self, parent, archive, *, member_name=""):
         super().__init__(parent)
         self.archive = archive
-        self.setWindowTitle("长期记忆")
-        self.resize(555, 365)
+        self.all_rows = []
+        self.rows = []
+        self.setWindowTitle(f"长期记忆 · {member_name}" if member_name else "长期记忆")
+        self.resize(580, 410)
         layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("按关键词筛选记忆…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.apply_filter)
+        top.addWidget(self.search_input, 1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("quiet")
+        top.addWidget(self.count_label)
+        layout.addLayout(top)
         self.items = QListWidget()
         layout.addWidget(self.items)
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
         self.detail.setMaximumHeight(110)
         layout.addWidget(self.detail)
+        self.notice = QLabel()
+        self.notice.setObjectName("notice")
+        self.notice.setWordWrap(True)
+        self.notice.hide()
+        layout.addWidget(self.notice)
         actions = QHBoxLayout()
         layout.addLayout(actions)
+        add_btn = QPushButton("新增记忆…")
+        add_btn.clicked.connect(self.add_memory)
+        actions.addWidget(add_btn)
         self.confirm = QPushButton("确认记住")
         self.remove = QPushButton("移出长期记忆")
         self.confirm.clicked.connect(lambda: self.review("confirmed"))
@@ -82,30 +103,63 @@ class MemoryDialog(QDialog):
         self.refresh()
 
     def refresh(self):
-        self.rows = self.archive.memories()
+        self.all_rows = self.archive.memories()
+        self.apply_filter()
+
+    def apply_filter(self):
+        needle = self.search_input.text().strip().casefold()
+        self.rows = [row for row in self.all_rows if not needle or needle in row["body"].casefold()]
+        self.count_label.setText(f"{len(self.rows)} / {len(self.all_rows)} 条" if needle else f"共 {len(self.all_rows)} 条")
         self.items.clear()
         for row in self.rows:
             label = {"confirmed": "已确认", "candidate": "待确认"}.get(row["state"], "练习小结")
-            self.items.addItem(f"{label}　{excerpt(row['body'].replace(chr(10), ' '), 92)}")
+            created = (row["created"] or "")[:10]
+            prefix = f"{label} · {created}" if created else label
+            self.items.addItem(f"{prefix}　{excerpt(row['body'].replace(chr(10), ' '), 84)}")
         self.items.setCurrentRow(0)
         self.show_item(self.items.currentRow())
 
     def show_item(self, index):
         row = self.rows[index] if 0 <= index < len(self.rows) else None
-        self.detail.setPlainText(row["body"] if row else "还没有长期记忆。")
+        if row is not None:
+            self.detail.setPlainText(row["body"])
+        elif self.search_input.text().strip():
+            self.detail.setPlainText("没有匹配的长期记忆。")
+        else:
+            self.detail.setPlainText("还没有长期记忆。")
         self.confirm.setEnabled(bool(row and row["state"] == "candidate"))
-        self.remove.setEnabled(bool(row and row["role"] == "memory"))
+        self.remove.setEnabled(bool(row))
+
+    def add_memory(self):
+        text, accepted = QInputDialog.getMultiLineText(self, "新增长期记忆", "填写希望学伴长期记住的内容（1–1200 字）：")
+        if not accepted:
+            return
+        try:
+            self.archive.remember(text)
+        except (ValueError, sqlite3.Error) as error:
+            self.notice.setText(str(error))
+            self.notice.show()
+            return
+        self.notice.setText("已存入长期记忆。")
+        self.notice.show()
+        self.refresh()
 
     def review(self, state):
         index = self.items.currentRow()
         if index >= 0:
-            self.archive.review(self.rows[index]["id"], state)
+            try:
+                self.archive.review(self.rows[index]["id"], state)
+            except (ValueError, sqlite3.Error) as error:
+                self.notice.setText(str(error))
+                self.notice.show()
+                return
+            self.notice.hide()
             self.refresh()
 
 
 class ChatPane(QWidget):
-    completed = pyqtSignal(str, str, str)
-    chunk = pyqtSignal(str)
+    completed = pyqtSignal(object, str, str, str)
+    chunk = pyqtSignal(object, str)
     started = pyqtSignal()
     response = pyqtSignal(str, str)
 
@@ -117,6 +171,8 @@ class ChatPane(QWidget):
         self.busy = False
         self.taken = False
         self.cancel = Event()
+        self.last_prompt = ""
+        self.last_source_id = None
         self.preview = ""
         self.preview_timer = QTimer(self)
         self.preview_timer.setSingleShot(True)
@@ -125,19 +181,31 @@ class ChatPane(QWidget):
         self.draft_position = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
+        top_bar = QHBoxLayout()
         self.notice = QLabel("日常对话保存在本机。")
         self.notice.setObjectName("notice")
         self.notice.setWordWrap(True)
         self.notice.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.notice)
+        top_bar.addWidget(self.notice, 1)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索当前会话…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMaximumWidth(200)
+        self.search_input.returnPressed.connect(self.find_next)
+        top_bar.addWidget(self.search_input)
+        find_btn = QPushButton("查找")
+        find_btn.setToolTip("在当前会话记录中查找下一个匹配")
+        find_btn.clicked.connect(self.find_next)
+        top_bar.addWidget(find_btn)
+        layout.addLayout(top_bar)
         self.history = QPlainTextEdit()
         self.history.setAccessibleName("对话记录")
         self.history.setReadOnly(True)
         layout.addWidget(self.history, 1)
         self.input = QPlainTextEdit()
         self.input.setFixedHeight(76)
-        self.input.setPlaceholderText("输入消息。用「记住：…」保存一条记忆，用「回忆：…」检索。")
+        self.input.setPlaceholderText("输入消息。用「记住：…」保存一条记忆，用「回忆：…」检索。（Ctrl+Enter 发送）")
         layout.addWidget(self.input)
         actions = QHBoxLayout()
         layout.addLayout(actions)
@@ -147,7 +215,21 @@ class ChatPane(QWidget):
         memory = QPushButton("长期记忆")
         memory.clicked.connect(self.open_memory)
         actions.addWidget(memory)
+        self.clear_button = QPushButton("清空")
+        self.clear_button.setToolTip("清空当前私聊记录（保留长期记忆）")
+        self.clear_button.clicked.connect(self.clear_history)
+        actions.addWidget(self.clear_button)
         actions.addStretch()
+        self.retry_button = QPushButton("重试")
+        self.retry_button.setToolTip("重新向模型发送上一条消息")
+        self.retry_button.clicked.connect(self.retry_last)
+        self.retry_button.setEnabled(False)
+        actions.addWidget(self.retry_button)
+        self.stop_button = QPushButton("停止")
+        self.stop_button.setToolTip("停止正在生成的回复")
+        self.stop_button.clicked.connect(self.stop_reply)
+        self.stop_button.setEnabled(False)
+        actions.addWidget(self.stop_button)
         self.team_button = None
         if open_team is not None:
             self.team_button = QPushButton("协作…")
@@ -158,21 +240,75 @@ class ChatPane(QWidget):
         self.send_button.setObjectName("primary")
         self.send_button.clicked.connect(self.send)
         actions.addWidget(self.send_button)
-        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.input)
-        shortcut.activated.connect(self.send)
+        for key in ("Ctrl+Return", "Ctrl+Enter"):
+            shortcut = QShortcut(QKeySequence(key), self.input)
+            shortcut.activated.connect(self.send)
         self.chunk.connect(self.receive_chunk)
         self.completed.connect(self.receive)
         self.refresh()
 
     def refresh(self):
         name = self.member.name
+        rows = self.archive.transcript()
         self.history.setPlainText("\n\n".join(
             f"{'你' if row['role'] == 'user' else name}\n{row['body']}"
-            for row in self.archive.transcript()
+            for row in rows
         ))
         scrollbar = self.history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
         self.draft_position = self.history.document().characterCount() - 1
+        last_user = next((row for row in reversed(rows)
+                          if row["role"] == "user"
+                          and not row["body"].startswith(RECALL_MARKERS + REMEMBER_MARKERS)), None)
+        if last_user is not None:
+            self.last_prompt = last_user["body"]
+            self.last_source_id = last_user["id"]
+        else:
+            self.last_prompt = ""
+            self.last_source_id = None
+        self.update_controls()
+
+    def update_controls(self):
+        self.send_button.setEnabled(not self.taken and not self.busy)
+        self.stop_button.setEnabled(self.busy and not self.taken)
+        self.retry_button.setEnabled(bool(self.last_prompt) and not self.busy and not self.taken)
+        self.clear_button.setEnabled(not self.busy and not self.taken)
+
+    def find_next(self):
+        query = self.search_input.text().strip()
+        if not query:
+            return
+        if not self.history.find(query):
+            cursor = self.history.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            self.history.setTextCursor(cursor)
+            if not self.history.find(query):
+                self.notice.setText(f"当前显示记录中未找到「{query}」，可用「回忆：{query}」检索全部档案。")
+                return
+        self.history.ensureCursorVisible()
+        self.notice.setText(f"已定位到「{query}」。")
+
+    def clear_history(self):
+        if self.busy or self.taken:
+            return
+        if not self.history.toPlainText().strip():
+            self.notice.setText("当前会话记录已经为空。")
+            return
+        reply = QMessageBox.question(
+            self, "清空会话记录",
+            f"清空与「{self.member.name}」的全部私聊记录？已保存的长期记忆与练习小结会保留。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.archive.clear_transcript()
+        except sqlite3.Error:
+            self.notice.setText("无法清空会话记录，请检查本机档案。")
+            return
+        self.refresh()
+        self.notice.setText("已清空私聊记录，长期记忆已保留。")
 
     def set_member(self, member):
         renamed = self.member.name != member.name
@@ -180,18 +316,20 @@ class ChatPane(QWidget):
         if renamed and not self.busy:
             self.refresh()
 
-    def receive_chunk(self, text):
-        if self.cancel.is_set():
+    def receive_chunk(self, token, text):
+        if token is not self.cancel or token.is_set():
             return
         self.preview = text
         if not self.preview_timer.isActive():
             self.preview_timer.start()
 
     def render_preview(self):
+        if not self.busy or self.cancel.is_set():
+            return
         scrollbar = self.history.verticalScrollBar()
         following = scrollbar.value() >= scrollbar.maximum() - 12
         cursor = QTextCursor(self.history.document())
-        cursor.setPosition(self.draft_position)
+        cursor.setPosition(min(self.draft_position, self.history.document().characterCount() - 1))
         cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
         cursor.removeSelectedText()
         if self.preview:
@@ -202,23 +340,40 @@ class ChatPane(QWidget):
         self.response.emit("stream" if self.preview else "think", self.preview)
 
     def open_memory(self):
-        dialog = MemoryDialog(self, self.archive)
+        dialog = MemoryDialog(self, self.archive, member_name=self.member.name)
         dialog.exec()
         dialog.deleteLater()
+
+    def stop_reply(self):
+        if not self.busy:
+            return
+        self.cancel.set()
+        self.preview_timer.stop()
+        self.busy = False
+        self.preview = ""
+        self.refresh()
+        self.notice.setText("已停止本次回复。")
+        self.response.emit("error", "已停止本次回复。")
+
+    def retry_last(self):
+        if self.busy or self.taken or not self.last_prompt:
+            return
+        self._dispatch_model(self.last_prompt, self.last_source_id)
 
     def set_taken(self, taken):
         self.taken = taken
         self.input.setEnabled(not taken)
-        self.send_button.setEnabled(not taken and not self.busy)
         if self.team_button:
             self.team_button.setEnabled(not taken)
         if taken:
             self.cancel.set()
             self.preview_timer.stop()
+            self.busy = False
             self.preview = ""
             self.refresh()
             self.notice.setText("当前由外部对话伴学。结束后会回到日常对话。")
         else:
+            self.update_controls()
             self.notice.setText("已回到日常对话。")
 
     def send(self):
@@ -234,28 +389,36 @@ class ChatPane(QWidget):
         if len(prompt) > MAX_INPUT:
             self.notice.setText(f"每条消息最多 {MAX_INPUT} 字，请拆成几条发送。")
             return False
+        marker, raw_value = prompt[:3], prompt[3:].strip()
+        if marker in REMEMBER_MARKERS and not 1 <= len(raw_value) <= 1200:
+            self.notice.setText("每条记忆需要 1–1200 个字符。")
+            return False
         try:
             source = self.archive.write("user", prompt)
         except sqlite3.Error:
             self.notice.setText("无法保存消息，请检查本机档案。")
             return False
         self.refresh()
-        marker, raw_value = prompt[:3], prompt[3:].strip()
-        if marker in {"记住：", "记住:"}:
+        if marker in REMEMBER_MARKERS:
             try:
                 self.archive.remember(raw_value, source_id=source)
-            except ValueError as error:
+            except (ValueError, sqlite3.Error) as error:
                 self.notice.setText(str(error))
             else:
                 reply = "已经存入长期记忆。"
                 self.archive.write("assistant", reply)
                 self.refresh()
+                self.notice.setText("已存入长期记忆。")
                 self.response.emit("done", reply)
             return True
         if marker in RECALL_MARKERS:
-            hits = self.archive.search(raw_value, exclude=(source,), limit=5)
+            try:
+                hits = self.archive.search(raw_value, exclude=(source,), limit=5)
+            except sqlite3.Error:
+                self.notice.setText("无法检索本机档案，请检查存储状态。")
+                return True
             if hits:
-                answer = "\n\n".join(f"档案 #{row['id']} · {row['created'][:10]}\n{excerpt(row['body'], 1800)}"
+                answer = "\n\n".join(f"档案 #{row['id']} · {(row['created'] or '')[:10]}\n{excerpt(row['body'], 1800)}"
                                      for row in hits)
                 cursor = QTextCursor(self.history.document())
                 cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -271,6 +434,10 @@ class ChatPane(QWidget):
             self.notice.setText(notice)
             self.response.emit("done", notice)
             return True
+        self._dispatch_model(prompt, source)
+        return True
+
+    def _dispatch_model(self, prompt, source):
         self.settings.sync()
         endpoint, model, key = (self.settings.value(field, "", type=str)
                                 for field in ("endpoint", "model", "key_name"))
@@ -278,12 +445,12 @@ class ChatPane(QWidget):
         config = member.connection((endpoint, model, key))
         self.busy = True
         self.cancel = Event()
+        token = self.cancel
         self.preview = ""
-        self.send_button.setEnabled(False)
+        self.update_controls()
         self.notice.setText("正在思考…")
         self.started.emit()
-        Thread(target=self.answer, args=(config, prompt, source, member, self.cancel), daemon=True).start()
-        return True
+        Thread(target=self.answer, args=(config, prompt, source, member, token), daemon=True).start()
 
     def answer(self, config, prompt, source, member, cancel):
         reply = note = error_message = ""
@@ -298,15 +465,16 @@ class ChatPane(QWidget):
             if cancel.is_set():
                 return
             context = context_for()
-            answer, learn, recall = ask_model(*config, context, publish=self.chunk.emit, cancelled=cancel.is_set)
+            publish = lambda text: self.chunk.emit(cancel, text)
+            answer, learn, recall = ask_model(*config, context, publish=publish, cancelled=cancel.is_set)
             if cancel.is_set():
                 return
             if 1 <= len(recall) <= 70 and recall != prompt:
                 expanded = context_for(recall)
                 if expanded != context:
-                    self.chunk.emit("")
+                    publish("")
                     expanded[0]["content"] += "本轮已重新检索，请依据现有证据回复；recall 留空。"
-                    answer, learn, _ = ask_model(*config, expanded, publish=self.chunk.emit, cancelled=cancel.is_set)
+                    answer, learn, _ = ask_model(*config, expanded, publish=publish, cancelled=cancel.is_set)
             if cancel.is_set():
                 return
             if not answer:
@@ -319,25 +487,30 @@ class ChatPane(QWidget):
         except (ValueError, sqlite3.Error) as error:
             error_message = str(error)
         finally:
-            self.completed.emit(reply, note, error_message)
+            try:
+                self.completed.emit(cancel, reply, note, error_message)
+            except RuntimeError:
+                pass
 
-    def receive(self, reply, note, error):
+    def receive(self, token, reply, note, error):
+        if token is not self.cancel:
+            return
         self.preview_timer.stop()
         self.busy = False
-        self.send_button.setEnabled(not self.taken)
         self.refresh()
-        if not self.cancel.is_set() and not self.taken:
+        if not token.is_set() and not self.taken:
             self.notice.setText(error or note or "回复已保存在本机。")
             self.response.emit("error" if error else "done", error or reply)
 
 
 class QuickChat(QFrame):
-    def __init__(self, pane, anchor, open_history):
+    def __init__(self, pane, anchor, open_history, *, style=PANEL_STYLE):
         super().__init__(None, Qt.WindowType.Popup)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setObjectName("card")
-        self.setStyleSheet(PANEL_STYLE)
+        self.setStyleSheet(style)
         self.pane = pane
+        self.anchor = anchor
         self.show_history = open_history
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -366,12 +539,18 @@ class QuickChat(QFrame):
         self.status.setWordWrap(True)
         self.status.hide()
         layout.addWidget(self.status)
+        self._place()
+
+    def _place(self):
         self.adjustSize()
-        area = anchor.screen().availableGeometry()
-        point = anchor.mapToGlobal(QPoint(anchor.width() // 2, anchor.height()))
+        screen = self.anchor.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        point = self.anchor.mapToGlobal(QPoint(self.anchor.width() // 2, self.anchor.height()))
         position = point + QPoint(-self.width() // 2, 8)
         if position.y() + self.height() > area.bottom():
-            position.setY(point.y() - anchor.height() - self.height() - 8)
+            position.setY(point.y() - self.anchor.height() - self.height() - 8)
         self.move(fit_position(position, self.size(), area))
 
     def send(self):
@@ -383,6 +562,7 @@ class QuickChat(QFrame):
         elif self.pane.busy or prompt:
             self.status.setText("上一条消息还在回复。" if self.pane.busy else self.pane.notice.text())
             self.status.show()
+            self._place()
 
     def open_history(self):
         draft = self.input.text()
@@ -420,6 +600,7 @@ class Desktop(QObject):
         self.main_bubble_timer.timeout.connect(self.reset_main_bubble)
         self.engine.practice.idle_chat.connect(lambda: self.show_quick_chat(PRIMARY))
         self.engine.practice.panel.clicked.connect(lambda: self.show_quick_chat(PRIMARY))
+        self.engine.practice.panel.layout_changed.connect(lambda: self.save_pet_layout(PRIMARY))
         self.engine.practice.panel.add_desktop_actions(self.show_manager, self.hide_pets)
         self.engine.practice.appearance_requested.connect(self.show_appearance)
         self.engine.practice.session_started.connect(self.takeover)
@@ -435,15 +616,70 @@ class Desktop(QObject):
         self.menu.addAction("管理面板", self.show_manager)
         self.pets_action = self.menu.addAction("", self.toggle_pets)
         self.update_pets_action()
+        self.menu.addAction("快速对话", lambda: self.show_quick_chat(PRIMARY) if self.pets_visible else self.show_chat())
         self.menu.addAction("日常对话", self.show_chat)
         self.menu.addAction("桌宠外观", lambda: self.show_appearance())
+        self.menu.addAction("重置桌宠位置", self.reset_pet_positions)
+        self.menu.addSeparator()
         self.menu.addAction("退出桌面学伴", self.quit)
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_clicked)
         self.tray.show()
         self.attach_pet_menu(self.engine.practice.panel)
         self.apply_pet_preferences()
+        self.engine.practice.dialog_style = self.current_panel_style()
+        self.restore_pet_layout(PRIMARY, self.engine.practice.panel)
         self.sync_pets()
+
+    def current_panel_style(self):
+        return panel_style(
+            self.preferences.value("theme", "slate", type=str),
+            self.preferences.value("theme_color", "#1a232b", type=str),
+        )
+
+    def save_pet_layout(self, key):
+        panel = self.engine.practice.panel if key == PRIMARY else self.pets.get(key)
+        if panel is None:
+            return
+        self.preferences.setValue(f"pet_layouts/{key}", json.dumps(panel.layout_state()))
+        self.preferences.sync()
+
+    def restore_pet_layout(self, key, panel):
+        raw = self.preferences.value(f"pet_layouts/{key}", "", type=str)
+        if not raw:
+            return False
+        try:
+            state = json.loads(raw)
+        except ValueError:
+            return False
+        return panel.restore_layout(state)
+
+    def reset_pet_positions(self):
+        self.preferences.beginGroup("pet_layouts")
+        self.preferences.remove("")
+        self.preferences.endGroup()
+        self.preferences.sync()
+        screen = self.app.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            primary_panel = self.engine.practice.panel
+            if primary_panel.peek.isVisible():
+                primary_panel.peek.hide()
+            primary_panel.dock_position = None
+            primary_panel.adjustSize()
+            primary_panel.move(fit_position(
+                QPoint(area.right() - primary_panel.width() - 18, area.bottom() - primary_panel.height() - 38),
+                primary_panel.size(), area,
+            ))
+            if self.pets_visible and not primary_panel.isVisible():
+                primary_panel.show()
+        for pet in self.pets.values():
+            if pet.peek.isVisible():
+                pet.peek.hide()
+            pet.dock_position = None
+            pet.move(pet.default_position())
+            if self.pets_visible and not self.team.blocked and pet.member.visible and not pet.isVisible():
+                pet.show()
 
     def show_chat(self):
         self.show_member_chat(PRIMARY)
@@ -518,9 +754,12 @@ class Desktop(QObject):
         interval = max(4, min(30, self.preferences.value("bubble_seconds", 12, type=int))) * 1000
         self.main_bubble_timer.setInterval(interval)
         enabled = self.preferences.value("snap_enabled", True, type=bool)
+        opacity = max(50, min(100, self.preferences.value("pet_opacity", 100, type=int))) / 100
         self.engine.practice.panel.set_snapping(enabled)
+        self.engine.practice.panel.set_pet_opacity(opacity)
         for pet in self.pets.values():
             pet.set_snapping(enabled)
+            pet.set_pet_opacity(opacity)
             pet.bubble_timer.setInterval(interval)
 
     def workspace_directory(self):
@@ -533,6 +772,9 @@ class Desktop(QObject):
         self.exiting = True
         if self.manager is not None:
             self.manager.store_layout()
+        self.main_bubble_timer.stop()
+        self.engine.hide_guide()
+        self.engine.overlay.close()
         self.engine.practice.shutdown.set()
         self.engine.practice.close()
         self.scheduler.stop()
@@ -540,6 +782,9 @@ class Desktop(QObject):
         self.team.timer.stop()
         for chat in self.member_chats.values():
             chat.cancel.set()
+        for pet in list(self.pets.values()):
+            pet.close()
+        self.pets.clear()
         if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
             self.quick_chat.close()
         self.tray.hide()
@@ -606,6 +851,44 @@ class Desktop(QObject):
             self.manager.refresh()
         return saved
 
+    def delete_member(self, key):
+        if key == PRIMARY:
+            raise ValueError("主学伴不能删除。")
+        if self.team.running:
+            raise ValueError("当前正在群聊或协作，请先停止后再删除成员。")
+        try:
+            self.team.store.remove_member(key)
+        except sqlite3.Error as error:
+            raise ValueError("无法删除学伴，请检查本机存储。") from error
+        pet = self.pets.pop(key, None)
+        if pet is not None:
+            pet.close()
+        chat = self.member_chats.pop(key, None)
+        if chat is not None:
+            chat.cancel.set()
+            if self.manager is not None:
+                self.manager.private_chats.removeWidget(chat)
+            chat.deleteLater()
+        if self.quick_chat is not None and not sip.isdeleted(self.quick_chat) and self.quick_chat.pane.member.key == key:
+            self.quick_chat.close()
+        self.preferences.remove(f"pet_layouts/{key}")
+        self.preferences.sync()
+        self.sync_pets()
+        if self.manager is not None:
+            self.manager.reload_members(PRIMARY)
+            self.manager.reload_rooms()
+            self.manager.refresh()
+
+    def on_skin_deleted(self, skin_key):
+        try:
+            self.team.store.reset_skin(skin_key)
+        except sqlite3.Error:
+            pass
+        self.engine.practice.panel.refresh_skin(force=True)
+        self.sync_pets()
+        if self.manager is not None:
+            self.manager.reload_members()
+
     def show_member_chat(self, key):
         self.show_manager()
         self.manager.open_chat(key)
@@ -639,13 +922,16 @@ class Desktop(QObject):
             return
         if self.quick_chat is not None and not sip.isdeleted(self.quick_chat):
             self.quick_chat.close()
-        self.quick_chat = QuickChat(pane, panel.sprite, lambda: self.show_member_chat(key))
+        self.quick_chat = QuickChat(pane, panel.sprite, lambda: self.show_member_chat(key),
+                                    style=self.current_panel_style())
         self.quick_chat.show()
         self.quick_chat.input.setFocus()
 
     def show_member_memory(self, key):
-        dialog = MemoryDialog(self.manager, self.member_archive(key))
-        dialog.setStyleSheet(STYLE)
+        member = next((entry for entry in self.team.store.members() if entry.key == key), None)
+        dialog = MemoryDialog(self.manager, self.member_archive(key), member_name=member.name if member else "")
+        if self.manager is None:
+            dialog.setStyleSheet(self.current_panel_style())
         dialog.exec()
         dialog.deleteLater()
 
@@ -656,6 +942,7 @@ class Desktop(QObject):
             self.pets.pop(key).close()
         occupied = {pet.slot for pet in self.pets.values()}
         slots = iter(slot for slot in range(len(members) + len(occupied)) if slot not in occupied)
+        opacity = max(50, min(100, self.preferences.value("pet_opacity", 100, type=int))) / 100
         for member in members:
             if member.key not in self.pets:
                 if not member.visible:
@@ -663,9 +950,12 @@ class Desktop(QObject):
                 pet = TeamPet(member, self, next(slots))
                 self.pets[member.key] = pet
                 self.attach_pet_menu(pet)
+                pet.layout_changed.connect(partial(self.save_pet_layout, member.key))
                 pet.set_snapping(self.preferences.value("snap_enabled", True, type=bool))
+                pet.set_pet_opacity(opacity)
                 pet.bubble_timer.setInterval(self.main_bubble_timer.interval())
-                if not self.team.blocked and self.pets_visible:
+                restored_dock = self.restore_pet_layout(member.key, pet)
+                if not self.team.blocked and self.pets_visible and not (restored_dock and pet.peek.isVisible()):
                     pet.show()
             self.pets[member.key].update_member(member, self.team.store.palette(member.key))
         self.sync_pet_visibility()
@@ -685,6 +975,7 @@ class Desktop(QObject):
         if self.team.blocked:
             return
         complete = phase in {"done", "error"}
+        pose = "thinking" if phase == "think" else "ready" if phase == "done" else "idle"
         if phase == "think":
             body = "正在思考…"
         else:
@@ -696,12 +987,11 @@ class Desktop(QObject):
             self.main_line = body
             self.main_bubble_timer.stop()
             practice.set_status(body)
-            practice.panel.set_pose("thinking" if phase == "think" else "ready" if complete else "idle")
+            practice.panel.set_pose(pose)
             if complete:
                 self.main_bubble_timer.start()
         elif key in self.pets:
-            self.pets[key].say(body, pose="thinking" if phase == "think" else "ready" if complete else "idle",
-                               transient=complete)
+            self.pets[key].say(body, pose=pose, transient=complete)
         if complete:
             self.chat_bubbles.discard(key)
         else:
@@ -771,6 +1061,7 @@ class Desktop(QObject):
             result = {"error": {"code": -32600, "message": "Invalid request"}}
         if not sip.isdeleted(socket) and socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
             socket.write(json.dumps(result, ensure_ascii=False).encode() + b"\n")
+            socket.flush()
             socket.disconnectFromServer()
 
 
@@ -791,6 +1082,7 @@ def log_unexpected_errors():
         logger.error("%s %s", error_type.__name__, locations)
 
     sys.excepthook = report
+    threading.excepthook = lambda args: report(args.exc_type, args.exc_value, args.exc_traceback)
 
 
 def main(*, initial_page=None):
@@ -802,9 +1094,12 @@ def main(*, initial_page=None):
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
         if "--background" not in sys.argv:
-            socket = connect()
-            if socket:
-                roundtrip(socket, {"owner": "desktop", "request": {"method": "show_desktop", "page": initial_page}})
+            try:
+                socket = connect()
+                if socket:
+                    roundtrip(socket, {"owner": "desktop", "request": {"method": "show_desktop", "page": initial_page}})
+            except (OSError, ValueError):
+                pass
         return 0
     log_unexpected_errors()
     desktop = Desktop(app)

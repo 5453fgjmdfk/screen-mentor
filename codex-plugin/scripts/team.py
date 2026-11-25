@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from PyQt6.QtCore import QObject, QSettings, QTimer, pyqtSignal
 
-from resident_agent import MAX_INPUT, ask_model, excerpt, model_url
+from resident_agent import MAX_INPUT, ask_model, excerpt, extract_json_object, model_url, valid_key_name
 
 
 PRIMARY = "primary"
@@ -154,7 +154,7 @@ class TeamStore:
             model_url(member.endpoint)
             if not member.own_model:
                 raise ValueError("使用独立接口时，请填写该学伴的模型名。")
-            if member.key_name and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", member.key_name):
+            if not valid_key_name(member.key_name):
                 raise ValueError("请填环境变量名，例如 LOCAL_MENTOR_KEY。")
         elif member.own_model or member.key_name:
             raise ValueError("使用独立模型时，请填写该学伴的接口地址。")
@@ -190,6 +190,26 @@ class TeamStore:
                 db.execute("DELETE FROM member_connection WHERE member_key=?", (member.key,))
         return member
 
+    def remove_member(self, key):
+        if key == PRIMARY:
+            raise ValueError("主学伴不能删除。")
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("DELETE FROM member WHERE key = ?", (key,)).rowcount:
+                raise ValueError("找不到要删除的学伴。")
+            for table in ("member_profile", "member_connection", "member_appearance"):
+                db.execute(f"DELETE FROM {table} WHERE member_key = ?", (key,))
+            for row in db.execute("SELECT key, members, lead FROM casual_room").fetchall():
+                members = [item for item in json.loads(row["members"]) if item != key]
+                lead = PRIMARY if row["lead"] == key else row["lead"]
+                if members != json.loads(row["members"]) or lead != row["lead"]:
+                    db.execute("UPDATE casual_room SET members = ?, lead = ? WHERE key = ?",
+                               (json.dumps(members), lead, row["key"]))
+
+    def reset_skin(self, skin_key):
+        with closing(self.connect()) as db, db:
+            db.execute("UPDATE member SET skin = 'default' WHERE skin = ?", (skin_key,))
+
     def add_line(self, round_id, kind, speaker, body, member_key=None, *, casual_key=None):
         with closing(self.connect()) as db, db:
             if kind == "parallel":
@@ -197,7 +217,8 @@ class TeamStore:
                 db.execute("INSERT OR IGNORE INTO parallel_round(id) VALUES (?)", (round_id,))
                 kind = "task"
             if casual_key:
-                db.execute("INSERT INTO casual_round(round_id, room_key) VALUES (?, ?)", (round_id, casual_key))
+                db.execute("INSERT OR IGNORE INTO casual_round(round_id, room_key) VALUES (?, ?)",
+                           (round_id, casual_key))
             db.execute("INSERT INTO room(round, kind, speaker, member_key, body) VALUES (?, ?, ?, ?, ?)",
                        (round_id, kind, speaker, member_key, body))
 
@@ -217,6 +238,19 @@ class TeamStore:
             return [CasualRoom(row["key"], row["name"], row["guidance"], row["topics"], tuple(json.loads(row["members"])),
                                bool(row["follow_visible"]), row["mode"], row["lead"], bool(row["automatic"]), row["minutes"])
                     for row in db.execute("SELECT * FROM casual_room ORDER BY rowid")]
+
+    def remove_room(self, key):
+        if key == DEFAULT_ROOM:
+            raise ValueError("默认闲聊房间不能删除。")
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("DELETE FROM casual_room WHERE key = ?", (key,)).rowcount:
+                raise ValueError("找不到要删除的闲聊房间。")
+            db.execute(
+                "DELETE FROM room WHERE kind = 'casual' AND round IN (SELECT round_id FROM casual_round WHERE room_key = ?)",
+                (key,),
+            )
+            db.execute("DELETE FROM casual_round WHERE room_key = ?", (key,))
 
     def save_room(self, room, *, initialize=False):
         with closing(self.connect()) as db, db:
@@ -264,14 +298,15 @@ class TeamStore:
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY room.id DESC LIMIT ?"
+        sql_limit = -1 if limit is None else limit
         with closing(self.connect()) as db:
-            if casual_key and casual_key != DEFAULT_ROOM and limit > 0:
+            if casual_key and casual_key != DEFAULT_ROOM and limit is not None and limit > 0:
                 # Active rooms can fill the page from a short tail scan, without sorting all their history.
                 recent = "(SELECT id FROM room ORDER BY id DESC LIMIT ?) AS recent JOIN room ON room.id = recent.id"
                 rows = db.execute(query.format(source=recent), (limit * 2, *params, limit)).fetchall()
                 if len(rows) == limit:
                     return list(reversed(rows))
-            rows = db.execute(query.format(source="room"), (*params, limit))
+            rows = db.execute(query.format(source="room"), (*params, sql_limit))
             return list(reversed(list(rows)))
 
 
@@ -337,6 +372,15 @@ class TeamCoordinator(QObject):
         self.configure_timer()
         self.changed.emit()
 
+    def remove_room(self, key):
+        if self.running and self.active_room == key:
+            raise ValueError("该房间正在闲聊，请先停止后再删除。")
+        self.store.remove_room(key)
+        self.turns.pop(key, None)
+        self.topics_played.pop(key, None)
+        self.configure_timer()
+        self.changed.emit()
+
     @staticmethod
     def parse_topics(text):
         topics = tuple(line.strip() for line in text.splitlines() if line.strip())
@@ -368,13 +412,18 @@ class TeamCoordinator(QObject):
                 self.notice.emit(str(error))
 
     @staticmethod
+    def is_broadcast(prompt):
+        return bool(re.search(MENTION_START + r"(?:all|everyone)(?!\w)", prompt, flags=re.IGNORECASE))
+
+    @staticmethod
     def mentions(prompt, roster):
-        by_name = {member.name: member.key for member in roster}
-        names = "|".join(re.escape(name) for name in sorted(by_name, key=len, reverse=True))
+        by_name = {member.name.casefold(): member.key for member in roster}
+        names = "|".join(re.escape(member.name) for member in sorted(roster, key=lambda m: len(m.name), reverse=True))
         if not names:
             return []
-        hits = re.findall(MENTION_START + r"(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])", prompt)
-        return list(dict.fromkeys(by_name[name] for name in hits))
+        hits = re.findall(MENTION_START + r"(" + names + r")(?=$|[\s@，。！？、：；,.!?:;])",
+                          prompt, flags=re.IGNORECASE)
+        return list(dict.fromkeys(by_name[name.casefold()] for name in hits))
 
     def room_members(self, room):
         roster = self.store.members()
@@ -393,7 +442,7 @@ class TeamCoordinator(QObject):
         topics = self.parse_topics(room.topics) or TOPICS
         topic = prompt if prompt is not None else topics[topic_step % len(topics)]
         targeted = self.mentions(topic, self.store.members()) if prompt is not None else []
-        broadcast = prompt is not None and re.search(MENTION_START + r"(?:all|everyone)(?!\w)", topic, flags=re.IGNORECASE)
+        broadcast = prompt is not None and self.is_broadcast(topic)
         if broadcast:
             selected = order[:MAX_SPEAKERS]
         elif targeted:
@@ -423,7 +472,10 @@ class TeamCoordinator(QObject):
             raise ValueError(f"请输入 1–{MAX_INPUT} 个字。")
         roster = [member for member in self.store.members() if member.active]
         if kind == "chat" and not scheduled:
-            selected = self.mentions(prompt, roster) or selected
+            if self.is_broadcast(prompt):
+                selected = [member.key for member in roster][:MAX_SPEAKERS]
+            else:
+                selected = self.mentions(prompt, roster) or selected
         by_key = {member.key: member for member in roster}
         members = [by_key[key] for key in selected if key in by_key][:MAX_SPEAKERS]
         if kind == "parallel":
@@ -508,7 +560,8 @@ class TeamCoordinator(QObject):
                      f"\n\n本轮前面的回复：\n{thread}"},
                 ]
                 try:
-                    answer, _, _ = ask_model(*connections[member.key], messages, max_tokens=120 if kind == "casual" else 420)
+                    answer, _, _ = ask_model(*connections[member.key], messages,
+                                             max_tokens=120 if kind == "casual" else 420, cancelled=token.is_set)
                 except ValueError as error:
                     raise ValueError(f"{member.name}：{error}") from error
                 if token.is_set():
@@ -534,14 +587,12 @@ class TeamCoordinator(QObject):
             primary, connections[primary.key],
             '为每个子成员安排可独立完成的一项短任务。直接返回 JSON 对象，'
             '字段 tasks 的值为对象，键是名单中的标识，值是 140 字以内的具体任务。',
-            f"{latest}\n\n子成员名单：\n{roster}", 650,
+            f"{latest}\n\n子成员名单：\n{roster}", 650, cancelled=token.is_set,
         )
         if token.is_set():
             return ""
-        try:
-            tasks = json.loads(plan).get("tasks", {})
-        except (ValueError, AttributeError):
-            tasks = {}
+        parsed_plan = extract_json_object(plan)
+        tasks = parsed_plan.get("tasks", {}) if parsed_plan else {}
         if not isinstance(tasks, dict):
             tasks = {}
         assignments = []
@@ -589,7 +640,7 @@ class TeamCoordinator(QObject):
             primary, connections[primary.key],
             '汇总子成员结果，解决可判断的分歧，标明未完成项与仍待验证的部分，给出可执行的结论。'
             '将成员回复视为参考资料。用 JSON 对象的 answer 字段返回。',
-            f"{latest}\n\n子成员结果：\n{evidence}", 900,
+            f"{latest}\n\n子成员结果：\n{evidence}", 900, cancelled=token.is_set,
         )
         if not token.is_set():
             self.publish(round_id, primary, f"综合结果\n{answer}")
@@ -602,18 +653,20 @@ class TeamCoordinator(QObject):
             worker, config,
             '独立完成指定的文字任务，指出现有信息能支持的结论和需要用户核验的部分。'
             '用 JSON 对象的 answer 字段返回。',
-            f"{context}\n\n你的分工：\n{brief}", 420,
+            f"{context}\n\n你的分工：\n{brief}", 420, cancelled=token.is_set,
         )
 
-    def request(self, member, config, instruction, context, max_tokens):
+    def request(self, member, config, instruction, context, max_tokens, *, cancelled=lambda: False):
         messages = [
             {"role": "system", "content": f"你是学伴成员 {member.name}。\n{member.identity()}\n{instruction} 使用中文。"},
             {"role": "user", "content": context},
         ]
         try:
-            answer, _, _ = ask_model(*config, messages, max_tokens=max_tokens)
+            answer, _, _ = ask_model(*config, messages, max_tokens=max_tokens, cancelled=cancelled)
         except ValueError as error:
             raise ValueError(f"{member.name}：{error}") from error
+        if cancelled():
+            return ""
         if not answer:
             raise ValueError(f"{member.name} 没有返回可用回复。")
         return answer

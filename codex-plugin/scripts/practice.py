@@ -98,6 +98,8 @@ class Practice(QObject):
         self.progress_since = None
         self.progress_text = ""
         self.progress_label = ""
+        self.dialog_style = ("QWidget{outline:0;} QDialog{background:#251d3b;}"
+                             "QPlainTextEdit,QListWidget{background:#342851;}")
 
         self.setup_panel(app)
         if persistent:
@@ -355,10 +357,12 @@ class Practice(QObject):
         self.panel.adjustSize()
         self.sync_edge_thought()
         if self.panel.isVisible() and not self.panel.moving:
-            top = self.panel.screen().availableGeometry().top()
-            y = max(top, bottom - self.panel.height())
-            if y != self.panel.y():
-                self.panel.move(self.panel.x(), y)
+            screen = self.panel.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                top = screen.availableGeometry().top()
+                y = max(top, bottom - self.panel.height())
+                if y != self.panel.y():
+                    self.panel.move(self.panel.x(), y)
 
     def set_progress(self, text="", *, pose=None, label=""):
         self.panel.set_pose(pose or ("thinking" if text else "idle"))
@@ -414,8 +418,7 @@ class Practice(QObject):
         serial = self.session_serial
         image = self.last_image
         dialog = QDialog(self.panel, Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
-        dialog.setStyleSheet("QWidget{outline:0;} QDialog{background:#251d3b;}"
-                             "QPlainTextEdit,QListWidget{background:#342851;}")
+        dialog.setStyleSheet(self.dialog_style)
         dialog.setWindowTitle("反馈到当前对话")
         dialog.setMinimumWidth(400)
         layout = QVBoxLayout(dialog)
@@ -437,6 +440,11 @@ class Practice(QObject):
         image_actions.addWidget(paste)
         image_actions.addWidget(remove)
         layout.addLayout(image_actions)
+        paste_hint = QLabel()
+        paste_hint.setObjectName("notice")
+        paste_hint.setWordWrap(True)
+        paste_hint.hide()
+        layout.addWidget(paste_hint)
         attach = QCheckBox("附上最近一次练习窗口截图")
         attach.setEnabled(image is not None)
         if image is None:
@@ -455,18 +463,31 @@ class Practice(QObject):
             remove.setEnabled(attachments.currentRow() >= 0)
             paste.setEnabled(len(pasted_images) < 3)
 
-        def add_image(image):
-            if len(pasted_images) >= 3 or image.isNull():
+        def add_image(img, *, notify_empty=False):
+            if len(pasted_images) >= 3:
+                paste_hint.setText("最多附带 3 张粘贴图片。")
+                paste_hint.show()
                 return
-            image = image.scaled(1600, 1200, Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation) if image.width() > 1600 or image.height() > 1200 else image
+            if img.isNull():
+                if notify_empty:
+                    paste_hint.setText("剪贴板里没有图片。")
+                    paste_hint.show()
+                return
+            paste_hint.hide()
+            img = img.scaled(1600, 1200, Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation) if img.width() > 1600 or img.height() > 1200 else img
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-            if not image.save(buffer, "JPEG", 90):
-                return
-            pasted_images.append(Image.open(BytesIO(bytes(buffer.data()))).convert("RGB"))
-            attachments.addItem(QListWidgetItem(QIcon(QPixmap.fromImage(image)),
-                                                f"图片 · {image.width()} × {image.height()}"))
+            try:
+                if not img.save(buffer, "JPEG", 90):
+                    return
+                raw_jpeg = bytes(buffer.data())
+            finally:
+                buffer.close()
+            with Image.open(BytesIO(raw_jpeg)) as opened:
+                pasted_images.append(opened.convert("RGB"))
+            attachments.addItem(QListWidgetItem(QIcon(QPixmap.fromImage(img)),
+                                                f"图片 · {img.width()} × {img.height()}"))
             attachments.setCurrentRow(len(pasted_images) - 1)
             update_send()
 
@@ -475,18 +496,21 @@ class Practice(QObject):
             if index >= 0:
                 del pasted_images[index]
                 attachments.takeItem(index)
+                paste_hint.hide()
                 update_send()
 
         problem.image_pasted.connect(add_image)
-        paste.clicked.connect(lambda: add_image(QApplication.clipboard().image()))
+        paste.clicked.connect(lambda: add_image(QApplication.clipboard().image(), notify_empty=True))
         remove.clicked.connect(remove_image)
         attachments.currentRowChanged.connect(update_send)
         problem.textChanged.connect(update_send)
         attach.toggled.connect(update_send)
         layout.addWidget(buttons)
         dialog.adjustSize()
-        center = self.panel.screen().availableGeometry().center()
-        dialog.move(center.x() - dialog.width() // 2, center.y() - dialog.height() // 2)
+        screen = self.panel.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            center = screen.availableGeometry().center()
+            dialog.move(center.x() - dialog.width() // 2, center.y() - dialog.height() // 2)
         problem.setFocus()
         if (dialog.exec() == QDialog.DialogCode.Accepted and serial == self.session_serial
                 and not self.ending.is_set()):

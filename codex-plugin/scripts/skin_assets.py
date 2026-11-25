@@ -107,9 +107,15 @@ def crop_sheet(sheet, region, columns, rows, rate, role):
     else:
         indexed = []
         for image in frames:
-            transparent = image.getchannel("A").point(lambda value: 255 if value < 128 else 0)
-            frame = image.convert("RGB").quantize(colors=255)
+            alpha = image.getchannel("A")
+            transparent = alpha.point(lambda value: 255 if value < 128 else 0)
+            opaque = alpha.point(lambda value: 255 if value >= 128 else 0)
+            # Fill transparent areas with a neutral backdrop so hidden RGB does not skew palette quantization.
+            flattened = Image.new("RGB", image.size, (32, 32, 32))
+            flattened.paste(image.convert("RGB"), mask=opaque)
+            frame = flattened.quantize(colors=255, method=Image.Quantize.MEDIANCUT)
             frame.paste(255, mask=transparent)
+            frame.info["transparency"] = 255
             indexed.append(frame)
         indexed[0].save(result, "GIF", save_all=True, append_images=indexed[1:],
                         duration=round(1000 / rate), loop=0, transparency=255, disposal=2, optimize=False)

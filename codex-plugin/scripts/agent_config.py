@@ -20,6 +20,8 @@ CLIENTS = (
 
 def configuration(client):
     python = Path(sys.executable).with_name("python.exe")
+    if not python.is_file():
+        python = Path(sys.executable)
     launcher = python.parent.parent.parent / "mcp" / "launch.py"
     if not launcher.is_file():
         launcher = Path(__file__).with_name("bridge.py")

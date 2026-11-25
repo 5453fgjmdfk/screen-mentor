@@ -23,10 +23,11 @@ from agent_config import CLIENTS, configuration
 from appearance import AppearanceEditor, SkinLibrary, palette_for, palette_key
 from companion import CompanionAction, CompanionPanel, fit_position, style_row_views
 from diagnostics import support_report
-from resident_agent import MAX_INPUT, ask_model, excerpt, model_url
+from resident_agent import MAX_INPUT, ask_model, excerpt, model_url, valid_key_name
 from scheduled import FREQUENCIES, MODES, ScheduledTask
 from team import (
-    MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL, CasualRoom, Member, PRIMARY, ROOM_MODES,
+    DEFAULT_ROOM, MAX_MEMBERS, MAX_SPEAKERS, MAX_WORKERS, MAX_INTERVAL, MIN_INTERVAL,
+    CasualRoom, Member, PRIMARY, ROOM_MODES,
 )
 
 
@@ -75,6 +76,15 @@ PANEL_THEMES = {
 }
 
 
+def blend_hex(first, second, weight):
+    a, b = QColor(first), QColor(second)
+    return QColor(
+        round(a.red() * (1 - weight) + b.red() * weight),
+        round(a.green() * (1 - weight) + b.green() * weight),
+        round(a.blue() * (1 - weight) + b.blue() * weight),
+    ).name()
+
+
 def panel_style(theme, color):
     if theme == "slate":
         return PANEL_STYLE
@@ -84,17 +94,36 @@ def panel_style(theme, color):
     except ValueError:
         return PANEL_STYLE
     foreground = palette.text
+    quiet_fg = blend_hex(foreground, palette.background, 0.36)
+    disabled_fg = blend_hex(foreground, palette.background, 0.54)
+    input_bg = blend_hex(palette.background, palette.surface, 0.55)
+    card_bg = palette.surface
+    hover_bg = blend_hex(palette.surface, palette.border, 0.38)
+    selected_bg = blend_hex(palette.surface, palette.border, 0.72)
+    selected_fg = palette_for(selected_bg).text
+    subtle_border = blend_hex(palette.surface, palette.border, 0.65)
+    focus_border = blend_hex(palette.border, palette.highlight, 0.55)
     shades = {
-        "#1a232b": palette.background, "#e5edf1": foreground, "#a7bbc7": foreground,
-        "#b2ccd9": palette.highlight, "#202b35": palette.surface, "#354752": palette.border,
-        "#222f3a": palette.surface, "#344754": palette.border, "#1d2933": palette.surface,
-        "#3f5360": palette.border, "#416272": palette.border, "#365260": palette.border,
-        "#f3f8fa": palette_for(palette.border).text, "#2b3e4a": palette.surface, "#455e6d": palette.border,
-        "#9abacb": palette.highlight, "#8596a0": palette.border, "#374b56": palette.border,
-        "#648496": palette.border,
+        "#1a232b": palette.background, "#e5edf1": foreground, "#a7bbc7": quiet_fg,
+        "#b2ccd9": palette.highlight, "#202b35": card_bg, "#354752": subtle_border,
+        "#222f3a": card_bg, "#344754": subtle_border, "#1d2933": input_bg,
+        "#3f5360": palette.border, "#416272": selected_bg, "#365260": selected_bg,
+        "#f3f8fa": selected_fg, "#2b3e4a": hover_bg, "#455e6d": palette.border,
+        "#9abacb": palette.highlight, "#8596a0": disabled_fg, "#374b56": subtle_border,
+        "#648496": focus_border,
         "#a1c1d0": palette.highlight, "#1c2b34": palette_for(palette.highlight).text,
     }
     return re.sub(r"#[0-9a-f]{6}\b", lambda match: shades.get(match[0], match[0]), PANEL_STYLE)
+
+
+def set_text_preserving_scroll(editor, text):
+    scrollbar = editor.verticalScrollBar()
+    was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 12
+    previous = scrollbar.value()
+    if editor.toPlainText() == text:
+        return
+    editor.setPlainText(text)
+    scrollbar.setValue(scrollbar.maximum() if was_at_bottom else min(previous, scrollbar.maximum()))
 
 
 def label(text, role=""):
@@ -163,12 +192,18 @@ class TeamPet(CompanionPanel):
         self.bubble_timer.setInterval(12_000)
         self.bubble_timer.timeout.connect(lambda: self.say(""))
         self.say("")
-        area = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(self.default_position())
+
+    def default_position(self):
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return QPoint(0, 0)
+        area = screen.availableGeometry()
         width = self.width() + 12
         columns = max(1, (area.width() - 340) // width)
-        x = area.right() - 335 - (slot % columns + 1) * width
-        y = area.bottom() - 38 - self.height() - slot // columns * (self.height() + 28)
-        self.move(fit_position(QPoint(x, y), self.size(), area))
+        x = area.right() - 335 - (self.slot % columns + 1) * width
+        y = area.bottom() - 38 - self.height() - self.slot // columns * (self.height() + 28)
+        return fit_position(QPoint(x, y), self.size(), area)
 
     def update_member(self, member, palette):
         changed = self.member != member
@@ -188,14 +223,18 @@ class TeamPet(CompanionPanel):
         self.layout().activate()
         self.adjustSize()
         if self.isVisible() and not self.moving:
-            area = self.screen().availableGeometry()
-            self.move(fit_position(QPoint(self.x(), bottom - self.height()), self.size(), area))
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                self.move(fit_position(QPoint(self.x(), bottom - self.height()), self.size(), area))
         self.peek.set_thought(message)
         self.bubble_timer.stop()
         if text:
             self.set_pose(pose)
             if transient:
                 self.bubble_timer.start()
+        else:
+            self.set_pose("idle")
 
     def suspend(self, suspend):
         if suspend and not self.suspended:
@@ -554,15 +593,19 @@ class ManagerWindow(QDialog):
         card.setObjectName("card")
         contents = QVBoxLayout(card)
         contents.setContentsMargins(15, 12, 15, 12)
+        contents.setSpacing(6)
         self.mode = label("", "section")
         contents.addWidget(self.mode)
         self.info = label("", "quiet")
         contents.addWidget(self.info)
+        self.home_summary = label("", "notice")
+        contents.addWidget(self.home_summary)
         actions = QHBoxLayout()
         contents.addLayout(actions)
         actions.addWidget(button("日常对话", self.desktop.show_chat, primary=True))
         self.pets_toggle = button("", self.desktop.toggle_pets)
         actions.addWidget(self.pets_toggle)
+        actions.addWidget(button("重置桌宠位置", self.desktop.reset_pet_positions))
         self.exit_practice = button("结束伴学", self.desktop.engine.practice.close)
         actions.addWidget(self.exit_practice)
         actions.addStretch()
@@ -571,6 +614,7 @@ class ManagerWindow(QDialog):
         layout.addLayout(row)
         row.addWidget(button("长期记忆", lambda: self.desktop.show_member_memory(PRIMARY)))
         row.addWidget(button("桌宠外观", lambda: self.open_appearance(PRIMARY)))
+        row.addWidget(button("配置模型", lambda: self.open_model("")))
         row.addWidget(button("定时任务", lambda: self.nav.setCurrentRow(self.tasks_index)))
         row.addStretch()
         layout.addStretch()
@@ -594,11 +638,14 @@ class ManagerWindow(QDialog):
         self.participants.setAccessibleName("选择参与成员")
         self.participants.setFixedWidth(182)
         roster.addWidget(self.participants, 1)
+        export_group = button("导出群聊", self.export_group_chat)
+        export_group.setToolTip("将群聊与协作记录导出为 Markdown。")
+        roster.addWidget(export_group)
         body.addLayout(roster)
         self.group_roster = ()
         self.prompt = QPlainTextEdit()
         self.prompt.setFixedHeight(69)
-        self.prompt.setPlaceholderText("点击成员行来选择发言者，或用 @成员名 点名。")
+        self.prompt.setPlaceholderText("点击成员行来选择发言者，或用 @成员名 / @all 点名。（Ctrl+Enter 发送）")
         layout.addWidget(self.prompt)
         actions = QHBoxLayout()
         layout.addLayout(actions)
@@ -614,8 +661,9 @@ class ManagerWindow(QDialog):
         self.participants.itemSelectionChanged.connect(self.group_input_changed)
         self.prompt.textChanged.connect(self.group_input_changed)
         self.send_button.setToolTip("发送（Ctrl+Enter）")
-        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.prompt)
-        shortcut.activated.connect(self.send_button.click)
+        for key in ("Ctrl+Return", "Ctrl+Enter"):
+            shortcut = QShortcut(QKeySequence(key), self.prompt)
+            shortcut.activated.connect(self.send_button.click)
         return page
 
     def chat_page(self):
@@ -669,9 +717,9 @@ class ManagerWindow(QDialog):
             return
 
         name = pane.member.name
-        filename_name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        filename_name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(" .") or "学伴"
         today = QDateTime.currentDateTime().toString("yyyy-MM-dd")
-        suggested = Path(self.desktop.workspace_directory()) / f"学伴私聊-{filename_name}-{today}.md"
+        suggested = Path(self.desktop.workspace_directory() or Path.home()) / f"学伴私聊-{filename_name}-{today}.md"
         dialog = QFileDialog(self, "导出私聊", str(suggested), "Markdown (*.md)")
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setDefaultSuffix("md")
@@ -692,6 +740,55 @@ class ManagerWindow(QDialog):
             pane.notice.setText(f"已导出 {len(rows)} 条私聊消息。")
         else:
             pane.notice.setText("无法保存 Markdown，请检查文件路径和写入权限。")
+
+    def _export_markdown_rows(self, title, default_stem, heading, rows, notice_widget, *, kind_labels=None):
+        if not rows:
+            notice_widget.setText("还没有可导出的消息。")
+            return
+        safe_stem = re.sub(r'[<>:"/\\|?*]', "_", default_stem).strip(" .") or "记录"
+        today = QDateTime.currentDateTime().toString("yyyy-MM-dd")
+        suggested = Path(self.desktop.workspace_directory() or Path.home()) / f"{safe_stem}-{today}.md"
+        dialog = QFileDialog(self, title, str(suggested), "Markdown (*.md)")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        dialog.setDefaultSuffix("md")
+        filename = dialog.selectedFiles()[0] if dialog.exec() == QDialog.DialogCode.Accepted else ""
+        dialog.deleteLater()
+        if not filename:
+            return
+        sections = [f"# {heading}\n\n"]
+        for row in rows:
+            kind_tag = f" · {kind_labels[row['display_kind']]}" if kind_labels else ""
+            timestamp = f" · {row['created']} UTC" if row["created"] else ""
+            sections.append(f"## {row['speaker']}{kind_tag}{timestamp}\n\n{row['body']}\n\n")
+        content = "".join(sections).encode("utf-8")
+        output = QSaveFile(filename)
+        if (output.open(QIODevice.OpenModeFlag.WriteOnly)
+                and output.write(content) == len(content) and output.commit()):
+            notice_widget.setText(f"已导出 {len(rows)} 条消息。")
+        else:
+            notice_widget.setText("无法保存 Markdown，请检查文件路径和写入权限。")
+
+    def export_group_chat(self):
+        try:
+            rows = self.team.store.lines(limit=None, kinds=("chat", "task"))
+        except sqlite3.Error:
+            self.group_notice.setText("无法读取群聊记录，请检查本机档案。")
+            return
+        kinds = {"task": "接力", "parallel": "并行协作", "chat": "群聊", "casual": "闲聊"}
+        self._export_markdown_rows("导出群聊记录", "学伴群聊", "屏幕伴学 · 群聊与协作记录",
+                                   rows, self.group_notice, kind_labels=kinds)
+
+    def export_room_chat(self):
+        room = self.rooms.currentData()
+        if room is None:
+            return
+        try:
+            rows = self.team.store.lines(limit=None, casual_key=room.key)
+        except sqlite3.Error:
+            self.show_room_notice(room.key, "无法读取房间记录，请检查本机档案。")
+            return
+        self._export_markdown_rows("导出闲聊记录", f"闲聊-{room.name}", f"屏幕伴学 · 闲聊房间「{room.name}」",
+                                   rows, self.casual_notice)
 
     def open_model(self, key=""):
         self.model_target.setCurrentIndex(max(0, self.model_target.findData(key)))
@@ -718,6 +815,8 @@ class ManagerWindow(QDialog):
         actions.addWidget(button("查看记忆", lambda: self.member_action(self.desktop.show_member_memory)))
         actions.addWidget(button("编辑外观", lambda: self.member_action(self.open_appearance)))
         actions.addWidget(button("编辑档案", lambda: self.edit_member()))
+        self.delete_member_button = button("删除成员", self.delete_selected_member)
+        actions.addWidget(self.delete_member_button)
         actions.addStretch()
         return page
 
@@ -731,7 +830,7 @@ class ManagerWindow(QDialog):
         layout.addLayout(row)
         self.skin_library = SkinLibrary()
         self.skin_editor = AppearanceEditor(self.skin_library, self.skin_library.current(), self.apply_appearance,
-                                            self.desktop.workspace_directory)
+                                            self.desktop.workspace_directory, self.desktop.on_skin_deleted)
         layout.addWidget(self.skin_editor, 1)
         self.appearance_member.currentIndexChanged.connect(self.load_appearance)
         return page
@@ -746,14 +845,19 @@ class ManagerWindow(QDialog):
 
     def load_appearance(self):
         key = self.appearance_member.currentData()
-        if key == PRIMARY:
+        if not key or key == PRIMARY:
             skin = self.skin_library.current()
         else:
-            member = next(item for item in self.team.store.members() if item.key == key)
+            member = next((item for item in self.team.store.members() if item.key == key), None)
+            if member is None:
+                return
             skin = self.skin_library.resolve(member.skin, saved_palette=False)
             palette = self.team.store.palette(key)
             if palette:
-                skin = replace(skin, palette=palette_for(palette))
+                try:
+                    skin = replace(skin, palette=palette_for(palette))
+                except ValueError:
+                    pass
         self.skin_editor.load(skin)
 
     def apply_appearance(self, skin):
@@ -871,6 +975,8 @@ class ManagerWindow(QDialog):
             else:
                 if fields["endpoint"]:
                     model_url(fields["endpoint"])
+                if not valid_key_name(fields["key_name"]):
+                    raise ValueError("请填环境变量名，例如 SCREEN_MENTOR_MODEL_KEY，不要直接填密钥。")
                 settings = QSettings(self.desktop.agent_settings.fileName(), QSettings.Format.IniFormat)
                 settings.sync()
                 error_message = "无法保存模型设置，请检查本机目录的写入权限。"
@@ -893,6 +999,7 @@ class ManagerWindow(QDialog):
         except ValueError as error:
             self.model_notice.setText(str(error))
             return
+        self.update_pet_visibility()
         self.model_notice.setText("模型设置已保存。")
 
     def test_model(self):
@@ -994,9 +1101,19 @@ class ManagerWindow(QDialog):
         self.bubble_seconds.setRange(4, 30)
         self.bubble_seconds.setValue(preferences.value("bubble_seconds", 12, type=int))
         self.bubble_seconds.setSuffix(" 秒")
+        self.pet_opacity = QSpinBox()
+        self.pet_opacity.setRange(50, 100)
+        self.pet_opacity.setSingleStep(5)
+        self.pet_opacity.setValue(max(50, min(100, preferences.value("pet_opacity", 100, type=int))))
+        self.pet_opacity.setSuffix(" %")
         pets.addRow(self.pets_on_startup)
         pets.addRow(self.snap_enabled)
         pets.addRow("回复气泡停留", self.bubble_seconds)
+        pets.addRow("桌宠不透明度", self.pet_opacity)
+        reset_pos = QHBoxLayout()
+        reset_pos.addWidget(button("重置所有桌宠位置", self.desktop.reset_pet_positions))
+        reset_pos.addStretch()
+        pets.addRow("桌宠位置", reset_pos)
 
         self.workspace_folder = QLineEdit(preferences.value("workspace_directory", "", type=str))
         self.workspace_folder.setPlaceholderText("选择导入皮肤和素材时优先打开的目录")
@@ -1145,7 +1262,9 @@ class ManagerWindow(QDialog):
 
     def apply_theme(self, theme, color):
         preferences = self.desktop.preferences
-        self.setStyleSheet(panel_style(theme, color))
+        style = panel_style(theme, color)
+        self.setStyleSheet(style)
+        self.desktop.engine.practice.dialog_style = style
         preferences.setValue("theme", theme)
         preferences.setValue("theme_color", self.custom_color)
         preferences.sync()
@@ -1181,6 +1300,7 @@ class ManagerWindow(QDialog):
         preferences.setValue("pets_on_startup", self.pets_on_startup.isChecked())
         preferences.setValue("snap_enabled", self.snap_enabled.isChecked())
         preferences.setValue("bubble_seconds", self.bubble_seconds.value())
+        preferences.setValue("pet_opacity", self.pet_opacity.value())
         preferences.setValue("workspace_directory", folder)
         preferences.setValue("startup_page", self.startup_page_field.currentText())
         preferences.setValue("remember_geometry", self.remember_geometry.isChecked())
@@ -1199,6 +1319,9 @@ class ManagerWindow(QDialog):
         header.addWidget(self.rooms, 1)
         header.addWidget(button("房间设置", self.edit_room))
         header.addWidget(button("新建房间", lambda: self.edit_room(new=True)))
+        self.delete_room_button = button("删除房间", self.delete_current_room)
+        header.addWidget(self.delete_room_button)
+        header.addWidget(button("导出记录", self.export_room_chat))
         layout.addLayout(header)
         self.room_members = label("", "quiet")
         layout.addWidget(self.room_members)
@@ -1249,22 +1372,50 @@ class ManagerWindow(QDialog):
             self.reload_rooms(room.key)
         dialog.deleteLater()
 
+    def delete_current_room(self):
+        room = self.rooms.currentData()
+        if room is None or room.key == DEFAULT_ROOM:
+            return
+        reply = QMessageBox.question(
+            self, "删除闲聊房间",
+            f"删除房间「{room.name}」及其全部闲聊记录？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.team.remove_room(room.key)
+        except (ValueError, sqlite3.Error) as error:
+            self.show_room_notice(room.key, str(error))
+            return
+        self.room_drafts.pop(room.key, None)
+        self.room_notices.pop(room.key, None)
+        self.reload_rooms(DEFAULT_ROOM)
+
     def refresh_casual(self):
         room = self.rooms.currentData()
         if room is None:
+            self.delete_room_button.setEnabled(False)
             return
-        if self.displayed_room != room.key:
+        switched = self.displayed_room != room.key
+        if switched:
             if self.displayed_room:
                 self.room_drafts[self.displayed_room] = self.room_post.text()
             self.room_post.setText(self.room_drafts.get(room.key, ""))
             self.displayed_room = room.key
+        self.delete_room_button.setEnabled(room.key != DEFAULT_ROOM and not (self.team.active_room == room.key and self.team.running))
         members = "、".join(member.name for member in self.team.room_members(room))
         schedule = f" · 每 {room.minutes} 分钟" if room.automatic else ""
         self.room_members.setText(f"{members or '暂无可用成员'} · {ROOM_MODES[room.mode]}{schedule}")
         rows = self.team.store.lines(casual_key=room.key)
-        self.room_history.setPlainText("\n\n".join(f"{row['speaker']}\n{row['body']}" for row in rows))
-        scrollbar = self.room_history.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        text = "\n\n".join(f"{row['speaker']}\n{row['body']}" for row in rows)
+        if switched:
+            self.room_history.setPlainText(text)
+            scrollbar = self.room_history.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            set_text_preserving_scroll(self.room_history, text)
         self.casual_notice.setText(self.room_notices.get(room.key, ""))
         self.update_room_actions()
         self.stop_casual.setEnabled(self.team.active_room == room.key and self.team.running)
@@ -1306,11 +1457,14 @@ class ManagerWindow(QDialog):
         self.task_list.setMinimumHeight(75)
         layout.addWidget(self.task_list, 1)
         actions = QHBoxLayout()
+        self.run_task_now_button = button("立即执行", self.run_task_now)
+        self.run_task_now_button.setToolTip("立刻执行一次选中任务，不影响原定计划时间。")
         self.edit_task_button = button("编辑", lambda: self.edit_task(self.current_task()))
         self.toggle_task_button = button("暂停计划", self.toggle_task)
         self.stop_task_button = button("停止本次", self.team.stop)
         self.remove_task_button = button("移除", self.remove_task)
-        for control in (self.edit_task_button, self.toggle_task_button, self.stop_task_button, self.remove_task_button):
+        for control in (self.run_task_now_button, self.edit_task_button, self.toggle_task_button,
+                        self.stop_task_button, self.remove_task_button):
             actions.addWidget(control)
         actions.addStretch()
         actions.addWidget(button("新建任务", lambda: self.edit_task(), primary=True))
@@ -1345,7 +1499,9 @@ class ManagerWindow(QDialog):
                     next_run = f"下次 {task.next_at:%Y-%m-%d %H:%M}"
                 else:
                     next_run = "已结束" if not task.repeat_days and task.last_round else "已暂停"
-                item = QListWidgetItem(f"{task.name}\n{FREQUENCIES[task.repeat_days]} · {MODES[task.mode]} · {next_run}")
+                item = QListWidgetItem(
+                    f"{task.name}\n{FREQUENCIES.get(task.repeat_days, f'每 {task.repeat_days} 天')} · {MODES[task.mode]} · {next_run}"
+                )
                 item.setData(Qt.ItemDataRole.UserRole, task)
                 self.task_list.addItem(item)
                 if previous and task.key == previous.key:
@@ -1353,11 +1509,13 @@ class ManagerWindow(QDialog):
             if self.task_list.currentRow() < 0 and self.task_list.count():
                 self.task_list.setCurrentRow(0)
         self.show_task_result()
+        self.update_pet_visibility()
 
     def show_task_result(self):
         task = self.current_task()
         for control in (self.edit_task_button, self.toggle_task_button, self.remove_task_button):
             control.setEnabled(task is not None)
+        self.run_task_now_button.setEnabled(task is not None and not self.team.blocked and not self.team.running)
         self.stop_task_button.setEnabled(bool(task and task.last_round and
                                              task.last_round == self.desktop.scheduler.active_round))
         if task is None:
@@ -1373,6 +1531,15 @@ class ManagerWindow(QDialog):
             return
         self.task_result.setPlainText("\n\n".join(f"{row['speaker']}\n{row['body']}" for row in rows))
 
+    def run_task_now(self):
+        task = self.current_task()
+        if task is None:
+            return
+        try:
+            self.desktop.scheduler.run_now(task.key)
+        except (ValueError, sqlite3.Error) as error:
+            self.tasks_notice.setText(str(error))
+
     def edit_task(self, task=None):
         dialog = ScheduledTaskDialog(self, task, self.desktop.scheduler.save)
         dialog.exec()
@@ -1382,7 +1549,7 @@ class ManagerWindow(QDialog):
         task = self.current_task()
         if task is None:
             return
-        if not task.enabled and not task.repeat_days and task.last_round:
+        if not task.enabled and not task.repeat_days and (task.last_round or task.next_at < datetime.now()):
             self.edit_task(task)
             return
         try:
@@ -1418,7 +1585,10 @@ class ManagerWindow(QDialog):
         prompt = self.prompt.toPlainText().strip()
         selected = self.selected()
         count = len(selected)
-        addressed = self.team.mentions(prompt, self.group_roster) or selected
+        if self.team.is_broadcast(prompt):
+            addressed = [member.key for member in self.group_roster][:MAX_SPEAKERS]
+        else:
+            addressed = self.team.mentions(prompt, self.group_roster) or selected
         child_count = sum(key != PRIMARY for key in selected)
         self.group_count.setText(f"已选 {count} 位 · 每轮最多 {MAX_SPEAKERS} 位")
         ready = not self.team.blocked and not self.team.running and bool(prompt) and len(prompt) <= MAX_INPUT
@@ -1440,9 +1610,10 @@ class ManagerWindow(QDialog):
         preferred = preferred or (previous.key if previous else None)
         checked = set(self.selected())
         first_load = not self.participants.count()
-        self.members.clear()
         members = self.team.store.members()
         self.group_roster = [member for member in members if member.active]
+        members_signals = QSignalBlocker(self.members)
+        self.members.clear()
         selection_signals = QSignalBlocker(self.participants)
         self.participants.clear()
         keys = {member.skin for member in members if member.key != PRIMARY}
@@ -1460,11 +1631,15 @@ class ManagerWindow(QDialog):
                 entry.setData(Qt.ItemDataRole.UserRole, member.key)
                 self.participants.addItem(entry)
                 entry.setSelected(self.participants.count() <= MAX_SPEAKERS if first_load else member.key in checked)
-        selection_signals.unblock()
-        self.update_group_actions()
-        if self.members.currentRow() < 0:
+        if self.members.currentRow() < 0 and self.members.count():
             self.members.setCurrentRow(0)
-        for combo in (self.appearance_member, self.chat_member, self.model_target):
+        selection_signals.unblock()
+        members_signals.unblock()
+        self.update_group_actions()
+        self.update_member_display_action()
+        for combo, on_change in ((self.appearance_member, self.load_appearance),
+                                 (self.chat_member, self.select_chat),
+                                 (self.model_target, self.load_model)):
             current_target = combo.currentData()
             with QSignalBlocker(combo):
                 combo.clear()
@@ -1473,8 +1648,8 @@ class ManagerWindow(QDialog):
                 for member in members:
                     combo.addItem(member.name, member.key)
                 combo.setCurrentIndex(max(0, combo.findData(current_target)))
-            if combo is self.model_target and current_target is None:
-                self.load_model()
+            if combo.currentData() != current_target or (combo is self.model_target and current_target is None):
+                on_change()
 
     def current_member(self):
         item = self.members.currentItem()
@@ -1497,6 +1672,7 @@ class ManagerWindow(QDialog):
         visible = self.desktop.pets_visible
         primary_shown = member is not None and member.key == PRIMARY and visible
         self.member_display.setEnabled(member is not None and not primary_shown)
+        self.delete_member_button.setEnabled(member is not None and member.key != PRIMARY)
         if primary_shown:
             caption = "主学伴已显示"
             hint = "在「桌面」页可统一隐藏桌宠。"
@@ -1508,6 +1684,23 @@ class ManagerWindow(QDialog):
             hint = "显示所选桌宠。若桌宠已统一隐藏，先恢复桌面显示。"
         self.member_display.setText(caption)
         self.member_display.setToolTip(hint)
+
+    def delete_selected_member(self):
+        member = self.current_member()
+        if member is None or member.key == PRIMARY:
+            return
+        reply = QMessageBox.question(
+            self, "删除成员",
+            f"删除成员「{member.name}」？该成员将从成员名单、桌面与闲聊房间中移除。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.desktop.delete_member(member.key)
+        except ValueError as error:
+            self.member_hint.setText(str(error))
 
     def toggle_member_display(self):
         member = self.current_member()
@@ -1550,10 +1743,9 @@ class ManagerWindow(QDialog):
     def refresh_history(self):
         kinds = {"task": "接力", "parallel": "并行协作", "chat": "群聊", "casual": "闲聊"}
         rows = self.team.store.lines(kinds=("chat", "task"))
-        self.history.setPlainText("\n\n".join(
-            f"{row['speaker']} · {kinds[row['display_kind']]}\n{row['body']}" for row in rows))
-        scrollbar = self.history.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        text = "\n\n".join(
+            f"{row['speaker']} · {kinds[row['display_kind']]}\n{row['body']}" for row in rows)
+        set_text_preserving_scroll(self.history, text)
 
     def refresh(self):
         active = self.team.blocked
@@ -1564,15 +1756,24 @@ class ManagerWindow(QDialog):
         self.update_group_actions()
         self.refresh_history()
         self.refresh_casual()
+        self.show_task_result()
 
     def update_pet_visibility(self):
         visible = self.desktop.pets_visible
         self.pets_toggle.setText("隐藏桌宠" if visible else "显示桌宠")
-        count = 1 if self.team.blocked else sum(member.visible for member in self.team.store.members())
+        members = self.team.store.members()
+        count = 1 if self.team.blocked else sum(member.visible for member in members)
         room = self.team.automatic_room()
         schedule = f"{room.name} · 每 {room.minutes} 分钟" if room else "定时闲聊关闭"
         status = f"{count} 位学伴显示在桌面" if visible else "桌宠已隐藏"
-        self.info.setText(f"{status} · {schedule}")
+        self.info.setText(f"{status} · 共 {len(members)} 位成员 · {schedule}")
+        endpoint, model, _ = self.desktop.model_settings()
+        model_text = f"默认模型：{model}" if endpoint and model else "默认模型：尚未配置（可点下方「配置模型」）"
+        try:
+            enabled_tasks = sum(task.enabled for task in self.desktop.scheduler.tasks())
+        except sqlite3.Error:
+            enabled_tasks = 0
+        self.home_summary.setText(f"{model_text} · 启用定时任务 {enabled_tasks} 个")
         for index in range(self.members.count()):
             item = self.members.item(index)
             item.setText(self.member_row_text(item.data(Qt.ItemDataRole.UserRole)))

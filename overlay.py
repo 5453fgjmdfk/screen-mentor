@@ -86,6 +86,7 @@ class GuideOverlay(QWidget):
     def phys_to_local(self, x: float, y: float, w: float, h: float) -> QRectF:
         """截图物理像素坐标 -> 本窗口局部坐标（比例映射，抗 DPI 缩放）。"""
         pw, ph = self._phys or (self.width(), self.height())
+        pw, ph = max(1, pw), max(1, ph)
         lw, lh = max(1, self.width()), max(1, self.height())
         kx, ky = lw / pw, lh / ph
         return QRectF(x * kx, y * ky, max(2.0, w * kx), max(2.0, h * ky))
@@ -173,8 +174,9 @@ class GuideOverlay(QWidget):
     def _tick(self) -> None:
         self._phase = (self._phase + 0.09) % (math.pi * 4)
         if self.has_guide and self._rect is not None:
-            region = QRectF(self._rect.center(), self._drag_to).normalized() if self._drag_to else self._rect
-            self.update(region.adjusted(-27, -27, 50, 50).toAlignedRect())
+            region = (self._rect.united(QRectF(self._drag_to.x(), self._drag_to.y(), 1, 1))
+                      if self._drag_to else self._rect)
+            self.update(region.adjusted(-30, -30, 56, 56).toAlignedRect())
         elif self._mode:
             self.update()
 
@@ -200,17 +202,21 @@ class GuideOverlay(QWidget):
         head_font.setBold(True)
         metrics = QFontMetrics(head_font)
         body_metrics = QFontMetrics(QFont(FONT_FAMILY, 10))
-        preferred = max(120, metrics.horizontalAdvance(self._say) + 40)
+        badge_extra = 28 if self._mode == "guide" and self._num > 0 else 0
+        preferred = max(120, metrics.horizontalAdvance(self._say) + 40 + badge_extra)
         if self._detail:
             w = max(w, 420)
             preferred = max(preferred, min(w, body_metrics.horizontalAdvance(self._detail) + 32))
-        cw = min(w, self.width() - 32, preferred)
-        inner = cw - 32
+        cw = max(100, min(w, self.width() - 32, preferred))
+        inner = max(40, cw - 32)
+        head_inner = max(40, inner - badge_extra)
         hh = QFontMetrics(head_font).boundingRect(
-            QRect(0, 0, inner, 4000),
+            QRect(0, 0, head_inner, 4000),
             int(Qt.TextFlag.TextWordWrap),
             self._say or " ",
         ).height()
+        if badge_extra:
+            hh = max(hh, 22)
         ch = 24 + hh
         if self._detail:
             ch += 6 + body_metrics.boundingRect(
@@ -228,19 +234,30 @@ class GuideOverlay(QWidget):
             center = QPointF(self.width() / 2, self.height() * 0.62)
             target = None
 
-        # 卡片位置：优先放目标上方，放不下就放下方
+        # 卡片位置：优先放目标上方，放不下放下方；仍遮挡目标时放左右两侧
         if target is not None:
             occupied = target.united(QRectF(self._drag_to.x() - 8, self._drag_to.y() - 8, 16, 16)) if self._drag_to else target
-            cx = min(max(center.x() - card.width() / 2, 16), self.width() - card.width() - 16)
+            cx = min(max(center.x() - card.width() / 2, 16), max(16.0, self.width() - card.width() - 16))
             above_y = occupied.top() - card.height() - 16
-            if above_y > 16:
+            below_y = occupied.bottom() + 16
+            if above_y >= 16:
                 card.moveTo(cx, above_y)
+            elif below_y + card.height() <= self.height() - 16:
+                card.moveTo(cx, below_y)
             else:
-                card.moveTo(cx, min(occupied.bottom() + 16, self.height() - card.height() - 16))
+                cy = min(max(center.y() - card.height() / 2, 16), max(16.0, self.height() - card.height() - 16))
+                right_x = occupied.right() + 16
+                left_x = occupied.left() - card.width() - 16
+                if right_x + card.width() <= self.width() - 16:
+                    card.moveTo(right_x, cy)
+                elif left_x >= 16:
+                    card.moveTo(left_x, cy)
+                else:
+                    card.moveTo(cx, min(below_y, max(16.0, self.height() - card.height() - 16)))
         else:
             where = self._hint_at or QPointF(self.width() / 2, self.height() * .66)
-            card.moveTo(min(max(where.x() - card.width() / 2, 16), self.width() - card.width() - 16),
-                        min(max(where.y(), 16), self.height() - card.height() - 16))
+            card.moveTo(min(max(where.x() - card.width() / 2, 16), max(16.0, self.width() - card.width() - 16)),
+                        min(max(where.y(), 16), max(16.0, self.height() - card.height() - 16)))
 
         if target is not None:
             self._paint_target(p, target)
@@ -312,22 +329,38 @@ class GuideOverlay(QWidget):
         p.setBrush(ACCENT)
         p.drawRoundedRect(QRectF(card.left() + 5, y + 2, 2, 14), 1, 1)
 
+        text_x = x
+        head_inner = inner
+        if self._mode == "guide" and self._num > 0:
+            badge = QRectF(x, y + 1, 21, 21)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(ACCENT)
+            p.drawEllipse(badge)
+            badge_font = QFont(FONT_FAMILY, 9)
+            badge_font.setBold(True)
+            p.setFont(badge_font)
+            p.setPen(QColor(25, 18, 42))
+            p.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), str(self._num))
+            text_x += 28
+            head_inner = max(40, inner - 28)
+
         head_font = QFont(FONT_FAMILY, 12)
         head_font.setBold(True)
         p.setFont(head_font)
         p.setPen(TXT)
         hh = QFontMetrics(head_font).boundingRect(
-            QRect(0, 0, inner, 4000), int(Qt.TextFlag.TextWordWrap), self._say or " "
+            QRect(0, 0, head_inner, 4000), int(Qt.TextFlag.TextWordWrap), self._say or " "
         )
+        head_h = max(hh.height(), 22 if self._mode == "guide" and self._num > 0 else 0)
         p.drawText(
-            QRectF(x, y, inner, hh.height() + 4),
+            QRectF(text_x, y, head_inner, head_h + 4),
             int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft),
             self._say,
         )
         if self._detail:
             p.setFont(QFont(FONT_FAMILY, 10))
             p.setPen(SUB)
-            detail_y = y + hh.height() + 6
+            detail_y = y + head_h + 6
             p.drawText(QRectF(x, detail_y, inner, card.bottom() - detail_y - 10),
                        int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft), self._detail)
 
